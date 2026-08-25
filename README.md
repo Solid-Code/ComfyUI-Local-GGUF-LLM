@@ -2,6 +2,8 @@
 
 A persistent local GGUF LLM service for ComfyUI, powered by `llama-cpp-python`.
 
+The **LLM sidebar icon opens the server as a modal**; it is intentionally not a persistent sidebar panel.
+
 The extension is designed to keep a local language model available for ComfyUI workflows without forcing the GGUF to remain in VRAM when diffusion or video models need the GPU. It provides a global LLM service, a workflow generation node, optional vision support, model/memory presets, prompt presets, performance logging, and an optional OpenAI-compatible HTTP endpoint.
 
 ## What it does

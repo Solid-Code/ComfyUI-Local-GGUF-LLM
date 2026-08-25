@@ -23,6 +23,8 @@ let saving = false;
 let currentModelInfo = null;
 let floatingStatus = null;
 let floatingDrag = null;
+let allowNativeSidebarToggle = false;
+let sidebarCollapsePending = false;
 const FLOAT_POS_KEY = "local-llm-floating-status-position-v1";
 const serviceGenerateNodes = new Set();
 let serviceGenerateGraphConfigureDepth = 0;
@@ -681,12 +683,45 @@ async function openModal() {
   try { await loadData(); renderModal(); } catch(e) { app.extensionManager?.toast?.add?.({severity:"error",summary:"Local LLM Server",detail:e.message,life:5000}); }
 }
 
+function collapseAccidentalLLMSidebar() {
+  if (sidebarCollapsePending) return;
+  sidebarCollapsePending = true;
+  requestAnimationFrame(async () => {
+    try {
+      // Newer ComfyUI frontends expose a generated toggle command for sidebar
+      // tabs. Prefer it when present; it cleanly returns the canvas to its prior
+      // width without relying on private store APIs.
+      const commandId = `Workspace.ToggleSidebarTab.${SIDEBAR_ID}`;
+      const commands = app.extensionManager?.command?.commands || [];
+      if (commands.some((cmd) => cmd?.id === commandId)) {
+        allowNativeSidebarToggle = true;
+        try { await app.extensionManager.command.execute(commandId); } finally { allowNativeSidebarToggle = false; }
+        return;
+      }
+
+      // Compatibility fallback: if ComfyUI mounted our sidebar tab, clicking the
+      // already-active launcher toggles it closed. Temporarily let this synthetic
+      // click pass through our modal-only interception.
+      const launcher = document.querySelector('[data-local-llm-launcher="1"]');
+      if (launcher) {
+        allowNativeSidebarToggle = true;
+        try { launcher.click(); } finally { allowNativeSidebarToggle = false; }
+      }
+    } catch (e) {
+      console.debug("[Local LLM] Could not auto-collapse accidental sidebar activation", e);
+    } finally {
+      sidebarCollapsePending = false;
+    }
+  });
+}
+
 function renderSidebarLauncher(el) {
-  el.innerHTML=`<div class="llm-sidebar-launch"><div class="llm-card"><b>Local LLM Server</b><div class="llm-muted" style="margin:6px 0 10px">${esc(status.vram_yielded && status.state === "ready" ? "yielded" : (status.state||"stopped"))} • ${esc(status.model||"no model")}</div><button class="llm-btn primary">Open Server</button></div></div>`;
-  el.querySelector("button").onclick=openModal;
-  // Selecting the sidebar item behaves as a launcher. Defer one frame so ComfyUI
-  // can finish mounting the custom sidebar content first.
-  requestAnimationFrame(()=>openModal());
+  // This tab exists only to obtain a normal ComfyUI sidebar launcher/icon. The
+  // actual UI is modal-only. If the host activates/mounts the tab despite our
+  // event interception, immediately toggle it closed instead of opening a second
+  // copy of the UI in the side panel.
+  el.innerHTML=`<div class="llm-sidebar-launch"><div class="llm-card"><b>Local LLM Server</b><div class="llm-muted" style="margin:6px 0 10px">Opening…</div></div></div>`;
+  collapseAccidentalLLMSidebar();
 }
 
 function nodeWidget(node, name) { return node?.widgets?.find((w) => w.name === name); }
@@ -1164,16 +1199,21 @@ app.registerExtension({
       type: "custom",
       render: renderSidebarLauncher,
     });
-    // Open the modal directly from the sidebar launcher, even while ComfyUI is
-    // generating. This bypasses sidebar-panel mounting, which some frontend
-    // states temporarily suppress while a queue is active.
-    document.addEventListener("pointerdown", (event) => {
+    // Treat the sidebar icon as a modal-only launcher. ComfyUI versions differ
+    // on whether sidebar activation happens on pointerdown or click, so intercept
+    // both in the capture phase. stopImmediatePropagation() prevents a native
+    // sidebar-toggle handler on the same event from also opening the side panel.
+    const interceptLLMLauncher = (event, open=false) => {
+      if (allowNativeSidebarToggle) return;
       const launcher = event.target?.closest?.('[data-local-llm-launcher="1"]');
       if (!launcher) return;
       event.preventDefault();
+      event.stopImmediatePropagation?.();
       event.stopPropagation();
-      openModal();
-    }, true);
+      if (open) openModal();
+    };
+    document.addEventListener("pointerdown", (event) => interceptLLMLauncher(event, true), true);
+    document.addEventListener("click", (event) => interceptLLMLauncher(event, false), true);
     try {
       api.addEventListener("local_llm_server_status", (event) => {
         status = event?.detail || event || status;
