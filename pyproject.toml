@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-local-gguf-llm"
-version = "0.10.6a0"
+version = "0.10.7a0"
 description = "Persistent local GGUF LLM server, OpenAI API, and ComfyUI nodes"
 requires-python = ">=3.10"
 
