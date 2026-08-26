@@ -1,3 +1,9 @@
+"""Local GGUF/llama.cpp runtime used by the persistent Local LLM service.
+
+This module owns model discovery, llama.cpp loading, multimodal handling,
+reasoning parsing, VRAM coordination, and the internal ComfyUI execution node.
+"""
+
 import base64
 import copy
 import gc
@@ -9,7 +15,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -17,7 +22,7 @@ from pathlib import Path
 import folder_paths
 
 from .gguf_meta import read_gguf_metadata, detect_family, recommended_model_preset, available_model_presets
-from .presets import MODEL_PRESETS, MODEL_PRESET_META, MEMORY_PRESETS, capabilities_for_family, public_presets
+from .presets import MODEL_PRESETS, MEMORY_PRESETS, capabilities_for_family, public_presets
 
 LLM_DIR = os.path.join(folder_paths.models_dir, "llm")
 os.makedirs(LLM_DIR, exist_ok=True)
@@ -29,7 +34,16 @@ except Exception:
 
 _NONE = "None"
 _AUTO_VISION = "Auto (matching mmproj)"
-_MODEL_CACHE = {"key": None, "llm": None, "metadata": None, "family": None, "base_chat_handler": None, "managed_adapter": None, "load_diagnostics": None, "mode": None}
+_MODEL_CACHE = {
+    "key": None,
+    "llm": None,
+    "metadata": None,
+    "family": None,
+    "base_chat_handler": None,
+    "managed_adapter": None,
+    "load_diagnostics": None,
+    "mode": None,
+}
 _MODEL_LOCK = threading.RLock()
 _META_CACHE = {}
 
@@ -578,7 +592,6 @@ def _perf_delta(after, before):
     }
 
 
-
 def _prompt_cache_context_snapshot(llm):
     """Cheap resident-context snapshot for prompt-cache accounting.
 
@@ -711,8 +724,7 @@ def _gpu_choices():
     """Return logical accelerator indices with human-readable device names.
 
     Prefer PyTorch because its logical device numbering follows the exact CUDA/ROCm
-    visibility seen by ComfyUI (including CUDA_VISIBLE_DEVICES remapping). Fall back
-    to nvidia-smi only when torch cannot enumerate an accelerator.
+    visibility seen by ComfyUI (including CUDA_VISIBLE_DEVICES remapping).
     """
     devices = []
     try:
@@ -733,29 +745,6 @@ def _gpu_choices():
                         devices.append(f"{i} — {torch.cuda.get_device_name(i)}")
                     except Exception:
                         devices.append(f"{i} — GPU {i}")
-    except Exception:
-        pass
-
-    if devices:
-        return devices
-
-    # Fallback is mainly useful when ComfyUI is using a non-standard Python
-    # environment where torch enumeration is unavailable but NVIDIA tools are.
-    try:
-        output = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=index,name,memory.total", "--format=csv,noheader,nounits"],
-            text=True, stderr=subprocess.DEVNULL, timeout=2,
-        )
-        for line in output.splitlines():
-            parts = [x.strip() for x in line.split(",", 2)]
-            if len(parts) >= 2 and parts[0].isdigit():
-                idx, name = int(parts[0]), parts[1]
-                mem = parts[2] if len(parts) >= 3 else ""
-                try:
-                    gib = float(mem) / 1024.0
-                    devices.append(f"{idx} — {name} ({gib:.1f} GiB)")
-                except Exception:
-                    devices.append(f"{idx} — {name}")
     except Exception:
         pass
 
@@ -1065,7 +1054,6 @@ def _require_init_option(llama_init_params, has_var_kw, option, reason):
     )
 
 
-
 _LOGGER = logging.getLogger(__name__)
 _MIB = 1024 * 1024
 _GIB = 1024 * 1024 * 1024
@@ -1167,6 +1155,17 @@ def _llama_gpu_offload_hint(llama_cpp):
     return None
 
 
+def _model_file_size(load_kwargs):
+    """Return the configured GGUF size for diagnostics without raising."""
+    path = load_kwargs.get("model_path")
+    if not path:
+        return 0
+    try:
+        return int(os.path.getsize(path))
+    except OSError:
+        return 0
+
+
 def _llama_backend_libraries(llama_cpp):
     """Return a small diagnostic list; never use this alone to decide GPU support."""
     try:
@@ -1223,7 +1222,7 @@ def _load_llama_verified(llama_cpp, Llama, load_kwargs, gpu_layers):
         "snapshot_before_seconds": round(snapshot_before_seconds, 4),
         "snapshot_after_seconds": round(snapshot_after_seconds, 4),
         "load_mode": load_mode,
-        "model_file_size_bytes": int(os.path.getsize(load_kwargs.get("model_path"))) if load_kwargs.get("model_path") and os.path.exists(load_kwargs.get("model_path")) else 0,
+        "model_file_size_bytes": _model_file_size(load_kwargs),
         **host_delta,
     }
     try:
@@ -1310,7 +1309,7 @@ def _load_llama_fast(Llama, load_kwargs, prior_diagnostics=None, reload_count=0)
             if free_before is not None and free_after is not None else None
         ),
         "load_mode": load_mode,
-        "model_file_size_bytes": int(os.path.getsize(load_kwargs.get("model_path"))) if load_kwargs.get("model_path") and os.path.exists(load_kwargs.get("model_path")) else 0,
+        "model_file_size_bytes": _model_file_size(load_kwargs),
         **host_delta,
     })
     _perf_log(
@@ -2088,7 +2087,7 @@ class _NativeLLMResident:
             before = int(max(0, self._accounted_size))
             free_before = _raw_cuda_free_bytes(self.load_device) if self.load_device.type == "cuda" else None
 
-            # Break every strong reference we own *before* closing.  The local
+            # Break every strong reference we own *before* closing. The local
             # `llm` variable is then the only intentional owner of the context.
             llm = self._llm
             self._llm = None
@@ -2103,64 +2102,39 @@ class _NativeLLMResident:
             del llm
 
             free_after_close = _raw_cuda_free_bytes(self.load_device) if self.load_device.type == "cuda" else None
-            gc_seconds = 0.0
             cache_seconds = 0.0
-            fallback_gc_used = False
             fallback_cache_used = False
 
-            if heavy_cleanup:
-                gc_started = time.perf_counter()
-                gc.collect()
-                gc_seconds = time.perf_counter() - gc_started
-                try:
-                    import comfy.model_management as mm
-                    cache_started = time.perf_counter()
-                    mm.soft_empty_cache()
-                    cache_seconds = time.perf_counter() - cache_started
-                except Exception:
-                    pass
-            elif self.load_device.type == "cuda" and free_after_close is not None:
-                # Normal Auto Yield is intentionally just close()+drop refs. Only
-                # invoke Python GC/PyTorch cache cleanup when VRAM demonstrably did
-                # not return enough for the caller's requested target (or barely
-                # changed at all when no target was supplied).
+            # Auto Yield never forces Python garbage collection. The native llama
+            # context close plus dropping our references is the ownership boundary
+            # that should release llama.cpp VRAM. ComfyUI/PyTorch cache handling is
+            # separate and is only useful for a concrete remaining memory target.
+            if (
+                not heavy_cleanup
+                and self.load_device.type == "cuda"
+                and free_after_close is not None
+            ):
                 target = max(0, int(required_free_bytes or 0))
-                delta = max(0, free_after_close - (free_before or 0)) if free_before is not None else 0
-                release_failed = (target > 0 and free_after_close < target)
-                if target <= 0 and free_before is not None and before >= 256 * _MIB:
-                    expected_floor = min(256 * _MIB, max(32 * _MIB, int(before * 0.02)))
-                    release_failed = delta < expected_floor
-                if release_failed:
-                    fallback_gc_used = True
-                    gc_started = time.perf_counter()
-                    gc.collect()
-                    gc_seconds = time.perf_counter() - gc_started
-                    free_after_gc = _raw_cuda_free_bytes(self.load_device)
-                    # PyTorch cache is unrelated to the native llama allocation.
-                    # Only pay for ComfyUI's synchronized cache flush if its
-                    # reclaimable allocator blocks can actually cover the remaining
-                    # driver-visible shortfall; otherwise the outer ComfyUI
-                    # free_memory() call will evict a model anyway.
-                    if target > 0 and free_after_gc is not None and free_after_gc < target:
-                        try:
-                            import comfy.model_management as mm
-                            remaining = max(0, target - free_after_gc)
-                            breakdown = _comfy_memory_breakdown(mm, self.load_device)
-                            reclaimable = int(breakdown.get("torch_reclaimable_bytes") or 0)
-                            if reclaimable >= remaining and reclaimable >= 16 * _MIB:
-                                fallback_cache_used = True
-                                cache_started = time.perf_counter()
-                                mm.soft_empty_cache()
-                                cache_seconds = time.perf_counter() - cache_started
-                            else:
-                                _perf_log(
-                                    "skip post-LLM-close PyTorch cache flush",
-                                    signature=self.signature_id,
-                                    remaining_shortfall_mib=remaining / _MIB,
-                                    reclaimable_mib=reclaimable / _MIB,
-                                )
-                        except Exception:
-                            pass
+                if target > 0 and free_after_close < target:
+                    try:
+                        import comfy.model_management as mm
+                        remaining = max(0, target - free_after_close)
+                        breakdown = _comfy_memory_breakdown(mm, self.load_device)
+                        reclaimable = int(breakdown.get("torch_reclaimable_bytes") or 0)
+                        if reclaimable >= remaining and reclaimable >= 16 * _MIB:
+                            fallback_cache_used = True
+                            cache_started = time.perf_counter()
+                            mm.soft_empty_cache()
+                            cache_seconds = time.perf_counter() - cache_started
+                        else:
+                            _perf_log(
+                                "skip post-LLM-close PyTorch cache flush",
+                                signature=self.signature_id,
+                                remaining_shortfall_mib=remaining / _MIB,
+                                reclaimable_mib=reclaimable / _MIB,
+                            )
+                    except Exception:
+                        pass
 
             free_after = _raw_cuda_free_bytes(self.load_device) if self.load_device.type == "cuda" else None
             self._unload_count += 1
@@ -2171,10 +2145,10 @@ class _NativeLLMResident:
                 "unload_count": self._unload_count,
                 "released_accounted_bytes": before,
                 "close_seconds": round(close_seconds, 4),
-                "gc_seconds": round(gc_seconds, 4),
+                "gc_seconds": 0.0,
                 "soft_empty_cache_seconds": round(cache_seconds, 4),
                 "heavy_cleanup": bool(heavy_cleanup),
-                "fallback_gc_used": bool(fallback_gc_used),
+                "fallback_gc_used": False,
                 "fallback_cache_used": bool(fallback_cache_used),
                 "required_free_mib": round(int(required_free_bytes or 0) / _MIB, 1),
                 "total_seconds": round(total_seconds, 4),
@@ -2192,9 +2166,9 @@ class _NativeLLMResident:
                 reason=reason,
                 unload_count=self._unload_count,
                 close_s=close_seconds,
-                gc_s=gc_seconds,
+                gc_s=0.0,
                 cache_s=cache_seconds,
-                fallback_gc=fallback_gc_used,
+                fallback_gc=False,
                 fallback_cache=fallback_cache_used,
                 total_s=total_seconds,
                 accounted_mib=before / _MIB,
@@ -2210,11 +2184,9 @@ def _cleanup_llm():
     total_started = time.perf_counter()
     _perf_log("explicit cleanup begin", mode=_MODEL_CACHE.get("mode"))
     resident_ctl = _MODEL_CACHE.get("managed_adapter")
-    cleanup_done = False
     if resident_ctl is not None:
         try:
             resident_ctl._unload_native(reason="explicit-cleanup", heavy_cleanup=True)
-            cleanup_done = True
         except Exception as e:
             _LOGGER.warning("[Local GGUF LLM] Native resident explicit cleanup failed: %s", e)
     else:
@@ -2232,21 +2204,21 @@ def _cleanup_llm():
             "mode": None,
         })
 
-    # Direct/unmanaged contexts do not have the resident controller's explicit
-    # heavy cleanup. Keep Stop/Reload/model-change teardown conservative there.
-    gc_seconds = 0.0
+    # Stop/Reload/model-change teardown is the single explicit Python GC
+    # boundary. All model-cache references have been cleared before this point.
+    gc_started = time.perf_counter()
+    gc.collect()
+    gc_seconds = time.perf_counter() - gc_started
+
+    # ComfyUI/PyTorch allocator cleanup is intentionally separate from Python GC.
     cache_seconds = 0.0
-    if not cleanup_done:
-        gc_started = time.perf_counter()
-        gc.collect()
-        gc_seconds = time.perf_counter() - gc_started
-        try:
-            import comfy.model_management as mm
-            cache_started = time.perf_counter()
-            mm.soft_empty_cache()
-            cache_seconds = time.perf_counter() - cache_started
-        except Exception:
-            pass
+    try:
+        import comfy.model_management as mm
+        cache_started = time.perf_counter()
+        mm.soft_empty_cache()
+        cache_seconds = time.perf_counter() - cache_started
+    except Exception:
+        pass
     _perf_log(
         "explicit cleanup complete",
         gc_s=gc_seconds,
@@ -2481,8 +2453,6 @@ def _vision_handler(family, mmproj_path, thinking_mode, preserve_thinking, reaso
     return _instantiate_handler(cls, mmproj_path, extra)
 
 
-
-
 def _embedded_template_chat_handler(llm, template_kwargs):
     """Wrap the GGUF embedded Jinja template and inject template kwargs.
 
@@ -2567,7 +2537,6 @@ def _thinking_template_kwargs(family, thinking_mode, preserve_thinking, reasonin
             x["enable_thinking"] = False
 
     return x
-
 
 
 _REASONING_FIELD_NAMES = (

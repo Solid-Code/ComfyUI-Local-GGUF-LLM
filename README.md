@@ -6,7 +6,7 @@ This package includes:
 
 - **Local LLM Generate** — send prompts, images, and sampled video frames to the persistent local LLM.
 - **Local LLM Settings** — reusable sampler, vision-limit, token, penalty, and seed settings.
-- **Local LLM Prompt Enhancer** — bundled **v0.6.10-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
+- **Local LLM Prompt Enhancer** — bundled **v0.6.12-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
 - **Local LLM Server panel** — model loading, presets, memory/VRAM controls, status, performance information, and the optional OpenAI-compatible API.
 
 
@@ -35,7 +35,7 @@ ComfyUI/custom_nodes/ComfyUI-Local-GGUF-LLM/
 
 Restart ComfyUI, then hard-refresh the browser if an older frontend is still cached.
 
-Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.10 is already bundled here.
+Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.12 is already bundled here.
 
 ## GGUF model folders
 
@@ -139,14 +139,14 @@ Settings includes the sampler controls, generation limits, vision limits, and se
 
 ## Local LLM Prompt Enhancer
 
-The bundled **Local LLM Prompt Enhancer v0.6.10-alpha** uses the same persistent Local GGUF service. No second LLM server or second model load is required.
+The bundled **Local LLM Prompt Enhancer v0.6.12-alpha** uses the same persistent Local GGUF service. No second LLM server or second model load is required.
 
 ### Main workflow
 
 1. Add **Local LLM Prompt Enhancer**.
 2. Enter the original text in **Prompt**.
 3. Choose an **Enhancement Preset** or edit **Enhancement Instructions**.
-4. Click **Enhance Prompt** for a manual enhancement.
+4. Set the number beside **Enhance Prompt** to `1` for a single result or higher for a batch, then click **Enhance Prompt**. Batch counts above `1` automatically switch **Overwrite Enhanced** to **Add New** and lock that choice until the count returns to `1`.
 5. Edit the resulting **Enhanced Prompt** if needed.
 6. Connect `enhanced_prompt` downstream to the node that should receive the enhanced text.
 

@@ -1,0 +1,18 @@
+# ComfyUI-Local-GGUF-LLM — intentionally non-invasive requirements
+#
+# This file deliberately installs NOTHING.
+#
+# ComfyUI already provides the runtime packages this custom node uses, including:
+#   torch
+#   numpy
+#   Pillow
+#   aiohttp
+#
+# IMPORTANT: llama-cpp-python is intentionally NOT listed here.
+# It must be installed separately in the same Python environment as ComfyUI using
+# the build appropriate for that machine (for example, a CUDA-enabled build).
+# Automatically installing llama-cpp-python from requirements.txt can replace a
+# working GPU-enabled build with an incompatible or CPU-only wheel.
+#
+# Keeping this requirements file dependency-free lets ComfyUI Manager safely run
+# `pip install -r requirements.txt` without modifying the user's Python/CUDA stack.

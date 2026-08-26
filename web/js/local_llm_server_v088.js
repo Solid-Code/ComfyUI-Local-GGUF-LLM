@@ -2055,7 +2055,9 @@ function createServicePanelNumberControl(node, name, labelText) {
     const move=(ev)=>{
       if(ev.pointerId!==pointerId) return;
       const dx=ev.clientX-startX;
-      const totalSteps=Math.trunc(dx/10);
+      // Nodes 2.0-style direct scrub: approximately one configured value step
+      // for each horizontal CSS pixel of pointer movement.
+      const totalSteps=Math.trunc(dx);
       if(totalSteps!==0) moved=true;
       if(totalSteps===appliedSteps) return;
       appliedSteps=totalSteps;
@@ -2084,11 +2086,24 @@ function createServicePanelNumberControl(node, name, labelText) {
 function addServicePanelNumberField(node, content, controls, name, labelText) {
   const created=createServicePanelNumberControl(node,name,labelText);
   if(!created) return;
-  const field=servicePanelElement("div","llmn-field");
+  const field=servicePanelElement("div","llmn-field llmn-number-field");
   field.appendChild(servicePanelFieldLabel(labelText));
   field.appendChild(created.shell);
   content.appendChild(field);
   controls[name]=created.input;
+}
+
+function syncServicePanelNumberLabelWidth(node) {
+  const root=node?.__localLLMPanelRoot;
+  if(!root) return;
+  const labels=[...root.querySelectorAll(".llmn-number-field > .llmn-field-label")];
+  if(!labels.length) return;
+  let maxWidth=0;
+  for(const label of labels){
+    const rect=label.getBoundingClientRect?.();
+    maxWidth=Math.max(maxWidth,Number(rect?.width)||Number(label.scrollWidth)||0);
+  }
+  if(maxWidth>0) root.style.setProperty("--llmn-number-label-width",`${Math.ceil(maxWidth+4)}px`);
 }
 
 function addServicePanelTextarea(node, content, controls, name, placeholder) {
@@ -2134,13 +2149,13 @@ function createServiceNodeDomPanel(node) {
     .local-llm-service-node-panel .llmn-textarea{display:block;min-height:108px;padding:8px 9px;resize:vertical;line-height:1.35}
     .local-llm-service-node-panel .llmn-select:focus,.local-llm-service-node-panel .llmn-input:focus,.local-llm-service-node-panel .llmn-textarea:focus{border-color:rgba(120,170,255,.9);box-shadow:0 0 0 1px rgba(120,170,255,.32)}
     .local-llm-service-node-panel .llmn-select,.local-llm-service-node-panel .llmn-input{min-height:38px;padding:5px 8px}
-    .local-llm-service-node-panel .llmn-number{position:relative;display:flex;align-items:stretch;width:100%;min-width:0;height:38px;overflow:hidden;border:1px solid rgba(127,127,127,.38);border-radius:10px;background:rgba(127,127,127,.14);color:inherit;font-variant-numeric:tabular-nums;isolation:isolate;user-select:none}
+    .local-llm-service-node-panel .llmn-number{position:relative;display:flex;align-items:stretch;width:100%;min-width:0;height:30px;overflow:hidden;border:1px solid rgba(127,127,127,.38);border-radius:10px;background:rgba(127,127,127,.14);color:inherit;font-variant-numeric:tabular-nums;isolation:isolate;user-select:none}
     .local-llm-service-node-panel .llmn-number-fill{position:absolute;z-index:0;inset:0 auto 0 0;width:0;pointer-events:none;background:rgba(71,133,181,.38);transition:width .06s linear}
-    .local-llm-service-node-panel .llmn-number-step{position:relative;z-index:2;flex:0 0 38px;width:38px;height:100%;padding:0;border:0;border-radius:0;background:transparent;color:rgba(235,235,235,.6);display:flex;align-items:center;justify-content:center;cursor:pointer;touch-action:manipulation}
+    .local-llm-service-node-panel .llmn-number-step{position:relative;z-index:2;flex:0 0 32px;width:32px;height:100%;padding:0;border:0;border-radius:0;background:transparent;color:rgba(235,235,235,.6);display:flex;align-items:center;justify-content:center;cursor:pointer;touch-action:manipulation}
     .local-llm-service-node-panel .llmn-number-step:hover:not(:disabled){background:rgba(255,255,255,.07);color:rgba(255,255,255,.82)}
     .local-llm-service-node-panel .llmn-number-step:active:not(:disabled){background:rgba(255,255,255,.11)}
     .local-llm-service-node-panel .llmn-number-step:disabled{opacity:.28;cursor:default}
-    .local-llm-service-node-panel .llmn-number-step svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
+    .local-llm-service-node-panel .llmn-number-step svg{width:18px;height:18px;stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
     .local-llm-service-node-panel .llmn-number-center{position:relative;z-index:2;min-width:4ch;flex:1 1 auto;height:100%}
     .local-llm-service-node-panel .llmn-number-input{position:absolute;inset:0;width:100%;height:100%;min-width:0;border:0;outline:0;background:transparent;color:#f5f5f5;font:inherit;font-size:15px;font-weight:500;text-align:center;padding:0 5px;font-variant-numeric:tabular-nums;user-select:text}
     .local-llm-service-node-panel .llmn-number-input:focus{outline:0;box-shadow:none}
@@ -2152,6 +2167,7 @@ function createServiceNodeDomPanel(node) {
     .local-llm-service-node-panel .llmn-number-disabled{opacity:.48}
     .local-llm-service-node-panel .llmn-number-disabled .llmn-number-scrub{cursor:default}
     .local-llm-service-node-panel .llmn-field{display:grid;grid-template-columns:minmax(118px,38%) 1fr;gap:8px;align-items:center;width:100%}
+    .local-llm-service-node-panel .llmn-number-field{grid-template-columns:var(--llmn-number-label-width,152px) minmax(0,1fr)}
     .local-llm-service-node-panel .llmn-field-label{font-weight:600;opacity:.9;min-width:0}
     .local-llm-service-node-panel .llmn-selector-actions{display:grid;grid-template-columns:42px minmax(0,1fr) 42px;gap:6px;align-items:center;width:100%}
     .local-llm-service-node-panel .llmn-button{min-height:38px;min-width:42px;padding:6px 10px;border:1px solid rgba(127,127,127,.42);border-radius:6px;background:rgba(127,127,127,.18);color:inherit;font:inherit;font-weight:600;cursor:pointer;touch-action:manipulation}
@@ -2165,7 +2181,7 @@ function createServiceNodeDomPanel(node) {
     .local-llm-service-node-panel .llmn-mini-label{display:block;font-size:11px;font-weight:600;opacity:.75;margin:0 0 3px 2px}
     .local-llm-service-node-panel .llmn-badge{font-size:11px;opacity:.75;text-align:right}
     .local-llm-service-node-panel .llmn-disabled{opacity:.48}
-    @media(max-width:520px){.local-llm-service-node-panel .llmn-field{grid-template-columns:1fr;gap:4px}.local-llm-service-node-panel .llmn-selector-actions{grid-template-columns:44px minmax(0,1fr) 44px}.local-llm-service-node-panel .llmn-icon-button{width:44px;min-width:44px}.local-llm-service-node-panel .llmn-select,.local-llm-service-node-panel .llmn-input{min-height:42px}.local-llm-service-node-panel .llmn-number{height:44px}.local-llm-service-node-panel .llmn-number-step{flex-basis:44px;width:44px}.local-llm-service-node-panel .llmn-textarea{min-height:120px}.local-llm-service-node-panel .llmn-seed-grid{grid-template-columns:1fr}}
+    @media(max-width:520px){.local-llm-service-node-panel .llmn-field{grid-template-columns:1fr;gap:4px}.local-llm-service-node-panel .llmn-selector-actions{grid-template-columns:44px minmax(0,1fr) 44px}.local-llm-service-node-panel .llmn-icon-button{width:44px;min-width:44px}.local-llm-service-node-panel .llmn-select,.local-llm-service-node-panel .llmn-input{min-height:42px}.local-llm-service-node-panel .llmn-number{height:34px}.local-llm-service-node-panel .llmn-number-step{flex-basis:36px;width:36px}.local-llm-service-node-panel .llmn-textarea{min-height:120px}.local-llm-service-node-panel .llmn-seed-grid{grid-template-columns:1fr}}
   `;
   root.appendChild(css);
   const content=servicePanelElement("div","llmn-content");
@@ -2200,6 +2216,7 @@ function createServiceNodeDomPanel(node) {
   node.__localLLMPanelControls=controls;
   node.__localLLMPanelRoot=root;
   node.__localLLMPanelContent=content;
+  requestAnimationFrame(()=>syncServicePanelNumberLabelWidth(node));
   applyServiceTextareaHeights(node,node.__localLLMTextareaHeights || node?.properties?.[SERVICE_UI_STATE_KEY]?.textareaHeights,{schedule:false});
 
   const panelHeight=()=>measureServicePanelHeight(node);
@@ -2212,7 +2229,7 @@ function createServiceNodeDomPanel(node) {
   syncServiceNodeDomPanel(node);
 
   if(typeof ResizeObserver!=="undefined"){
-    const ro=new ResizeObserver(()=>scheduleServiceNodePanelHeight(node)); ro.observe(content); node.__localLLMPanelResizeObserver=ro;
+    const ro=new ResizeObserver(()=>{syncServicePanelNumberLabelWidth(node);scheduleServiceNodePanelHeight(node);}); ro.observe(content); node.__localLLMPanelResizeObserver=ro;
     const tro=new ResizeObserver(()=>captureServiceTextareaHeights(node));
     if(controls.system_prompt) tro.observe(controls.system_prompt);
     if(controls.prompt) tro.observe(controls.prompt);

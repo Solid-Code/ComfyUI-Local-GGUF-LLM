@@ -124,6 +124,21 @@ MEMORY_PRESET_SCHEMA = "local_llm_memory_preset"
 MEMORY_PRESET_VERSION = 1
 
 
+_RESERVED_PRESET_NAMES = frozenset({"default", "custom", "server default"})
+_BUILTIN_MEMORY_PRESET_NAMES = frozenset(str(name).lower() for name in MEMORY_PRESETS)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Atomically replace a small UTF-8 settings/preset file."""
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(path)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    _atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False))
+
+
 def _ensure_preset_dirs():
     for path in (PRESET_ROOT_DIR, SAMPLER_PRESET_DIR, SYSTEM_PROMPT_PRESET_DIR, PROMPT_PRESET_DIR, MEMORY_PRESET_DIR):
         path.mkdir(parents=True, exist_ok=True)
@@ -139,7 +154,7 @@ def _safe_preset_name(name: str) -> str:
     name = name.rstrip('. ').strip()
     if not name:
         raise ValueError("Preset name cannot be empty")
-    if name.lower() in {"default", "custom", "server default"}:
+    if name.lower() in _RESERVED_PRESET_NAMES:
         raise ValueError(f"'{name}' is reserved; choose another preset name")
     if len(name) > 96:
         name = name[:96].rstrip()
@@ -215,16 +230,14 @@ def save_sampler_preset(name: str, settings: dict[str, Any]) -> dict[str, Any]:
         "name": clean_name,
         "settings": clean,
     }
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
+    _atomic_write_json(path, payload)
     return {"name": clean_name, "settings": copy.deepcopy(clean), "path": str(path)}
 
 
 def delete_sampler_preset(name: str) -> dict[str, Any]:
     """Delete one user sampler preset without ever accepting an arbitrary path."""
     requested = str(name or "").strip()
-    if requested.lower() in {"default", "custom", "server default"}:
+    if requested.lower() in _RESERVED_PRESET_NAMES:
         raise ValueError(f"'{requested or 'Default'}' is a built-in selector and cannot be deleted")
     item = sampler_presets().get(requested)
     if item is None:
@@ -278,16 +291,14 @@ def save_text_preset(kind: str, name: str, text: str) -> dict[str, Any]:
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / (clean_name + ".txt")
     value = str(text if text is not None else "")
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(value, encoding="utf-8")
-    tmp.replace(path)
+    _atomic_write_text(path, value)
     return {"name": clean_name, "text": value, "path": str(path)}
 
 
 def delete_text_preset(kind: str, name: str) -> dict[str, Any]:
     """Delete one user text preset without accepting an arbitrary path."""
     requested = str(name or "").strip()
-    if requested.lower() in {"default", "custom", "server default"}:
+    if requested.lower() in _RESERVED_PRESET_NAMES:
         raise ValueError(f"'{requested or 'Custom'}' is a built-in selector and cannot be deleted")
     directory = _text_preset_dir(kind)
     item = text_presets(kind).get(requested)
@@ -347,7 +358,7 @@ def memory_presets() -> dict[str, dict[str, Any]]:
 
 def save_memory_preset(name: str, settings: dict[str, Any]) -> dict[str, Any]:
     clean_name = _safe_preset_name(name)
-    if clean_name.lower() in {str(x).lower() for x in MEMORY_PRESETS}:
+    if clean_name.lower() in _BUILTIN_MEMORY_PRESET_NAMES:
         raise ValueError(f"'{clean_name}' is a built-in memory preset and cannot be overwritten from the UI")
     clean = _validate_memory_preset_settings(settings)
     path = MEMORY_PRESET_DIR / (clean_name + ".json")
@@ -355,9 +366,7 @@ def save_memory_preset(name: str, settings: dict[str, Any]) -> dict[str, Any]:
         "schema": MEMORY_PRESET_SCHEMA, "schema_version": MEMORY_PRESET_VERSION,
         "name": clean_name, "settings": clean,
     }
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
+    _atomic_write_json(path, payload)
     return {"name": clean_name, "settings": copy.deepcopy(clean), "path": str(path)}
 
 
@@ -558,9 +567,7 @@ def _load_config_file() -> dict[str, Any]:
 
 def _write_config_file(config: dict[str, Any]):
     path = _config_path()
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(path)
+    _atomic_write_json(path, config)
 
 
 def _normalized_messages(messages):
@@ -663,6 +670,23 @@ class LocalLLMServiceManager:
     def logs(self):
         with self._state_lock:
             return list(self._logs)
+
+    def _clear_current_request_locked(self, *, phase: bool = False, metrics: bool = False) -> None:
+        """Clear live request fields while ``_state_lock`` is held.
+
+        ``phase`` and ``metrics`` preserve the previous call-site semantics; this
+        helper only centralizes assignments that had been repeated in several
+        lifecycle paths.
+        """
+        self._current_client = None
+        self._current_started = None
+        if phase:
+            self._current_phase_started = None
+        if metrics:
+            self._current_completion_tokens = 0
+            self._current_tokens_per_second = 0.0
+            self._current_prompt_tokens = 0
+            self._current_prompt_tokens_per_second = 0.0
 
     @staticmethod
     def _safe_content_for_log(value, limit=8000):
@@ -1019,9 +1043,7 @@ class LocalLLMServiceManager:
                     self._state = STATE_READY
                     self._model_loaded = True
                     self._error = None
-                    self._current_client = None
-                    self._current_started = None
-                    self._current_phase_started = None
+                    self._clear_current_request_locked(phase=True)
                 self._log(
                     "Native GGUF suspended; service yielded and ready for fast reload "
                     f"(sync={sync_seconds:.3f}s, total={time.perf_counter() - started:.3f}s, "
@@ -1055,8 +1077,7 @@ class LocalLLMServiceManager:
                 self._state = STATE_STOPPED
                 self._error = None
                 self._restart_required = False
-                self._current_client = None
-                self._current_started = None
+                self._clear_current_request_locked()
             self._emit()
         return self.status()
 
@@ -1244,13 +1265,7 @@ class LocalLLMServiceManager:
                     self._last_generation_seconds = elapsed
                     self._last_result = copy.deepcopy(result)
                     self._state = STATE_READY
-                    self._current_client = None
-                    self._current_started = None
-                    self._current_phase_started = None
-                    self._current_completion_tokens = 0
-                    self._current_tokens_per_second = 0.0
-                    self._current_prompt_tokens = 0
-                    self._current_prompt_tokens_per_second = 0.0
+                    self._clear_current_request_locked(phase=True, metrics=True)
                     self._error = None
                 info = result.get("info") or {}
                 speed = info.get("tokens_per_second")
@@ -1336,12 +1351,7 @@ class LocalLLMServiceManager:
                 # model is still resident. Keep READY when possible.
                 self._state = STATE_READY if self._api is not None and self._api.is_loaded() else STATE_ERROR
                 self._error = f"{type(e).__name__}: {e}"
-                self._current_client = None
-                self._current_started = None
-                self._current_completion_tokens = 0
-                self._current_tokens_per_second = 0.0
-                self._current_prompt_tokens = 0
-                self._current_prompt_tokens_per_second = 0.0
+                self._clear_current_request_locked(metrics=True)
             self._log(self._error, "error")
             raise
         finally:
@@ -2620,6 +2630,31 @@ try:
     def _json_error(message, status=400):
         return web.json_response({"error": {"message": str(message), "type": "local_llm_server_error"}}, status=status)
 
+    _SSE_HEADERS = {
+        "Content-Type": "text/event-stream; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+
+    def _sse_response():
+        return web.StreamResponse(status=200, headers=dict(_SSE_HEADERS))
+
+    def _token_queue_callback(loop, token_queue):
+        def on_token(event):
+            try:
+                loop.call_soon_threadsafe(token_queue.put_nowait, dict(event or {}))
+            except Exception:
+                pass
+        return on_token
+
+    async def _finish_sse(stream):
+        await stream.write(b"data: [DONE]\n\n")
+        try:
+            await stream.write_eof()
+        except Exception:
+            pass
+
     def _authorized(request):
         cfg = SERVICE.get_config()
         if not cfg.get("external_api_enabled"):
@@ -2906,15 +2941,7 @@ try:
                 # buffered response after generation completes.
                 rid = "chatcmpl-" + uuid.uuid4().hex
                 created = int(time.time())
-                stream = web.StreamResponse(
-                    status=200,
-                    headers={
-                        "Content-Type": "text/event-stream; charset=utf-8",
-                        "Cache-Control": "no-cache, no-transform",
-                        "Connection": "keep-alive",
-                        "X-Accel-Buffering": "no",
-                    },
-                )
+                stream = _sse_response()
                 await stream.prepare(request)
 
                 async def write_chunk(delta, finish_reason=None, usage=None):
@@ -2948,13 +2975,9 @@ try:
                 visible_chars = 0
                 reasoning_chars = 0
 
-                def on_token(event):
-                    # Called from the llama.cpp worker thread. Never touch aiohttp
-                    # objects here; only transfer the immutable event to the loop.
-                    try:
-                        loop.call_soon_threadsafe(token_queue.put_nowait, dict(event or {}))
-                    except Exception:
-                        pass
+                # Called from the llama.cpp worker thread. The callback only
+                # transfers a copied event onto aiohttp's event loop.
+                on_token = _token_queue_callback(loop, token_queue)
 
                 generation_task = asyncio.create_task(asyncio.to_thread(
                     SERVICE.generate_messages,
@@ -3016,11 +3039,7 @@ try:
 
                     usage = payload.get("usage") if bool((body.get("stream_options") or {}).get("include_usage")) else None
                     await write_chunk({}, finish_reason="stop", usage=usage)
-                    await stream.write(b"data: [DONE]\n\n")
-                    try:
-                        await stream.write_eof()
-                    except Exception:
-                        pass
+                    await _finish_sse(stream)
 
                 SERVICE._log(
                     f"OpenAI SSE sent {visible_chars} visible chars • {reasoning_chars} reasoning chars to {client}"
@@ -3063,15 +3082,7 @@ try:
 
                 rid = "cmpl-" + uuid.uuid4().hex
                 created = int(time.time())
-                stream = web.StreamResponse(
-                    status=200,
-                    headers={
-                        "Content-Type": "text/event-stream; charset=utf-8",
-                        "Cache-Control": "no-cache, no-transform",
-                        "Connection": "keep-alive",
-                        "X-Accel-Buffering": "no",
-                    },
-                )
+                stream = _sse_response()
                 await stream.prepare(request)
 
                 async def write_text_chunk(text="", finish_reason=None, usage=None):
@@ -3094,11 +3105,7 @@ try:
                 token_queue = asyncio.Queue()
                 visible_chars = 0
 
-                def on_token(event):
-                    try:
-                        loop.call_soon_threadsafe(token_queue.put_nowait, dict(event or {}))
-                    except Exception:
-                        pass
+                on_token = _token_queue_callback(loop, token_queue)
 
                 generation_task = asyncio.create_task(asyncio.to_thread(
                     SERVICE.generate_messages,
@@ -3144,11 +3151,7 @@ try:
                         await write_text_chunk(final_content)
                         visible_chars += len(final_content)
                     await write_text_chunk("", finish_reason="stop", usage=(usage if bool((body.get("stream_options") or {}).get("include_usage")) else None))
-                    await stream.write(b"data: [DONE]\n\n")
-                    try:
-                        await stream.write_eof()
-                    except Exception:
-                        pass
+                    await _finish_sse(stream)
 
                 SERVICE._log(
                     f"OpenAI text SSE sent {visible_chars} visible chars to {client}"

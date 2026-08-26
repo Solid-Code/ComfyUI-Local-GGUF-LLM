@@ -16,7 +16,7 @@ import folder_paths
 
 log = logging.getLogger(__name__)
 
-NODE_VERSION = "0.6.10-alpha"
+NODE_VERSION = "0.6.12-alpha"
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_DIR = PACKAGE_DIR / "templates" / "default"
 USER_TEMPLATE_DIR = Path(folder_paths.models_dir) / "LLM" / "local_LLM_presets" / "prompt_enhancer"
@@ -71,6 +71,13 @@ def _read_text(path: Path) -> str:
         return path.read_text(encoding="utf-8").strip()
     except UnicodeDecodeError:
         return path.read_text(encoding="utf-8-sig").strip()
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Atomically replace a user-owned prompt/template file."""
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(path)
 
 
 def _template_records() -> list[dict[str, Any]]:
@@ -353,9 +360,7 @@ def _save_user_template(name: str, text: str) -> dict[str, Any]:
     if destination.resolve().parent != USER_TEMPLATE_DIR.resolve():
         raise ValueError("Invalid template path.")
 
-    temporary = destination.with_suffix(".txt.tmp")
-    temporary.write_text(text.rstrip() + "\n", encoding="utf-8")
-    temporary.replace(destination)
+    _atomic_write(destination, text.rstrip() + "\n")
     return {
         "label": f"User / {clean_name}",
         "name": clean_name,
@@ -363,10 +368,6 @@ def _save_user_template(name: str, text: str) -> dict[str, Any]:
         "protected": False,
         "text": text,
     }
-
-
-
-
 
 
 def _delete_user_template(label: str) -> dict[str, Any]:
@@ -420,9 +421,7 @@ def _save_prompt_set(name: str, prompts: Any, active_index: Any = 0) -> dict[str
     USER_PROMPT_SET_DIR.mkdir(parents=True, exist_ok=True)
     destination = USER_PROMPT_SET_DIR / f"{clean_name}.json"
     payload = {"name": clean_name, "prompts": clean_prompts, "active_index": index}
-    temporary = destination.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(destination)
+    _atomic_write(destination, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
     return payload
 
 
@@ -438,8 +437,6 @@ def _load_prompt_set(name: str) -> dict[str, Any]:
     prompts = [str(item) for item in prompts]
     index = _normalize_history_index(data.get("active_index", 0), len(prompts))
     return {"name": clean_name, "prompts": prompts, "active_index": index}
-
-
 
 
 def _delete_prompt_set(name: str) -> dict[str, Any]:
@@ -995,7 +992,6 @@ try:
         except Exception as exc:
             log.exception("[Local LLM Prompt Enhancer] Template save failed")
             return _json_error(exc, 500)
-
 
 
     @routes.post("/local_llm_prompt_enhancer/delete_template")

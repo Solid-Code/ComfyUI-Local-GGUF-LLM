@@ -299,7 +299,6 @@ FAMILY_CAPABILITIES = {
 }
 
 
-
 MEMORY_COMMON = {
     "context_size": 32768,
     "kv_cache_k": "q8_0",
