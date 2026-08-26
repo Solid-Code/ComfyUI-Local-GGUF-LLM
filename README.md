@@ -1,59 +1,51 @@
 # ComfyUI Local GGUF LLM
 
-A persistent local GGUF LLM service for ComfyUI, powered by `llama-cpp-python`.
+A single ComfyUI custom-node package for running a persistent local GGUF LLM and using it directly from workflows.
 
-The **LLM sidebar icon opens the server as a modal**; it is intentionally not a persistent sidebar panel.
+This package includes:
 
-The extension is designed to keep a local language model available for ComfyUI workflows without forcing the GGUF to remain in VRAM when diffusion or video models need the GPU. It provides a global LLM service, a workflow generation node, optional vision support, model/memory presets, prompt presets, performance logging, and an optional OpenAI-compatible HTTP endpoint.
+- **Local LLM Generate** — send prompts, images, and sampled video frames to the persistent local LLM.
+- **Local LLM Settings** — reusable sampler, vision-limit, token, penalty, and seed settings.
+- **Local LLM Prompt Enhancer** — bundled **v0.6.10-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
+- **Local LLM Server panel** — model loading, presets, memory/VRAM controls, status, performance information, and the optional OpenAI-compatible API.
 
-## What it does
-
-- Loads `.gguf` language models from `ComfyUI/models/llm/`.
-- Keeps the selected model persistent between LLM requests when practical.
-- Can automatically yield the complete native llama.cpp GPU allocation when ComfyUI needs VRAM, then reload it on the next LLM request.
-- Reuses the same resident model when the model and load settings have not changed.
-- Uses `mmap` by default so Linux/WSL can reuse GGUF pages already cached in system RAM during reloads.
-- Supports text-only and supported multimodal/VLM GGUF models.
-- Supports one image, an image batch, or sampled video frames for compatible vision models.
-- Separates prompt processing speed from generation speed in the status display.
-- Provides detailed load, unload, VRAM handoff, page-cache, and inference performance logs.
 
 ## Requirements
 
 - ComfyUI
 - Python 3.10 or newer
 - `llama-cpp-python` installed in the same Python environment used by ComfyUI
-- A CUDA-enabled `llama-cpp-python` build if GPU inference is desired
+- A CUDA-enabled `llama-cpp-python` build when GPU inference is desired
 
-This extension intentionally does not install or replace `llama-cpp-python`. Installing the wrong wheel can replace a CUDA-enabled build with a CPU-only build.
+This package intentionally does not install or replace `llama-cpp-python`, because installing the wrong wheel can replace a working CUDA build with a CPU-only build.
 
-To verify the version available to ComfyUI:
+Verify the copy visible to ComfyUI with:
 
 ```bash
 python -c "import llama_cpp; print(llama_cpp.__version__)"
 ```
 
-Use the llama-cpp-python installation/build instructions appropriate for your operating system, Python version, CUDA version, and GPU.
-
 ## Installation
 
-Place the extension at:
+Extract the package so the folder is:
 
 ```text
 ComfyUI/custom_nodes/ComfyUI-Local-GGUF-LLM/
 ```
 
-Then restart ComfyUI and refresh the browser. After updating the frontend files, a hard refresh may be useful if the browser has cached an older JavaScript file.
+Restart ComfyUI, then hard-refresh the browser if an older frontend is still cached.
 
-## Model folders
+Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.10 is already bundled here.
 
-Place GGUF files anywhere below:
+## GGUF model folders
+
+Place model GGUF files anywhere below:
 
 ```text
 ComfyUI/models/llm/
 ```
 
-Subfolders are supported. For example:
+Subfolders are supported, for example:
 
 ```text
 ComfyUI/models/llm/
@@ -67,374 +59,240 @@ ComfyUI/models/llm/
     └── mistral-24b-Q4_K_M.gguf
 ```
 
-The model selector searches recursively through the folder.
+The Local LLM model selectors search this folder recursively.
 
-## Basic setup
+## First-time server setup
 
-Open the **LLM** item in the ComfyUI side menu. This opens the Local LLM Server panel.
+Open **LLM** in the ComfyUI side menu to open the Local LLM Server panel.
 
-For a basic text model:
+For a normal first setup:
 
 1. Select the GGUF under **Model**.
-2. Leave **Vision / mmproj** at `None` or `Auto` unless the model supports vision.
-3. Leave **VRAM policy** at `Auto Yield to ComfyUI` unless you specifically want the LLM to remain resident.
-4. Choose a Model Preset or use `Auto (Detected)`.
-5. Choose a Memory / VRAM preset.
+2. Select the matching **Vision / mmproj** only when the model supports vision. Otherwise use `None` or `Auto`.
+3. Select a model preset or use **Auto (Detected)**.
+4. Select the memory/VRAM configuration you want.
+5. For a machine that also runs diffusion/video models, **Auto Yield to ComfyUI** is the recommended VRAM policy.
 6. Save the server settings.
-7. Start or reload the model if required.
-8. Add **Local LLM Service Generate** to the workflow.
-9. Enter a System Prompt and Prompt, then run the workflow.
+7. Start the model, or use **On Demand** so it loads on the first request.
 
-The service can also run in **On Demand** mode, where the model is loaded when it is first needed.
+The server is global and persistent. Workflow nodes send requests to that service instead of creating a new llama.cpp model for every node execution.
 
-## Workflow nodes
+## Local LLM Generate
 
-### Local LLM Service Generate
+Add **Local LLM Generate** from the Local LLM node category.
 
-This is the node to use for normal ComfyUI LLM generation.
+The node provides:
 
-Inputs include:
-
-- **System Prompt Preset** — optional saved system prompt.
-- **System Prompt** — system-role text.
-- **Prompt Preset** — optional saved user prompt.
-- **Prompt** — user-role text.
-- **Sampling Mode** — use the global server defaults, custom values, or a saved sampler preset.
-- **Temperature / Top P / Top K / Min P / penalties** — request-level sampling controls when using Custom mode.
-- **Max Tokens** — output-token limit for the request.
-- **Seed** — standard ComfyUI request seed.
-- **image(s)** — optional single IMAGE or IMAGE batch for a supported vision model.
-- **video_frames** — optional ordered IMAGE batch treated as frames from a video.
+- System Prompt preset and editable System Prompt
+- Prompt preset and editable Prompt
+- sampler preset / custom sampler values
+- Temperature
+- Top P
+- Top K
+- Min P
+- Repeat Penalty
+- Presence Penalty
+- Frequency Penalty
+- Max Tokens
+- vision image/frame limits
+- vision maximum edge size
+- Seed with standard ComfyUI Control After Generate behavior
+- optional `LOCAL_LLM_SETTINGS`
+- optional `IMAGE`
+- optional video frames as an `IMAGE` batch
 
 Outputs:
 
-- **response** — normal final-answer text.
-- **thinking** — separated reasoning/thinking text when the model/template provides it.
-- **info** — JSON metadata and performance information.
-- **tokens** — number of completion tokens generated.
+- `response`
+- `thinking`
+- `info`
+- `tokens`
 
-### Get Local LLM Service
+When a **Local LLM Settings** node is connected, its sampler, vision-limit, and seed values override the matching local Generate controls. Prompt text and media still come from Local LLM Generate.
 
-**This node is reserved for future workflow integration.**
+### Number controls
 
-It exposes a `LOCAL_LLM_SERVICE_API` handle, but there are currently no companion nodes that consume that handle, so it does not provide useful workflow functionality yet. Use **Local LLM Service Generate** for current workflows.
+The custom DOM numeric controls mirror Nodes 2.0 behavior:
 
-This future workflow API node is separate from the optional HTTP/OpenAI-compatible endpoint described later in this README.
+- large touch/clickable `−` and `+` controls
+- drag or touch-scrub left/right to change the value
+- min/max range fill when a real range exists
+- exact step snapping
+- direct click-to-edit
+- keyboard stepping
 
-## Persistent model and VRAM behavior
+The underlying native ComfyUI widgets remain authoritative for serialization and execution.
 
-### Auto Yield to ComfyUI
+## Local LLM Settings
 
-This is the recommended/default VRAM policy for a shared ComfyUI GPU.
+Use **Local LLM Settings** when several Local LLM nodes should share one generation configuration.
 
-While the LLM is resident, llama.cpp owns its native GPU allocation. The GGUF is deliberately kept outside ComfyUI's partial ModelPatcher loading system.
-
-When ComfyUI needs GPU memory:
-
-```text
-ComfyUI memory pressure
-        ↓
-Local LLM yields
-        ↓
-llm.close()
-        ↓
-native GGUF/KV/context VRAM is released
-        ↓
-ComfyUI continues loading its model
-```
-
-On the next LLM request:
+It outputs:
 
 ```text
-LLM request
-    ↓
-check available VRAM
-    ↓
-make room through ComfyUI only if needed
-    ↓
-recreate the native llama.cpp context
-    ↓
-process the real request
+LOCAL_LLM_SETTINGS
 ```
 
-The extension uses a strict load signature. If the same model and load settings are already resident, the load path is a no-op.
+Connect that output to the `settings` input on **Local LLM Generate** or **Local LLM Prompt Enhancer**.
 
-After the first verified load, subsequent reloads use the measured native VRAM requirement for that exact configuration rather than relying only on a conservative estimate.
+Settings includes the sampler controls, generation limits, vision limits, and seed. When connected to Prompt Enhancer, the Settings node is authoritative and Prompt Enhancer's local Seed controls are disabled.
 
-### Keep Resident
+## Local LLM Prompt Enhancer
 
-Keeps the LLM loaded until it is manually stopped/reloaded or the configuration changes. This can reduce LLM latency but leaves less VRAM available for diffusion/video models.
+The bundled **Local LLM Prompt Enhancer v0.6.10-alpha** uses the same persistent Local GGUF service. No second LLM server or second model load is required.
 
-Use this only when you know the LLM and the rest of the workflow comfortably fit together.
+### Main workflow
 
-## mmap and warm reloads
+1. Add **Local LLM Prompt Enhancer**.
+2. Enter the original text in **Prompt**.
+3. Choose an **Enhancement Preset** or edit **Enhancement Instructions**.
+4. Click **Enhance Prompt** for a manual enhancement.
+5. Edit the resulting **Enhanced Prompt** if needed.
+6. Connect `enhanced_prompt` downstream to the node that should receive the enhanced text.
 
-**Use mmap** is normally recommended.
+The original `prompt` output is also available unchanged.
 
-With mmap enabled, the GGUF is memory-mapped. Linux/WSL may keep recently used GGUF pages in the filesystem page cache after the native GPU context is closed. A later reload can therefore read much of the model from system RAM instead of storage.
+### Optional media
 
-This is why a second load can be much faster than the first even though the GPU model was fully unloaded.
+Prompt Enhancer accepts:
 
-mmap does not permanently pin those pages. The operating system can reclaim them under RAM pressure.
+- `images` — still image or IMAGE batch
+- `video` — native ComfyUI VIDEO input
+- `settings` — Local LLM Settings
 
-**Use mlock** keeps mapped model pages locked in system RAM. This can preserve RAM residency more aggressively, but it also increases system-memory pressure. It is normally best left off unless there is a specific reason to use it.
+Manual Enhance can partially execute the dependencies needed to make connected media available to the LLM. The selected local model must support the media type and have the appropriate vision/mmproj configuration.
 
-## Important memory settings
+### Enhanced Prompt history
 
-### Context size
+Generated enhanced prompts are stored as an editable array.
 
-Maximum context allocated for the llama.cpp context. Larger contexts consume more KV-cache memory.
-
-The server filters the available choices against detected model metadata when the GGUF advertises a native context limit.
-
-### KV cache K / V
-
-Controls the data type used for the key and value KV caches. Lower-bit formats save memory; higher-precision formats use more memory and may be faster or more accurate depending on the model and backend.
-
-Available formats depend on the installed llama.cpp/llama-cpp-python build.
-
-### KV cache location
-
-Controls whether the KV cache is kept on the GPU or CPU where supported. GPU KV is normally faster; CPU KV saves VRAM.
-
-### GPU layers
-
-Controls how many model layers llama.cpp offloads to the GPU. Full GPU offload is normally fastest when the model fits.
-
-### Prompt batch (`n_batch`)
-
-The logical maximum number of prompt tokens processed in one evaluation batch. It affects prompt/context ingestion rather than normal one-token-at-a-time decoding.
-
-### Micro batch (`n_ubatch`)
-
-The physical batch processed at once. Larger values can improve prompt-processing throughput but can require more temporary VRAM.
-
-### Flash Attention
-
-Enables llama.cpp Flash Attention when supported by the model/backend. It can improve performance and can affect KV-cache compatibility.
-
-### Split mode / Main GPU / Tensor split
-
-Advanced multi-GPU controls. Leave these at their defaults for a single-GPU system.
-
-For a custom tensor split, use comma-separated proportions, for example:
+The history control uses:
 
 ```text
-1,1
+− | X / Y | + | × | Undo | Redo | Clear All
 ```
 
-or:
+- `X` is the editable/scrubbable active prompt index.
+- `Y` is the read-only number of stored prompts.
+- `×` deletes the active entry.
+- Undo/Redo keep up to 20 array states in each direction.
+- **Clear All** empties the array.
+
+### Prompt Sets
+
+Prompt Sets save and restore the complete enhanced-prompt array and active index.
+
+They are stored under:
 
 ```text
-0.7,0.3
+ComfyUI/models/LLM/local_LLM_presets/prompt_enhancer/prompt_sets/
 ```
 
-## Model presets
+### Enhancement templates
 
-**Auto (Detected)** reads GGUF metadata and the filename to identify the model family and select an appropriate built-in behavior preset when possible.
+Built-in templates are included for:
 
-Model presets can define model-specific chat-template/thinking behavior and recommended sampler values.
+- Krea 2 Image
+- MiniMax H3 T2VA
+- MiniMax H3 I2VA
+- MiniMax H3 FL2VA
+- MiniMax H3 L2VA
+- MiniMax H3 Ref2VA
 
-If a preset-owned setting is changed manually, the preset changes to **Custom** rather than silently overwriting the edited value.
+User enhancement templates are stored under:
 
-Task-specific controls such as the request seed and output-token limit remain request-local.
+```text
+ComfyUI/models/LLM/local_LLM_presets/prompt_enhancer/
+```
 
-## Memory presets
+Built-in templates are protected from deletion through the node UI.
 
-Memory presets group settings such as:
+### Prompt Cycle
 
-- context size
-- KV-cache types
-- KV-cache location
-- GPU layers
-- prompt and micro batch sizes
-- mmap/mlock behavior
-- other native llama.cpp memory/offload controls
+When **Enhance with Workflow** is disabled, Prompt Cycle controls how the stored enhanced-prompt array advances after normal workflow execution:
 
-Use a built-in preset as a starting point, then adjust individual values if needed. Editing a preset-owned value changes the selector to **Custom**.
+- `fixed`
+- `increment`
+- `decrement`
+- `shuffle`
+- `random`
 
-## Prompt and sampler presets
+Shuffle and Random use fresh internal randomness and do not use the LLM generation seed.
 
-Saved presets are stored under:
+### Enhance with Workflow
+
+Enable **Enhance with Workflow** when every normal workflow execution should generate a fresh enhancement before sending text downstream.
+
+When disabled, normal workflow execution uses the currently selected stored Enhanced Prompt instead of calling the LLM again.
+
+## Preset folders
+
+Local LLM presets are stored below:
 
 ```text
 ComfyUI/models/LLM/local_LLM_presets/
-├── sampler/
+├── prompts/
 ├── system_prompts/
-└── prompts/
+├── sampler/
+└── prompt_enhancer/
+    └── prompt_sets/
 ```
 
-The three preset types are independent.
+The Generate and Settings preset selectors support the package's built-in/default behavior plus user presets saved in these folders.
 
-- **sampler/** contains saved sampler settings.
-- **system_prompts/** contains reusable system prompts.
-- **prompts/** contains reusable user prompts.
+## Vision input
 
-On the Generate node, `Default` sampling means the current global Local LLM Server generation defaults. `Custom` uses the sampler controls serialized in that workflow node.
+For **Local LLM Generate**:
 
-## Vision and multimodal input
+- `image` accepts a still IMAGE or IMAGE batch.
+- `video_frames` accepts ordered frames as an IMAGE batch and samples them according to the configured frame limit.
 
-Vision support depends on both the GGUF model and the multimodal support available in the installed llama-cpp-python build.
+For **Local LLM Prompt Enhancer**:
 
-The extension detects known model families and selects compatible handlers when available. The Vision/mmproj selector can also automatically locate a matching projector.
+- `images` accepts still IMAGE references.
+- `video` accepts native ComfyUI VIDEO.
 
-### image(s)
+Vision input requires a compatible multimodal model and mmproj/projector configuration. A text-only GGUF cannot use image/video input simply because the node socket is connected.
 
-The **image(s)** input accepts either:
+## Thinking / reasoning
 
-- one ComfyUI IMAGE, or
-- an IMAGE batch containing multiple still images.
+The service exposes the final response and reasoning separately to ComfyUI nodes when the model/template provides reasoning.
 
-Images are kept in batch order and sent to the model up to **Vision Max Images**.
+The OpenAI-compatible chat endpoint also supports structured `reasoning_content`. For models such as Qwen where the chat template prefills the opening `<think>` and generation begins with reasoning text followed by `</think>`, the server recognizes the prefilled-thinking form and separates reasoning from final content instead of leaking the closing tag into the response.
 
-### video_frames
+## OpenAI-compatible API
 
-The **video_frames** input accepts an ordered IMAGE batch representing frames from a video.
+The optional external API is configured from the Local LLM Server panel.
 
-The extension evenly samples frames across that batch up to **Vision Max Frames**. This allows a long sequence of frames to be summarized without sending every frame to the VLM.
+Endpoints:
 
-### Text-only models
+```text
+GET  /local-llm/v1/models
+POST /local-llm/v1/chat/completions
+POST /local-llm/v1/completions
+```
 
-When a model is confidently detected as text-only:
+`/local-llm/v1/chat/completions` supports streaming responses. Configure the API key and external-access options in the LLM panel before using an external client such as SillyTavern.
 
-- `image(s)` and `video_frames` are visibly marked unavailable.
-- new connections to those sockets are blocked by the UI.
-- existing connections are preserved so switching models does not damage the workflow.
-- if existing image/video data reaches the node, it is ignored and a warning is logged rather than failing the workflow.
+External GPU requests coordinate with ComfyUI GPU execution so the persistent LLM does not intentionally race a diffusion/video workload during VRAM handoff.
 
-Vision content embedded directly inside an external chat-message payload is not silently discarded; using that with a known text-only model is treated as an invalid request.
+## Model residency and ComfyUI VRAM
 
-## Thinking and reasoning output
+The service is designed to coexist with normal ComfyUI model workloads.
 
-For models/templates that expose reasoning separately, the Generate node returns:
+- **Auto Yield to ComfyUI** allows the LLM to release its native context when ComfyUI needs the GPU, then reconstruct it on the next LLM request.
+- **Keep Resident** prioritizes avoiding LLM reloads and is appropriate when enough VRAM remains for the rest of the workflow.
+- **On Demand** loads the model on first use.
+- **Auto Start** loads shortly after ComfyUI starts.
 
-- final answer in **response**
-- reasoning in **thinking**
+Changing model-allocation settings requires a native model reload. Request-local prompts and sampler values do not.
 
-The server status and performance calculations distinguish prompt processing from generated-token decoding.
+## Updating
 
-## Status indicator
+When updating this package:
 
-A draggable status box can be enabled from the LLM server panel.
+1. Replace/extract over `ComfyUI/custom_nodes/ComfyUI-Local-GGUF-LLM/`.
+2. Restart ComfyUI.
+3. Hard-refresh the browser if necessary.
 
-Its robot/status behavior is:
-
-- **Ready** — green, static.
-- **Loading / Reloading** — amber, flashing.
-- **Processing** — green, flashing.
-- **Generating** — green, flashing.
-- **Yielded to ComfyUI** — static.
-- **Waiting for ComfyUI** — static.
-- **Stopped / Error** — static.
-
-The box shows live generation tok/s while generating. When idle, the live rate returns to zero.
-
-The last-request line can show:
-
-- completion tokens
-- average generation tok/s
-- prompt-processing tok/s
-- total request time
-- model load time when a reload occurred
-
-The floating box is kept on the workflow/canvas UI layer so ComfyUI sidebars, menus, dialogs, and popovers appear above it.
-
-## Performance logs
-
-The **Logs** section of the Local LLM Server panel includes detailed timing for model lifecycle and inference.
-
-Useful entries include:
-
-- queue wait
-- wait for active ComfyUI execution
-- VRAM handoff time
-- raw CUDA free memory
-- reclaimable PyTorch cache
-- whether cache cleanup was skipped or used
-- ComfyUI model-eviction time
-- native GGUF load time
-- observed native VRAM allocation
-- mmap/no-mmap mode
-- major/minor page-fault changes
-- Linux page-cache information
-- prompt-processing speed
-- generation speed
-- native context close/yield time
-
-These logs are intended to distinguish ComfyUI handoff overhead from llama.cpp model construction, storage/page-cache behavior, and actual inference speed.
-
-Prompt and response content logging is disabled by default and can be enabled separately.
-
-## Optional HTTP API
-
-The global service includes an optional OpenAI-compatible HTTP interface for external clients. It is disabled by default and can be enabled in the LLM server panel.
-
-This HTTP interface is independent of the **Get Local LLM Service** workflow node.
-
-The server supports chat/completion-style requests and streaming response transport. External GPU requests wait while ComfyUI is actively executing GPU work so llama.cpp cannot race a diffusion/video workload during VRAM handoff.
-
-If external access is enabled, configure an API key in the server panel as appropriate for your environment.
-
-## Startup modes
-
-The server supports startup behavior from the LLM panel, including:
-
-- **On Demand** — load when first needed.
-- **Auto Start** — load shortly after ComfyUI starts.
-- **Off** — remain stopped until started manually.
-
-For a machine that frequently switches between diffusion/video work and LLM work, **On Demand + Auto Yield to ComfyUI** is generally the most flexible combination.
-
-## Updating models or settings
-
-Changes to model-allocation settings require the native context to be reloaded. Request-local prompt and sampler changes do not require a model reload.
-
-If the exact native load signature is unchanged and the model is still resident, the extension reuses the existing context.
-
-If the model was yielded to ComfyUI, the next request reconstructs the model using the cached verified load configuration.
-
-## Troubleshooting
-
-### Model loads on CPU instead of GPU
-
-Verify that the `llama-cpp-python` installed in ComfyUI's Python environment was built with the desired CUDA backend. The extension cannot turn a CPU-only llama-cpp-python installation into a CUDA build.
-
-### KV-cache type is reported unsupported
-
-KV formats depend on the installed llama.cpp binding. The extension checks current high-level and low-level llama-cpp-python enum locations, but a backend still has to support the requested cache type.
-
-Try a more broadly supported cache type such as `f16`, `q8_0`, or `q4_0` if necessary.
-
-### Reload is much slower than previous reloads
-
-Check the performance logs for major page faults, block input, and the mmap cache hint. A warm mmap reload can use GGUF pages already cached in RAM; a cold reload may have to read those pages from storage again.
-
-### ComfyUI needs the GPU while the LLM is loaded
-
-Use **Auto Yield to ComfyUI**. The service will fully close the native llama.cpp context when ComfyUI has a real VRAM shortfall and recreate it on the next request.
-
-### Vision input does nothing
-
-Confirm that:
-
-- the selected model actually supports vision
-- a compatible mmproj is selected or auto-detected when required
-- the installed llama-cpp-python build contains the required multimodal support
-
-Known text-only models intentionally ignore existing connected image/video inputs and log a warning.
-
-## Recommended starting configuration
-
-For a single NVIDIA GPU shared between ComfyUI generation and a local LLM:
-
-- Startup mode: **On Demand**
-- VRAM policy: **Auto Yield to ComfyUI**
-- Model preset: **Auto (Detected)**
-- Memory preset: **Balanced** or another preset appropriate for the model/context
-- Use mmap: **On**
-- Use mlock: **Off**
-- Flash Attention: **On** when supported
-- Prompt batch: **2048**
-- Micro batch: **512**
-
-Then adjust context size, KV-cache format, and GPU layers according to model size and available VRAM.
+The package removes stale versioned Local LLM and Prompt Enhancer frontend modules at import time so an old JS file left by an overwrite-style update is not loaded alongside the current one.

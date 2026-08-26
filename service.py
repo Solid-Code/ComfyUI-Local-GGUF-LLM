@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import secrets
+import statistics
 import threading
 import time
 import uuid
@@ -27,12 +28,21 @@ from .nodes import (
     _AUTO_VISION,
     _NONE,
     _cleanup_llm,
+    _sync_cuda_device,
     _find_matching_mmproj,
     _validate_mmproj_pair,
     _gpu_choices,
     _metadata_for,
     _model_lists,
+    _estimate_native_vram_components,
+    _speculative_runtime_support,
+    _resolve_speculative_mode,
+    _mtp_layer_count,
+    _full_path,
+    _gpu_index,
+    _RELOAD_VRAM_MARGIN,
     _MODEL_CACHE,
+    _MODEL_LOCK,
 )
 from .gguf_meta import detect_family, recommended_model_preset, available_model_presets
 from .presets import MEMORY_PRESETS, MODEL_PRESETS, capabilities_for_family, public_presets
@@ -47,12 +57,16 @@ STATE_GENERATING = "generating"
 STATE_WAITING_COMFY = "waiting_comfy"
 STATE_RELOADING = "reloading"
 STATE_STOPPING = "stopping"
+STATE_TUNING = "tuning"
 STATE_ERROR = "error"
 
 LOAD_FIELDS = {
     "model", "vision_model", "memory_preset", "context_size", "kv_cache_k", "kv_cache_v",
     "kv_cache_location", "gpu_layers", "flash_attention", "prompt_batch_size",
-    "memory_batch_size", "use_mmap", "use_mlock", "split_mode", "main_gpu", "tensor_split",
+    "memory_batch_size", "use_mmap", "use_mlock", "speculative_mode",
+    "ngram_pred_tokens", "ngram_size", "ngram_mode", "ngram_min_hits",
+    "ngram_max_entries_per_key", "ngram_sync_check_tokens", "mtp_draft_tokens", "mtp_p_min",
+    "split_mode", "main_gpu", "tensor_split",
     "threads", "threads_batch", "op_offload", "swa_full", "rope_freq_base", "rope_freq_scale",
     "yarn_ext_factor", "yarn_attn_factor", "yarn_beta_fast", "yarn_beta_slow", "yarn_orig_ctx",
     "verbose", "vram_policy",
@@ -97,10 +111,21 @@ PRESET_ROOT_DIR = Path(folder_paths.models_dir) / "LLM" / "local_LLM_presets"
 SAMPLER_PRESET_DIR = PRESET_ROOT_DIR / "sampler"
 SYSTEM_PROMPT_PRESET_DIR = PRESET_ROOT_DIR / "system_prompts"
 PROMPT_PRESET_DIR = PRESET_ROOT_DIR / "prompts"
+MEMORY_PRESET_DIR = PRESET_ROOT_DIR / "memory"
+
+MEMORY_PRESET_FIELDS = (
+    "context_size", "kv_cache_k", "kv_cache_v", "kv_cache_location", "gpu_layers",
+    "flash_attention", "prompt_batch_size", "memory_batch_size", "use_mmap", "use_mlock",
+    "main_gpu", "split_mode", "tensor_split", "speculative_mode",
+    "ngram_pred_tokens", "ngram_size", "ngram_mode", "ngram_min_hits",
+    "ngram_max_entries_per_key", "ngram_sync_check_tokens", "mtp_draft_tokens", "mtp_p_min",
+)
+MEMORY_PRESET_SCHEMA = "local_llm_memory_preset"
+MEMORY_PRESET_VERSION = 1
 
 
 def _ensure_preset_dirs():
-    for path in (PRESET_ROOT_DIR, SAMPLER_PRESET_DIR, SYSTEM_PROMPT_PRESET_DIR, PROMPT_PRESET_DIR):
+    for path in (PRESET_ROOT_DIR, SAMPLER_PRESET_DIR, SYSTEM_PROMPT_PRESET_DIR, PROMPT_PRESET_DIR, MEMORY_PRESET_DIR):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -196,6 +221,22 @@ def save_sampler_preset(name: str, settings: dict[str, Any]) -> dict[str, Any]:
     return {"name": clean_name, "settings": copy.deepcopy(clean), "path": str(path)}
 
 
+def delete_sampler_preset(name: str) -> dict[str, Any]:
+    """Delete one user sampler preset without ever accepting an arbitrary path."""
+    requested = str(name or "").strip()
+    if requested.lower() in {"default", "custom", "server default"}:
+        raise ValueError(f"'{requested or 'Default'}' is a built-in selector and cannot be deleted")
+    item = sampler_presets().get(requested)
+    if item is None:
+        raise ValueError(f"Sampler preset '{requested}' was not found")
+    path = Path(str(item.get("path") or ""))
+    # Resolve both sides and require the file to live directly in our user preset directory.
+    if path.resolve().parent != SAMPLER_PRESET_DIR.resolve():
+        raise ValueError("Refusing to delete a sampler preset outside the Local LLM preset directory")
+    path.unlink()
+    return {"name": requested, "path": str(path)}
+
+
 def _text_preset_dir(kind: str) -> Path:
     if kind == "system_prompts":
         return SYSTEM_PROMPT_PRESET_DIR
@@ -241,6 +282,83 @@ def save_text_preset(kind: str, name: str, text: str) -> dict[str, Any]:
     tmp.write_text(value, encoding="utf-8")
     tmp.replace(path)
     return {"name": clean_name, "text": value, "path": str(path)}
+
+
+def delete_text_preset(kind: str, name: str) -> dict[str, Any]:
+    """Delete one user text preset without accepting an arbitrary path."""
+    requested = str(name or "").strip()
+    if requested.lower() in {"default", "custom", "server default"}:
+        raise ValueError(f"'{requested or 'Custom'}' is a built-in selector and cannot be deleted")
+    directory = _text_preset_dir(kind)
+    item = text_presets(kind).get(requested)
+    if item is None:
+        label = "System prompt" if kind == "system_prompts" else "Prompt"
+        raise ValueError(f"{label} preset '{requested}' was not found")
+    path = Path(str(item.get("path") or ""))
+    if path.resolve().parent != directory.resolve():
+        raise ValueError("Refusing to delete a text preset outside the Local LLM preset directory")
+    path.unlink()
+    return {"name": requested, "path": str(path)}
+
+
+def _validate_memory_preset_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(settings, dict):
+        raise TypeError("memory preset settings must be an object")
+    out = {}
+    for key in MEMORY_PRESET_FIELDS:
+        if key not in settings:
+            continue
+        value = settings[key]
+        if key in {"context_size", "gpu_layers", "prompt_batch_size", "memory_batch_size",
+                   "ngram_pred_tokens", "ngram_size", "ngram_min_hits",
+                   "ngram_max_entries_per_key", "ngram_sync_check_tokens", "mtp_draft_tokens"}:
+            value = int(value)
+        elif key in {"mtp_p_min"}:
+            value = float(value)
+        elif key in {"flash_attention", "use_mmap", "use_mlock"}:
+            value = bool(value)
+        else:
+            value = str(value)
+        out[key] = value
+    if not out:
+        raise ValueError("memory preset contains no supported settings")
+    return out
+
+
+def memory_presets() -> dict[str, dict[str, Any]]:
+    """User memory/performance presets stored beside the other Local LLM presets."""
+    _ensure_preset_dirs()
+    found = {}
+    for path in sorted(MEMORY_PRESET_DIR.glob("*.json"), key=lambda x: x.name.lower()):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
+            settings = _validate_memory_preset_settings(data.get("settings", data))
+            name = str(data.get("name") or path.stem).strip() or path.stem
+            found[name] = {
+                "name": name, "settings": settings, "path": str(path),
+                "mtime_ns": int(path.stat().st_mtime_ns),
+            }
+        except Exception as e:
+            log.warning("[Local LLM Server] Ignoring invalid memory preset %s: %s", path, e)
+    return found
+
+
+def save_memory_preset(name: str, settings: dict[str, Any]) -> dict[str, Any]:
+    clean_name = _safe_preset_name(name)
+    if clean_name.lower() in {str(x).lower() for x in MEMORY_PRESETS}:
+        raise ValueError(f"'{clean_name}' is a built-in memory preset and cannot be overwritten from the UI")
+    clean = _validate_memory_preset_settings(settings)
+    path = MEMORY_PRESET_DIR / (clean_name + ".json")
+    payload = {
+        "schema": MEMORY_PRESET_SCHEMA, "schema_version": MEMORY_PRESET_VERSION,
+        "name": clean_name, "settings": clean,
+    }
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+    return {"name": clean_name, "settings": copy.deepcopy(clean), "path": str(path)}
 
 
 # Backward-compatible aliases for v0.8 internal names.  New code and files use
@@ -333,6 +451,48 @@ def _spec_default(spec):
 def _node_defaults() -> dict[str, Any]:
     schema = LocalGGUFLLM.INPUT_TYPES()["required"]
     return {name: _spec_default(spec) for name, spec in schema.items()}
+
+
+def _model_capabilities_with_runtime(metadata, family):
+    caps = copy.deepcopy(capabilities_for_family(family))
+    runtime = _speculative_runtime_support()
+    mtp_layers = _mtp_layer_count(metadata or {})
+    caps["mtp"] = bool(mtp_layers > 0)
+    caps["mtp_layers"] = int(mtp_layers)
+    implemented = copy.deepcopy(caps.get("implemented") or {})
+    implemented["mtp"] = bool(mtp_layers > 0 and runtime.get("mtp"))
+    implemented["ngram_speculative"] = bool(runtime.get("ngram"))
+    caps["implemented"] = implemented
+    return caps, runtime
+
+
+def _resolve_service_speculative(cfg, metadata, runtime=None):
+    """Resolve UI/estimator speculative mode with current native-MTP constraints."""
+    support = runtime or _speculative_runtime_support()
+    spec = _resolve_speculative_mode(cfg.get("speculative_mode", "Off"), metadata, support)
+    requested = str(spec.get("requested") or "Off")
+    try:
+        gpu_layers = int(cfg.get("gpu_layers", -1))
+    except Exception:
+        gpu_layers = -1
+    if spec.get("effective") == "MTP" and gpu_layers >= 0:
+        if requested == "Auto" and support.get("ngram"):
+            spec["effective"] = "N-gram"
+            spec["reason"] = "Native MTP requires full GPU offload (GPU layers = -1); Auto fell back to N-gram."
+        else:
+            spec["effective"] = "Off"
+            spec["reason"] = "Native MTP requires GPU layers = -1 (full GPU offload) with the supported bridge."
+    try:
+        if spec.get("effective") == "MTP" and int(cfg.get("context_size") or 0) < int(cfg.get("mtp_draft_tokens") or 2) + 1:
+            if requested == "Auto" and support.get("ngram"):
+                spec["effective"] = "N-gram"
+                spec["reason"] = "Context size is too small for the configured MTP draft block; Auto fell back to N-gram."
+            else:
+                spec["effective"] = "Off"
+                spec["reason"] = "Context size must be at least MTP draft tokens + 1."
+    except Exception:
+        pass
+    return spec
 
 
 def _default_config() -> dict[str, Any]:
@@ -479,6 +639,15 @@ class LocalLLMServiceManager:
         self._last_generation_seconds = None
         self._logs = deque(maxlen=300)
         self._service_api = LocalLLMServiceAPI(self)
+        self._tuner_lock = threading.RLock()
+        self._tuner_thread = None
+        self._tuner_cancel = threading.Event()
+        self._tuner = {
+            "state": "idle", "phase": "Idle", "progress": 0.0, "candidate_index": 0,
+            "candidate_total": 0, "current_candidate": None, "results": [],
+            "recommendation": None, "error": None, "started_at": None, "finished_at": None,
+            "profile": "Quick", "message": "Ready to benchmark the saved server configuration.",
+        }
         self._log("Service manager initialized")
 
     @property
@@ -641,16 +810,19 @@ class LocalLLMServiceManager:
                 "directory": str(SAMPLER_PRESET_DIR),
                 "default": self.request_generation_defaults(),
                 "names": ["Default", "Custom", *sorted(samplers, key=str.lower)],
+                "deletable_names": sorted(samplers, key=str.lower),
                 "presets": {name: copy.deepcopy(item["settings"]) for name, item in samplers.items()},
             },
             "system_prompts": {
                 "directory": str(SYSTEM_PROMPT_PRESET_DIR),
                 "names": ["Custom", *sorted(systems, key=str.lower)],
+                "deletable_names": sorted(systems, key=str.lower),
                 "presets": {name: str(item.get("text", "")) for name, item in systems.items()},
             },
             "prompts": {
                 "directory": str(PROMPT_PRESET_DIR),
                 "names": ["Custom", *sorted(prompts, key=str.lower)],
+                "deletable_names": sorted(prompts, key=str.lower),
                 "presets": {name: str(item.get("text", "")) for name, item in prompts.items()},
             },
         }
@@ -727,7 +899,7 @@ class LocalLLMServiceManager:
         kernels are still executing can invalidate allocations that those kernels
         are using.  External service requests therefore wait until the active
         ComfyUI prompt finishes before loading/reloading or running llama.cpp.
-        Workflow-owned Local LLM Service Generate calls bypass this guard because
+        Workflow-owned Local LLM Generate calls bypass this guard because
         they already execute serially inside that same ComfyUI prompt.
         """
         logged = False
@@ -749,7 +921,7 @@ class LocalLLMServiceManager:
 
     @staticmethod
     def _is_workflow_client(client):
-        return str(client or "").startswith("ComfyUI Local LLM Service Generate")
+        return str(client or "").startswith("ComfyUI Local LLM Generate")
 
     def _warm_load(self):
         args = self._call_args()
@@ -774,7 +946,7 @@ class LocalLLMServiceManager:
 
     def start(self, wait_for_comfy=True):
         with self._state_lock:
-            if self._state in {STATE_LOADING, STATE_RELOADING, STATE_PROCESSING, STATE_GENERATING, STATE_WAITING_COMFY}:
+            if self._state in {STATE_LOADING, STATE_RELOADING, STATE_PROCESSING, STATE_GENERATING, STATE_WAITING_COMFY, STATE_TUNING}:
                 return self.status()
             if self._state == STATE_READY and self._api is not None and not self._restart_required and self._resident_snapshot():
                 return self.status()
@@ -807,7 +979,67 @@ class LocalLLMServiceManager:
             self._emit()
         return self.status()
 
+    def suspend(self):
+        """Yield the native llama.cpp context while preserving fast-reload state.
+
+        Unlike Stop / Unload, Suspend keeps the verified resident controller,
+        exact load signature/kwargs, measured VRAM target, and stable service API
+        facade.  The next request therefore follows the normal Auto-Yield fast
+        restoration path instead of performing a cold service start.
+        """
+        with self._generation_lock:
+            with self._state_lock:
+                if self._state in {STATE_LOADING, STATE_RELOADING, STATE_PROCESSING, STATE_GENERATING, STATE_STOPPING, STATE_WAITING_COMFY, STATE_TUNING}:
+                    return self.status()
+                if self._state != STATE_READY or self._api is None:
+                    return self.status()
+
+            resident_ctl = _MODEL_CACHE.get("managed_adapter")
+            if resident_ctl is None or getattr(resident_ctl, "llm", None) is None:
+                # Already yielded. Keep READY + API intact.
+                self._log("Suspend requested; native GGUF is already yielded")
+                self._emit()
+                return self.status()
+
+            self._log("Suspending native GGUF; preserving fast-reload state")
+            started = time.perf_counter()
+            try:
+                load_device = getattr(resident_ctl, "load_device", None)
+                if getattr(load_device, "type", None) == "cuda":
+                    sync_started = time.perf_counter()
+                    _sync_cuda_device(load_device)
+                    sync_seconds = time.perf_counter() - sync_started
+                else:
+                    sync_seconds = 0.0
+                released = resident_ctl._unload_native(
+                    reason="manual-suspend",
+                    heavy_cleanup=False,
+                )
+                with self._state_lock:
+                    self._state = STATE_READY
+                    self._model_loaded = True
+                    self._error = None
+                    self._current_client = None
+                    self._current_started = None
+                    self._current_phase_started = None
+                self._log(
+                    "Native GGUF suspended; service yielded and ready for fast reload "
+                    f"(sync={sync_seconds:.3f}s, total={time.perf_counter() - started:.3f}s, "
+                    f"released_accounted={int(released or 0) / (1024*1024):.1f} MiB)"
+                )
+            except Exception as e:
+                with self._state_lock:
+                    self._state = STATE_ERROR
+                    self._error = f"{type(e).__name__}: {e}"
+                self._log(self._error, "error")
+                raise
+            finally:
+                self._emit()
+        return self.status()
+
     def stop(self):
+        if self.tuner_status().get("running"):
+            raise RuntimeError("Cancel the performance tuner before stopping the service")
         with self._state_lock:
             if self._state == STATE_STOPPED:
                 return self.status()
@@ -829,6 +1061,8 @@ class LocalLLMServiceManager:
         return self.status()
 
     def reload(self, wait_for_comfy=True):
+        if self.tuner_status().get("running"):
+            raise RuntimeError("Cancel the performance tuner before reloading the service")
         with self._state_lock:
             self._state = STATE_RELOADING
             self._error = None
@@ -1020,6 +1254,37 @@ class LocalLLMServiceManager:
                     self._error = None
                 info = result.get("info") or {}
                 speed = info.get("tokens_per_second")
+                spec = info.get("speculative") or {}
+                if spec.get("effective") and spec.get("effective") != "Off":
+                    stats = spec.get("stats") or {}
+                    drafted = stats.get("drafted_tokens_normalized")
+                    accepted = stats.get("accepted_tokens_normalized")
+                    rate = stats.get("acceptance_rate")
+                    stat_text = ""
+                    if drafted is not None or accepted is not None:
+                        stat_text = f" • drafted={int(drafted or 0)} • accepted={int(accepted or 0)}"
+                    if rate is not None:
+                        stat_text += f" • acceptance={float(rate)*100:.1f}%"
+                    self._log(
+                        f"Speculative decoding: requested={spec.get('requested')} • effective={spec.get('effective')} "
+                        f"• implementation={spec.get('implementation') or 'n/a'}{stat_text}"
+                    )
+                prompt_cache = info.get("prompt_cache") or {}
+                if prompt_cache:
+                    reused = int(prompt_cache.get("reused_tokens") or 0)
+                    total_prompt = int(prompt_cache.get("prompt_tokens") or 0)
+                    evaluated = int(prompt_cache.get("evaluated_tokens") or 0)
+                    reuse_pct = float(prompt_cache.get("reuse_percent") or 0.0)
+                    saved = float(prompt_cache.get("estimated_seconds_saved") or 0.0)
+                    uncached_rate = float(prompt_cache.get("uncached_prompt_tokens_per_second") or 0.0)
+                    effective_rate = float(prompt_cache.get("effective_prompt_tokens_per_second") or 0.0)
+                    self._log(
+                        f"Prompt cache: requested={prompt_cache.get('requested', 'Auto')} • "
+                        f"effective={prompt_cache.get('effective', 'Auto')} • "
+                        f"hit={bool(prompt_cache.get('hit'))} • reused={reused}/{total_prompt} ({reuse_pct:.1f}%) • "
+                        f"evaluated={evaluated} • eval_rate={uncached_rate:.1f}t/s • effective_rate={effective_rate:.1f}t/s • "
+                        f"est_saved={saved:.3f}s • scope={prompt_cache.get('scope', 'resident-context')}"
+                    )
                 gpu_backend = info.get("gpu_backend") or {}
                 preload = gpu_backend.get("preload_memory") or {}
                 last_unload = gpu_backend.get("last_unload") or {}
@@ -1082,6 +1347,855 @@ class LocalLLMServiceManager:
         finally:
             self._emit()
 
+    def vram_estimate(self, patch=None):
+        """Return a live, non-mutating estimate for the selected memory settings.
+
+        `patch` may contain unsaved modal values.  The same component estimator
+        used by Auto-Yield first-load planning is used here so UI estimates and
+        actual handoff targets share one source of truth.
+        """
+        cfg_saved = self.get_config()
+        cfg = copy.deepcopy(cfg_saved)
+        if isinstance(patch, dict):
+            # The saved config already contains the complete supported schema;
+            # avoid rebuilding LocalGGUFLLM.INPUT_TYPES/model lists on every live
+            # estimator refresh.
+            allowed = set(cfg_saved)
+            cfg.update({k: copy.deepcopy(v) for k, v in patch.items() if k in allowed})
+        cfg["context_size"] = _normalize_context_size(cfg.get("context_size"), cfg.get("model"))
+
+        model = str(cfg.get("model") or "")
+        if not model or model == "No GGUF models found":
+            return {"available": False, "reason": "No GGUF model selected"}
+
+        md = _metadata_for(model)
+        family = detect_family(md, model)
+        caps = capabilities_for_family(family)
+        model_path = _full_path(model)
+
+        vision_choice = str(cfg.get("vision_model") or _NONE)
+        resolved_vision = None
+        if caps.get("vision") is not False:
+            if vision_choice == _AUTO_VISION:
+                resolved_vision = _find_matching_mmproj(model)
+            elif vision_choice != _NONE:
+                resolved_vision = vision_choice
+        mmproj_path = _full_path(resolved_vision) if resolved_vision else None
+
+        try:
+            gpu_layers = int(cfg.get("gpu_layers", -1))
+        except Exception:
+            gpu_layers = -1
+        try:
+            main_gpu_index = _gpu_index(cfg.get("main_gpu", 0))
+        except Exception:
+            main_gpu_index = 0
+
+        speculative_runtime = _speculative_runtime_support()
+        speculative = _resolve_service_speculative(cfg, md, speculative_runtime)
+        components = _estimate_native_vram_components(
+            model_path=model_path,
+            mmproj_path=mmproj_path,
+            metadata=md,
+            gpu_layers=gpu_layers,
+            n_ctx=int(cfg.get("context_size") or 0),
+            kv_k=str(cfg.get("kv_cache_k") or "f16"),
+            kv_v=str(cfg.get("kv_cache_v") or "f16"),
+            kv_location=str(cfg.get("kv_cache_location") or "GPU"),
+            n_batch=int(cfg.get("prompt_batch_size") or 2048),
+            n_ubatch=int(cfg.get("memory_batch_size") or 512),
+            flash_attention=bool(cfg.get("flash_attention")),
+            speculative_mode=str(speculative.get("effective") or "Off"),
+        )
+
+        raw_free = None
+        total_vram = None
+        torch_allocated = None
+        torch_reserved = None
+        if gpu_layers != 0:
+            try:
+                import torch
+                if torch.cuda.is_available() and main_gpu_index < int(torch.cuda.device_count()):
+                    with torch.cuda.device(main_gpu_index):
+                        free_b, total_b = torch.cuda.mem_get_info()
+                        raw_free = int(free_b)
+                        total_vram = int(total_b)
+                        torch_allocated = int(torch.cuda.memory_allocated(main_gpu_index))
+                        torch_reserved = int(torch.cuda.memory_reserved(main_gpu_index))
+            except Exception:
+                pass
+
+        # A measured native allocation is valid for display only when the saved
+        # load-affecting settings still match the unsaved modal values.  Otherwise
+        # keep it visible as prior information but do not use it to calibrate the
+        # proposed configuration.
+        match_fields = set(LOAD_FIELDS) - {"memory_preset"}
+        saved_settings_match = all(cfg.get(k) == cfg_saved.get(k) for k in match_fields)
+        resident_ctl = None
+        diagnostics = {}
+        resident_now = False
+        with _MODEL_LOCK:
+            resident_ctl = _MODEL_CACHE.get("managed_adapter")
+            diagnostics = copy.deepcopy(_MODEL_CACHE.get("load_diagnostics") or {})
+            resident_now = bool(_MODEL_CACHE.get("llm") is not None or (resident_ctl is not None and getattr(resident_ctl, "llm", None) is not None))
+
+        measured = 0
+        measured_source = None
+        if resident_ctl is not None:
+            try:
+                measured = int(resident_ctl.observed_vram_bytes or 0)
+            except Exception:
+                measured = 0
+            if measured > 0:
+                measured_source = "measured native allocation"
+        if measured <= 0:
+            try:
+                per_gpu = diagnostics.get("vram_delta_bytes_by_gpu") or {}
+                measured = int(per_gpu.get(str(main_gpu_index), 0) or 0)
+            except Exception:
+                measured = 0
+            if measured <= 0:
+                try:
+                    measured = int(float(diagnostics.get("total_vram_delta_mib") or 0) * 1024 * 1024)
+                except Exception:
+                    measured = 0
+            if measured > 0:
+                measured_source = "verified load delta"
+
+        measured_applies = bool(measured > 0 and saved_settings_match)
+        try:
+            last_info = copy.deepcopy((self._last_result or {}).get("info") or {})
+            measured_includes_vision = bool(last_info.get("vision_active"))
+        except Exception:
+            measured_includes_vision = False
+        base_total = int(components["base_total_bytes"])
+        total_with_vision = int(components["total_bytes"])
+        vision_bytes = int(components["vision_bytes"])
+        reload_target = int((measured + _RELOAD_VRAM_MARGIN) if measured_applies else base_total)
+        reload_target_source = "observed+256MiB" if measured_applies else "conservative estimate"
+
+        # Current free VRAM already excludes a resident LLM.  If the same saved
+        # configuration is resident, its projected base headroom is therefore the
+        # current free value.  A configuration change/vision activation first
+        # closes that context, so credit its measured allocation back before
+        # subtracting the new estimate.
+        release_credit = int(measured if resident_now and measured > 0 else 0)
+        if raw_free is None:
+            base_headroom = None
+            vision_headroom = None
+        elif resident_now and saved_settings_match:
+            base_headroom = int(raw_free)
+            vision_headroom = int(raw_free + release_credit - total_with_vision) if vision_bytes > 0 else int(raw_free)
+        else:
+            available_after_old_close = int(raw_free + release_credit)
+            base_headroom = int(available_after_old_close - base_total)
+            vision_headroom = int(available_after_old_close - total_with_vision)
+
+        headroom = vision_headroom if vision_bytes > 0 else base_headroom
+        warning = None
+        if str(cfg.get("speculative_mode") or "Off") in {"N-gram", "MTP"} and speculative.get("effective") == "Off":
+            warning = str(speculative.get("reason") or "Selected speculative-decoding mode is unavailable.")
+        elif gpu_layers == 0:
+            warning = "GPU layers is 0; native model weights are configured for CPU."
+        elif headroom is not None and headroom < 0:
+            warning = "Current free VRAM is below the estimated requirement; Auto Yield may need to evict ComfyUI models before loading."
+        elif headroom is not None and headroom < 1024 * 1024 * 1024:
+            warning = "Estimated VRAM headroom is below 1 GiB."
+
+        return {
+            "available": True,
+            "model": model,
+            "family": family,
+            "gpu_index": int(main_gpu_index),
+            "split_mode": cfg.get("split_mode"),
+            "components": components,
+            "resolved_vision": resolved_vision,
+            "vision_optional": bool(vision_bytes > 0),
+            "speculative": speculative,
+            "speculative_support": speculative_runtime,
+            "raw_free_bytes": raw_free,
+            "total_vram_bytes": total_vram,
+            "torch_allocated_bytes": torch_allocated,
+            "torch_reserved_bytes": torch_reserved,
+            "torch_reclaimable_bytes": (max(0, int(torch_reserved - torch_allocated)) if torch_reserved is not None and torch_allocated is not None else None),
+            "measured_bytes": int(measured),
+            "measured_source": measured_source,
+            "measured_applies": measured_applies,
+            "measured_includes_vision": bool(measured_includes_vision),
+            "resident": bool(resident_now),
+            "saved_settings_match": bool(saved_settings_match),
+            "reload_target_bytes": int(reload_target),
+            "reload_target_source": reload_target_source,
+            "projected_base_headroom_bytes": base_headroom,
+            "projected_vision_headroom_bytes": vision_headroom,
+            "projected_headroom_bytes": headroom,
+            "warning": warning,
+            "note": "Vision/mmproj memory is included only in the with-vision total and is allocated when a vision request activates the projector.",
+        }
+
+    # ------------------------------------------------------------------
+    # Performance tuner
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _tuner_prompt():
+        # Deliberately fixed and text-only so every candidate receives the same
+        # prompt-evaluation workload.  The content is moderately repetitive to
+        # represent prompt-enhancement / structured-writing use without being a
+        # synthetic single-token loop that would unfairly favor N-gram decoding.
+        blocks = [
+            "A visual prompt should identify the primary subject, the important physical details, the environment, the action, the composition, the camera relationship, the lighting, and any constraints that must remain unchanged. Prefer concrete descriptions over vague quality adjectives. Preserve the requested subject and action while resolving ambiguity with specific but neutral details.",
+            "When revising text, keep names, quantities, ordering, and explicit restrictions intact. Improve clarity by grouping related details and removing accidental repetition. Do not invent a new scene or change the requested outcome. Describe spatial relationships, materials, motion, and lighting only when they help make the instruction easier to execute consistently.",
+            "For a short generation request, useful structure is subject first, then action, environment, framing, lighting, and finishing details. Camera language should be physically coherent. Motion should have a clear direction and cause. If the source request is simple, the improved version should remain concise rather than expanding into unrelated cinematic language.",
+            "The benchmark text is intentionally stable across trials. It contains natural prose, repeated concepts, punctuation, and several sentence lengths so prompt processing is representative of ordinary local-LLM workflow requests rather than a tiny microbenchmark. The response itself is used only for timing and is discarded after each measured run.",
+        ]
+        text = "\n\n".join(blocks * 3)
+        return [{"role": "user", "content": text + "\n\nSummarize the practical rules above as a compact checklist using complete sentences."}]
+
+    def _set_tuner(self, **patch):
+        with self._tuner_lock:
+            self._tuner.update(copy.deepcopy(patch))
+        self._emit()
+
+    def tuner_status(self):
+        with self._tuner_lock:
+            data = copy.deepcopy(self._tuner)
+            thread = self._tuner_thread
+        data["running"] = bool(thread is not None and thread.is_alive())
+        data["cancel_requested"] = bool(self._tuner_cancel.is_set())
+        return data
+
+    @staticmethod
+    def _tuner_patch_label(patch):
+        names = {
+            "prompt_batch_size": "batch", "memory_batch_size": "ubatch",
+            "flash_attention": "flash", "speculative_mode": "spec",
+            "ngram_pred_tokens": "ngram-draft", "mtp_draft_tokens": "mtp-draft",
+            "use_mmap": "mmap", "use_mlock": "mlock", "kv_cache_location": "kv-location",
+            "gpu_layers": "gpu-layers", "kv_cache_k": "kv-k", "kv_cache_v": "kv-v",
+        }
+        order = (
+            "prompt_batch_size", "memory_batch_size", "flash_attention",
+            "use_mmap", "use_mlock", "kv_cache_location", "gpu_layers",
+            "kv_cache_k", "kv_cache_v", "speculative_mode",
+            "ngram_pred_tokens", "mtp_draft_tokens",
+        )
+        parts = []
+        for key in order:
+            if key not in patch:
+                continue
+            value = patch[key]
+            if isinstance(value, bool):
+                value = "on" if value else "off"
+            parts.append(f"{names.get(key, key)}={value}")
+        return "Baseline" if not parts else " • ".join(parts)
+
+    def _tuner_unload_current(self, reason="tuner-cycle"):
+        """Yield the current native context and return full wall-clock teardown timing.
+
+        The tuner intentionally models the same lightweight close path used by
+        Suspend/Auto-Yield, including the device synchronization that manual
+        Suspend performs before close.  Heavy Stop/Unload cleanup is not used.
+        """
+        ctl = _MODEL_CACHE.get("managed_adapter")
+        if ctl is None or getattr(ctl, "llm", None) is None:
+            return {
+                "total_seconds": 0.0, "sync_seconds": 0.0, "close_seconds": 0.0,
+                "released_accounted_bytes": 0,
+            }
+        started = time.perf_counter()
+        sync_seconds = 0.0
+        load_device = getattr(ctl, "load_device", None)
+        if getattr(load_device, "type", None) == "cuda":
+            sync_started = time.perf_counter()
+            _sync_cuda_device(load_device)
+            sync_seconds = time.perf_counter() - sync_started
+        released = int(ctl._unload_native(reason=reason, heavy_cleanup=False) or 0)
+        wall = time.perf_counter() - started
+        diag = copy.deepcopy(getattr(ctl, "_last_unload_diagnostics", {}) or {})
+        return {
+            "total_seconds": float(wall),
+            "sync_seconds": float(sync_seconds),
+            "close_seconds": float(diag.get("close_seconds") or 0.0),
+            "native_unload_seconds": float(diag.get("total_seconds") or 0.0),
+            "gc_seconds": float(diag.get("gc_seconds") or 0.0),
+            "soft_empty_cache_seconds": float(diag.get("soft_empty_cache_seconds") or 0.0),
+            "released_accounted_bytes": released,
+        }
+
+    def _tuner_candidate(self, base_cfg, patch, *, output_tokens, trials, safety_headroom_bytes, score_mode):
+        if self._tuner_cancel.is_set():
+            raise InterruptedError("Performance tuner cancelled")
+
+        candidate_cfg = copy.deepcopy(base_cfg)
+        candidate_cfg.update(patch)
+        estimate = self.vram_estimate(patch)
+        headroom = estimate.get("projected_headroom_bytes")
+        label = self._tuner_patch_label({k: candidate_cfg.get(k) for k in patch})
+        if patch and headroom is not None and int(headroom) < int(safety_headroom_bytes):
+            return {
+                "status": "skipped", "label": label, "patch": copy.deepcopy(patch),
+                "reason": f"Projected VRAM headroom {int(headroom)/(1024**3):.2f} GiB is below the tuner safety margin.",
+                "estimated_vram_bytes": int((estimate.get("components") or {}).get("base_total_bytes") or 0),
+                "projected_headroom_bytes": int(headroom),
+            }
+
+        args = self._call_args()
+        args.update(patch)
+        args.update({
+            "messages_override": self._tuner_prompt(),
+            "prompt_cache_mode": "Off",  # every measured trial performs the same prefill work
+            "max_tokens": int(output_tokens),
+            "seed": 8675309,
+            "progress_callback": None,
+            "token_callback": None,
+        })
+
+        # Warm once before measurement. This primes backend/JIT state and, with
+        # mmap, the normal OS page cache. We then yield the model so every measured
+        # trial is a real Suspend-style reload -> inference -> yield cycle.
+        warm_args = dict(args)
+        warm_args["max_tokens"] = min(16, int(output_tokens))
+        warm_started = time.perf_counter()
+        _response, _thinking, info_json, _tokens, api = LocalGGUFLLM().generate(**warm_args)
+        warm_wall = time.perf_counter() - warm_started
+        self._api = api
+        try:
+            warm_info = json.loads(info_json)
+        except Exception:
+            warm_info = {}
+        warm_unload = self._tuner_unload_current("tuner-warmup-yield")
+
+        prompt_rates = []
+        decode_rates = []
+        prompt_seconds = []
+        decode_seconds = []
+        load_seconds = []
+        native_load_seconds = []
+        unload_seconds = []
+        unload_sync_seconds = []
+        completion_tokens = []
+        inference_seconds = []
+        cycle_wall_seconds = []
+        acceptance_rates = []
+        measured_vram = 0
+        last_info = {}
+
+        for trial in range(max(1, int(trials))):
+            if self._tuner_cancel.is_set():
+                raise InterruptedError("Performance tuner cancelled")
+            cycle_started = time.perf_counter()
+            info = {}
+            tokens = 0
+            generate_wall = 0.0
+            try:
+                started = time.perf_counter()
+                _response, _thinking, info_json, tokens, api = LocalGGUFLLM().generate(**args)
+                generate_wall = time.perf_counter() - started
+                self._api = api
+                try:
+                    info = json.loads(info_json)
+                except Exception:
+                    info = {}
+                last_info = info
+
+                p_rate = float(info.get("prompt_tokens_per_second") or 0.0)
+                d_rate = float(info.get("tokens_per_second") or 0.0)
+                p_sec = float(info.get("prompt_eval_seconds") or 0.0)
+                d_sec = float(info.get("generation_seconds") or 0.0)
+                p_tok = int(info.get("prompt_eval_tokens", info.get("prompt_tokens")) or 0)
+                c_tok = int(info.get("completion_tokens") or tokens or 0)
+                if p_sec <= 0 and p_rate > 0 and p_tok > 0:
+                    p_sec = p_tok / p_rate
+                if d_sec <= 0 and d_rate > 0 and c_tok > 0:
+                    d_sec = c_tok / d_rate
+
+                load_sec = float(info.get("load_seconds") or 0.0)
+                native_sec = float((info.get("gpu_backend") or {}).get("native_load_seconds") or 0.0)
+                if load_sec <= 0:
+                    # Each measured trial starts yielded, so any unaccounted wall
+                    # before prompt/decode is a conservative reload estimate.
+                    load_sec = max(0.0, generate_wall - max(0.0, p_sec) - max(0.0, d_sec))
+
+                if p_rate > 0:
+                    prompt_rates.append(p_rate)
+                if d_rate > 0:
+                    decode_rates.append(d_rate)
+                if p_sec >= 0:
+                    prompt_seconds.append(p_sec)
+                if d_sec >= 0:
+                    decode_seconds.append(d_sec)
+                load_seconds.append(load_sec)
+                native_load_seconds.append(native_sec)
+                completion_tokens.append(c_tok)
+                inference_seconds.append((p_sec + d_sec) if (p_sec > 0 or d_sec > 0) else max(0.0, generate_wall - load_sec))
+                spec_stats = ((info.get("speculative") or {}).get("stats") or {})
+                rate = spec_stats.get("acceptance_rate")
+                if isinstance(rate, (int, float)):
+                    acceptance_rates.append(float(rate))
+                gpu = info.get("gpu_backend") or {}
+                measured_vram = max(measured_vram, int(gpu.get("observed_vram_bytes") or 0))
+            finally:
+                unload = self._tuner_unload_current(f"tuner-trial-{trial + 1}-yield")
+                unload_seconds.append(float(unload.get("total_seconds") or 0.0))
+                unload_sync_seconds.append(float(unload.get("sync_seconds") or 0.0))
+                cycle_wall_seconds.append(time.perf_counter() - cycle_started)
+
+        prompt_rate = float(statistics.median(prompt_rates)) if prompt_rates else 0.0
+        decode_rate = float(statistics.median(decode_rates)) if decode_rates else 0.0
+        prompt_sec = float(statistics.median(prompt_seconds)) if prompt_seconds else 0.0
+        decode_sec = float(statistics.median(decode_seconds)) if decode_seconds else 0.0
+        load_sec = float(statistics.median(load_seconds)) if load_seconds else 0.0
+        native_load_sec = float(statistics.median(native_load_seconds)) if native_load_seconds else 0.0
+        unload_sec = float(statistics.median(unload_seconds)) if unload_seconds else 0.0
+        unload_sync_sec = float(statistics.median(unload_sync_seconds)) if unload_sync_seconds else 0.0
+
+        # Normalize generation to a fixed amount of work so an early EOS cannot
+        # win merely by producing fewer tokens. The ComfyUI-cycle score then adds
+        # the measured warm reload and lightweight Suspend/Auto-Yield teardown.
+        fixed_work_seconds = prompt_sec
+        if decode_rate > 0:
+            fixed_work_seconds += float(output_tokens) / decode_rate
+        elif decode_sec > 0:
+            fixed_work_seconds += decode_sec
+        else:
+            fixed_work_seconds = float(statistics.median(inference_seconds)) if inference_seconds else 1e9
+        cycle_fixed_seconds = float(load_sec + fixed_work_seconds + unload_sec)
+        mode = "Inference Only" if str(score_mode).lower().startswith("inference") else "ComfyUI Cycle"
+        score_seconds = fixed_work_seconds if mode == "Inference Only" else cycle_fixed_seconds
+
+        tradeoffs = []
+        quality_tradeoff = False
+        if candidate_cfg.get("kv_cache_k") != base_cfg.get("kv_cache_k") or candidate_cfg.get("kv_cache_v") != base_cfg.get("kv_cache_v"):
+            quality_tradeoff = True
+            tradeoffs.append("KV precision changed; lower-bit KV formats can slightly affect output quality.")
+        if bool(candidate_cfg.get("use_mlock")) and not bool(base_cfg.get("use_mlock")):
+            tradeoffs.append("mlock pins mapped model pages in system RAM and increases RAM pressure.")
+        if str(candidate_cfg.get("kv_cache_location")) != str(base_cfg.get("kv_cache_location")):
+            tradeoffs.append("KV cache placement changed; CPU placement saves VRAM but can reduce throughput.")
+        if int(candidate_cfg.get("gpu_layers", -1)) != int(base_cfg.get("gpu_layers", -1)):
+            tradeoffs.append("GPU-layer offload changed; partial offload trades VRAM for CPU/PCIe work.")
+
+        spec = last_info.get("speculative") or {}
+        return {
+            "status": "ok", "label": label, "patch": copy.deepcopy(patch),
+            "prompt_tps": prompt_rate, "decode_tps": decode_rate,
+            "prompt_seconds": prompt_sec, "decode_seconds": decode_sec,
+            "fixed_work_seconds": float(fixed_work_seconds),
+            "load_seconds": load_sec, "native_load_seconds": native_load_sec,
+            "unload_seconds": unload_sec, "unload_sync_seconds": unload_sync_sec,
+            "cycle_fixed_seconds": cycle_fixed_seconds,
+            "cycle_wall_seconds": float(statistics.median(cycle_wall_seconds)) if cycle_wall_seconds else 0.0,
+            "score_mode": mode, "score_seconds": float(score_seconds),
+            "median_completion_tokens": int(statistics.median(completion_tokens)) if completion_tokens else 0,
+            "warmup_load_seconds": float(warm_info.get("load_seconds") or 0.0),
+            "warmup_native_load_seconds": float((warm_info.get("gpu_backend") or {}).get("native_load_seconds") or 0.0),
+            "warmup_wall_seconds": float(warm_wall),
+            "warmup_unload_seconds": float(warm_unload.get("total_seconds") or 0.0),
+            "measured_vram_bytes": int(measured_vram),
+            "estimated_vram_bytes": int((estimate.get("components") or {}).get("base_total_bytes") or 0),
+            "projected_headroom_bytes": (None if headroom is None else int(headroom)),
+            "speculative_effective": str(spec.get("effective") or "Off"),
+            "speculative_implementation": spec.get("implementation"),
+            "acceptance_rate": (float(statistics.median(acceptance_rates)) if acceptance_rates else None),
+            "tradeoffs": tradeoffs, "quality_tradeoff": bool(quality_tradeoff),
+            "trials": max(1, int(trials)),
+        }
+
+    @staticmethod
+    def _tuner_choose(current, candidates, minimum_gain=0.01):
+        valid = [x for x in candidates if x and x.get("status") == "ok" and float(x.get("score_seconds") or 0) > 0]
+        if not valid:
+            return current
+        best = min(valid, key=lambda x: float(x.get("score_seconds") or 1e99))
+        if current is None or current.get("status") != "ok":
+            return best
+        cur = float(current.get("score_seconds") or 1e99)
+        new = float(best.get("score_seconds") or 1e99)
+        # Tiny differences are usually run-to-run noise. Keep the simpler/current
+        # setting unless the candidate clears a small measurable threshold.
+        return best if new < cur * (1.0 - float(minimum_gain)) else current
+
+    def _run_tuner(self, options, original_resident, original_yielded):
+        base_cfg = self.get_config()
+        profile = str(options.get("profile") or "Quick").title()
+        standard = profile == "Standard"
+        trials = 2 if standard else 1
+        output_tokens = 96 if standard else 48
+        safety_mib = max(256, int(options.get("safety_headroom_mib") or 1024))
+        safety_bytes = safety_mib * 1024 * 1024
+        score_mode = "Inference Only" if str(options.get("score_mode") or "").lower().startswith("inference") else "ComfyUI Cycle"
+        tune_batches = bool(options.get("tune_batches", True))
+        tune_flash = bool(options.get("tune_flash_attention", True))
+        tune_spec = bool(options.get("tune_speculative", True))
+        tune_memory = bool(options.get("tune_memory", True))
+        tune_kv_precision = bool(options.get("tune_kv_precision", False))
+        results = []
+        seen = set()
+        planned = 1
+        if tune_batches:
+            planned += 8 if standard else 5
+        if tune_flash:
+            planned += 1
+        if tune_memory:
+            planned += 7 if standard else 5
+        if tune_kv_precision:
+            planned += 5 if standard else 3
+        if tune_spec:
+            planned += 5 if standard else 2
+
+        def patch_key(patch):
+            return tuple(sorted((k, json.dumps(v, sort_keys=True)) for k, v in patch.items()))
+
+        def run_candidate(patch, phase):
+            key = patch_key(patch)
+            if key in seen:
+                for item in results:
+                    if patch_key(item.get("patch") or {}) == key:
+                        return item
+            seen.add(key)
+            idx = len(results) + 1
+            self._set_tuner(
+                phase=phase, candidate_index=idx, candidate_total=max(planned, idx),
+                progress=min(0.96, max(0.02, idx / max(planned, 1))),
+                current_candidate=self._tuner_patch_label(patch),
+                message=f"Benchmarking {self._tuner_patch_label(patch)}",
+                results=results,
+            )
+            try:
+                item = self._tuner_candidate(
+                    base_cfg, patch, output_tokens=output_tokens, trials=trials,
+                    safety_headroom_bytes=safety_bytes, score_mode=score_mode,
+                )
+            except InterruptedError:
+                raise
+            except Exception as e:
+                item = {
+                    "status": "error", "label": self._tuner_patch_label(patch),
+                    "patch": copy.deepcopy(patch), "reason": f"{type(e).__name__}: {e}",
+                }
+            results.append(item)
+            self._set_tuner(results=results)
+            if item.get("status") == "ok":
+                self._log(
+                    "TUNER candidate: "
+                    f"{item['label']} • load={item['load_seconds']:.3f}s • prompt={item['prompt_tps']:.1f}t/s • "
+                    f"decode={item['decode_tps']:.2f}t/s • unload={item['unload_seconds']:.3f}s • "
+                    f"inference={item['fixed_work_seconds']:.3f}s • cycle={item['cycle_fixed_seconds']:.3f}s • "
+                    f"score({score_mode})={item['score_seconds']:.3f}s • VRAM={item['measured_vram_bytes']/(1024**3):.2f}GiB"
+                )
+            elif item.get("status") == "skipped":
+                self._log(f"TUNER skipped: {item['label']} • {item.get('reason')}", "warning")
+            else:
+                self._log(f"TUNER candidate failed: {item['label']} • {item.get('reason')}", "warning")
+            return item
+
+        try:
+            self._wait_for_comfy_idle("running the Local LLM performance tuner")
+            with self._generation_lock:
+                with self._state_lock:
+                    self._state = STATE_TUNING
+                    self._error = None
+                self._emit()
+                self._log(
+                    f"Performance tuner started ({profile}, optimize={score_mode}, trials={trials}, "
+                    f"output_tokens={output_tokens}, safety={safety_mib}MiB, memory={tune_memory}, kv_precision={tune_kv_precision})"
+                )
+
+                baseline = run_candidate({}, "Baseline full cycle")
+                if baseline.get("status") != "ok":
+                    raise RuntimeError("Baseline benchmark failed; tuner cannot compare candidates")
+                current = baseline
+                best_patch = {}
+
+                if tune_batches:
+                    base_batch = max(1, int(base_cfg.get("prompt_batch_size") or 2048))
+                    base_ubatch = max(1, int(base_cfg.get("memory_batch_size") or 512))
+                    ub_values = [base_ubatch, 512, 1024] if not standard else [base_ubatch, 256, 512, 1024, 2048]
+                    ub_ceiling = min(int(base_cfg.get("context_size") or 32768), max(base_batch, 2048 if standard else 1024))
+                    ub_values = sorted(set(v for v in ub_values if 64 <= v <= max(64, ub_ceiling)))
+                    group = [current]
+                    for ub in ub_values:
+                        p = dict(best_patch)
+                        p["memory_batch_size"] = int(ub)
+                        p["prompt_batch_size"] = max(base_batch, int(ub))
+                        group.append(run_candidate(p, "Tune micro-batch"))
+                    current = self._tuner_choose(current, group)
+                    best_patch = dict(current.get("patch") or {})
+
+                    selected_ub = int(best_patch.get("memory_batch_size", base_ubatch))
+                    context = max(selected_ub, int(base_cfg.get("context_size") or 32768))
+                    batch_values = [base_batch, 2048, 4096] if not standard else [base_batch, 512, 1024, 2048, 4096, 8192]
+                    batch_values = sorted(set(v for v in batch_values if selected_ub <= v <= context))
+                    group = [current]
+                    for batch in batch_values:
+                        p = dict(best_patch)
+                        p["prompt_batch_size"] = int(batch)
+                        group.append(run_candidate(p, "Tune prompt batch"))
+                    current = self._tuner_choose(current, group)
+                    best_patch = dict(current.get("patch") or {})
+
+                if tune_flash:
+                    current_flash = bool(best_patch.get("flash_attention", base_cfg.get("flash_attention", True)))
+                    opposite = dict(best_patch)
+                    opposite["flash_attention"] = not current_flash
+                    tested = run_candidate(opposite, "Tune Flash Attention")
+                    current = self._tuner_choose(current, [current, tested])
+                    best_patch = dict(current.get("patch") or {})
+
+                if tune_memory:
+                    # mmap affects load/reload behavior; mlock can improve page
+                    # residency at the cost of system-RAM pressure. Both are tested
+                    # independently around the current winner.
+                    for key, phase in (("use_mmap", "Tune mmap"), ("use_mlock", "Tune mlock")):
+                        now = bool(best_patch.get(key, base_cfg.get(key)))
+                        p = dict(best_patch)
+                        p[key] = not now
+                        tested = run_candidate(p, phase)
+                        current = self._tuner_choose(current, [current, tested])
+                        best_patch = dict(current.get("patch") or {})
+
+                    # GPU vs CPU KV placement can substantially change VRAM and
+                    # prompt/decode performance without changing KV precision.
+                    now_loc = str(best_patch.get("kv_cache_location", base_cfg.get("kv_cache_location") or "GPU"))
+                    other_loc = "CPU" if now_loc.upper() == "GPU" else "GPU"
+                    p = dict(best_patch)
+                    p["kv_cache_location"] = other_loc
+                    tested = run_candidate(p, "Tune KV placement")
+                    current = self._tuner_choose(current, [current, tested])
+                    best_patch = dict(current.get("patch") or {})
+
+                    # Explore useful partial-offload points, but never force pure
+                    # CPU inference. Context size stays fixed so memory tuning
+                    # cannot win by silently reducing configured capacity.
+                    est = self.vram_estimate(best_patch)
+                    blocks = int((est.get("components") or {}).get("block_count") or 0)
+                    cur_layers = int(best_patch.get("gpu_layers", base_cfg.get("gpu_layers", -1)))
+                    effective_spec = str(current.get("speculative_effective") or "Off")
+                    if blocks > 4 and effective_spec != "MTP":
+                        layer_values = {cur_layers, -1, max(1, blocks - max(2, blocks // 8))}
+                        if standard:
+                            layer_values.add(max(1, int(round(blocks * 0.75))))
+                        group = [current]
+                        for layers in sorted(layer_values):
+                            if layers == cur_layers:
+                                continue
+                            p = dict(best_patch)
+                            p["gpu_layers"] = int(layers)
+                            group.append(run_candidate(p, "Tune GPU layer offload"))
+                        current = self._tuner_choose(current, group)
+                        best_patch = dict(current.get("patch") or {})
+
+                if tune_kv_precision:
+                    # KV quantization can alter output slightly, so it is a
+                    # separately opt-in search rather than part of normal memory
+                    # tuning. Symmetric q8/q4/f16 cover the useful broad tradeoffs;
+                    # Standard also tests q8 keys + q4 values.
+                    cur_k = str(best_patch.get("kv_cache_k", base_cfg.get("kv_cache_k") or "q8_0"))
+                    cur_v = str(best_patch.get("kv_cache_v", base_cfg.get("kv_cache_v") or "q8_0"))
+                    pairs = {(cur_k, cur_v), ("q8_0", "q8_0"), ("q4_0", "q4_0"), ("f16", "f16")}
+                    if standard:
+                        pairs.add(("q8_0", "q4_0"))
+                    group = [current]
+                    for k_type, v_type in sorted(pairs):
+                        if (k_type, v_type) == (cur_k, cur_v):
+                            continue
+                        p = dict(best_patch)
+                        p["kv_cache_k"] = k_type
+                        p["kv_cache_v"] = v_type
+                        group.append(run_candidate(p, "Tune KV precision"))
+                    current = self._tuner_choose(current, group)
+                    best_patch = dict(current.get("patch") or {})
+
+                if tune_spec:
+                    md = _metadata_for(str(base_cfg.get("model") or ""))
+                    support = _speculative_runtime_support()
+                    modes = ["Off"]
+                    if support.get("ngram"):
+                        modes.append("N-gram")
+                    # Give native MTP a fair chance even if memory tuning selected
+                    # partial GPU offload: MTP itself requires full GPU offload, so
+                    # probe and benchmark that combined valid configuration.
+                    mtp_cfg = copy.deepcopy(base_cfg)
+                    mtp_cfg.update(best_patch)
+                    mtp_cfg["speculative_mode"] = "MTP"
+                    mtp_cfg["gpu_layers"] = -1
+                    mtp_resolved = _resolve_service_speculative(mtp_cfg, md, support)
+                    if mtp_resolved.get("effective") == "MTP":
+                        modes.append("MTP")
+                    group = [current]
+                    for mode in modes:
+                        p = dict(best_patch)
+                        p["speculative_mode"] = mode
+                        if mode == "MTP":
+                            p["gpu_layers"] = -1
+                        group.append(run_candidate(p, "Tune speculative decoding"))
+                    current = self._tuner_choose(current, group)
+                    best_patch = dict(current.get("patch") or {})
+
+                    if standard and current.get("status") == "ok":
+                        effective = str(current.get("speculative_effective") or best_patch.get("speculative_mode") or "Off")
+                        if effective == "N-gram":
+                            vals = sorted(set([int(base_cfg.get("ngram_pred_tokens") or 10), 5, 10, 16, 24]))
+                            group = [current]
+                            for value in vals:
+                                p = dict(best_patch)
+                                p["speculative_mode"] = "N-gram"
+                                p["ngram_pred_tokens"] = int(value)
+                                group.append(run_candidate(p, "Tune N-gram draft size"))
+                            current = self._tuner_choose(current, group)
+                            best_patch = dict(current.get("patch") or {})
+                        elif effective == "MTP":
+                            vals = sorted(set([int(base_cfg.get("mtp_draft_tokens") or 2), 1, 2, 3, 4]))
+                            group = [current]
+                            for value in vals:
+                                p = dict(best_patch)
+                                p["speculative_mode"] = "MTP"
+                                p["gpu_layers"] = -1
+                                p["mtp_draft_tokens"] = int(value)
+                                group.append(run_candidate(p, "Tune MTP draft size"))
+                            current = self._tuner_choose(current, group)
+                            best_patch = dict(current.get("patch") or {})
+
+                baseline_score = float(baseline.get("score_seconds") or 0.0)
+                best_score = float(current.get("score_seconds") or baseline_score or 1.0)
+                improvement = max(0.0, (baseline_score - best_score) / baseline_score) if baseline_score > 0 else 0.0
+                recommendation_patch = {}
+                final_cfg = copy.deepcopy(base_cfg)
+                final_cfg.update(best_patch)
+                recommendation_fields = (
+                    "prompt_batch_size", "memory_batch_size", "flash_attention",
+                    "use_mmap", "use_mlock", "kv_cache_location", "gpu_layers",
+                    "kv_cache_k", "kv_cache_v", "speculative_mode",
+                    "ngram_pred_tokens", "mtp_draft_tokens",
+                )
+                for key in recommendation_fields:
+                    if final_cfg.get(key) != base_cfg.get(key):
+                        recommendation_patch[key] = copy.deepcopy(final_cfg.get(key))
+                recommendation = {
+                    "patch": recommendation_patch,
+                    "settings": {k: copy.deepcopy(final_cfg.get(k)) for k in MEMORY_PRESET_FIELDS if k in final_cfg},
+                    "label": current.get("label"),
+                    "score_mode": score_mode,
+                    "baseline_score_seconds": baseline_score,
+                    "best_score_seconds": best_score,
+                    "baseline_fixed_work_seconds": float(baseline.get("fixed_work_seconds") or 0.0),
+                    "best_fixed_work_seconds": float(current.get("fixed_work_seconds") or 0.0),
+                    "baseline_cycle_seconds": float(baseline.get("cycle_fixed_seconds") or 0.0),
+                    "best_cycle_seconds": float(current.get("cycle_fixed_seconds") or 0.0),
+                    "improvement_percent": improvement * 100.0,
+                    "load_seconds": current.get("load_seconds"),
+                    "unload_seconds": current.get("unload_seconds"),
+                    "prompt_tps": current.get("prompt_tps"),
+                    "decode_tps": current.get("decode_tps"),
+                    "measured_vram_bytes": current.get("measured_vram_bytes"),
+                    "speculative_effective": current.get("speculative_effective"),
+                    "acceptance_rate": current.get("acceptance_rate"),
+                    "tradeoffs": copy.deepcopy(current.get("tradeoffs") or []),
+                    "quality_tradeoff": bool(current.get("quality_tradeoff")),
+                }
+                score_name = "ComfyUI cycle" if score_mode == "ComfyUI Cycle" else "inference"
+                self._set_tuner(
+                    state="complete", phase="Complete", progress=1.0,
+                    current_candidate=None, results=results, recommendation=recommendation,
+                    error=None, finished_at=time.time(),
+                    message=f"Complete. Best {score_name} score improved {improvement*100:.1f}% over baseline.",
+                )
+                self._log(
+                    f"Performance tuner complete: {improvement*100:.1f}% {score_name} improvement • "
+                    f"recommendation={recommendation_patch or 'current settings'}"
+                )
+        except InterruptedError:
+            self._set_tuner(
+                state="cancelled", phase="Cancelled", progress=0.0, current_candidate=None,
+                results=results, finished_at=time.time(), message="Cancelled after the current benchmark trial.",
+            )
+            self._log("Performance tuner cancelled")
+        except Exception as e:
+            self._set_tuner(
+                state="error", phase="Error", current_candidate=None, results=results,
+                error=f"{type(e).__name__}: {e}", finished_at=time.time(), message=str(e),
+            )
+            self._log(f"Performance tuner failed: {type(e).__name__}: {e}", "error")
+        finally:
+            # Restore the user's saved load signature rather than leaving the last
+            # benchmark candidate resident. This does not save any tuner result.
+            try:
+                if self._api is not None:
+                    restore_args = self._call_args()
+                    restore_args.update({
+                        "messages_override": [{"role": "user", "content": "Respond with OK."}],
+                        "max_tokens": 1, "seed": 0, "progress_callback": None, "token_callback": None,
+                    })
+                    _r, _t, _i, _n, api = LocalGGUFLLM().generate(**restore_args)
+                    self._api = api
+                    ctl = _MODEL_CACHE.get("managed_adapter")
+                    if original_yielded:
+                        if ctl is not None and getattr(ctl, "llm", None) is not None:
+                            ctl._unload_native(reason="tuner-restore-yielded", heavy_cleanup=False)
+                    elif ctl is not None and getattr(ctl, "llm", None) is not None:
+                        # Do not leave the tuner's restore/warmup prompt as the next
+                        # user's reusable resident prefix. The model remains loaded.
+                        reset = getattr(ctl.llm, "reset", None)
+                        if callable(reset):
+                            reset()
+                with self._state_lock:
+                    self._state = STATE_READY
+                    self._model_loaded = bool(original_resident or original_yielded or self._api is not None)
+                    self._error = None
+            except Exception as restore_error:
+                restore_message = f"Tuner finished but restoring the saved configuration failed: {restore_error}"
+                with self._state_lock:
+                    self._state = STATE_ERROR
+                    self._error = restore_message
+                self._set_tuner(state="error", phase="Restore error", error=restore_message, message=restore_message, finished_at=time.time())
+                self._log(self._error, "error")
+            finally:
+                self._emit()
+
+    def start_tuner(self, options=None):
+        options = dict(options or {})
+        with self._tuner_lock:
+            if self._tuner_thread is not None and self._tuner_thread.is_alive():
+                raise RuntimeError("Performance tuner is already running")
+        with self._state_lock:
+            if self._state != STATE_READY or self._api is None:
+                raise RuntimeError("Start the Local LLM service before running the performance tuner")
+            if self._restart_required:
+                raise RuntimeError("Save/reload the current server configuration before benchmarking")
+        original_resident = bool(self._resident_snapshot())
+        original_yielded = bool(not original_resident and self._api is not None)
+        profile = str(options.get("profile") or "Quick").title()
+        if profile not in {"Quick", "Standard"}:
+            profile = "Quick"
+        options["profile"] = profile
+        self._tuner_cancel.clear()
+        with self._tuner_lock:
+            self._tuner = {
+                "state": "running", "phase": "Preparing", "progress": 0.01,
+                "candidate_index": 0, "candidate_total": 0, "current_candidate": None,
+                "results": [], "recommendation": None, "error": None,
+                "started_at": time.time(), "finished_at": None, "profile": profile,
+                "message": "Preparing benchmark candidates…",
+                "options": copy.deepcopy(options),
+            }
+            thread = threading.Thread(
+                target=self._run_tuner,
+                args=(copy.deepcopy(options), original_resident, original_yielded),
+                name="LocalLLMPerformanceTuner", daemon=True,
+            )
+            self._tuner_thread = thread
+            thread.start()
+        return self.tuner_status()
+
+    def cancel_tuner(self):
+        with self._tuner_lock:
+            running = self._tuner_thread is not None and self._tuner_thread.is_alive()
+        if running:
+            self._tuner_cancel.set()
+            self._set_tuner(message="Cancellation requested; waiting for the current native benchmark call to finish…")
+        return self.tuner_status()
+
     def status(self):
         with self._state_lock:
             state = self._state
@@ -1106,7 +2220,8 @@ class LocalLLMServiceManager:
         model = cfg.get("model")
         md = _metadata_for(model) if model and model != "No GGUF models found" else {}
         family = detect_family(md, model or "") if md else "unknown"
-        capabilities = capabilities_for_family(family)
+        capabilities, speculative_support = _model_capabilities_with_runtime(md, family)
+        speculative = _resolve_service_speculative(cfg, md, speculative_support)
         gpu_backend = info.get("gpu_backend") or {}
         preload = gpu_backend.get("preload_memory") or {}
         last_unload = gpu_backend.get("last_unload") or {}
@@ -1124,6 +2239,11 @@ class LocalLLMServiceManager:
             "vision_model": cfg.get("vision_model"),
             "family": family,
             "capabilities": capabilities,
+            "speculative_support": speculative_support,
+            "speculative": speculative,
+            "speculative_mode": cfg.get("speculative_mode", "Off"),
+            "speculative_effective": speculative.get("effective", "Off"),
+            "prompt_cache_mode": cfg.get("prompt_cache_mode", "Auto"),
             "model_preset": cfg.get("model_preset"),
             "memory_preset": cfg.get("memory_preset"),
             "vram_policy": cfg.get("vram_policy", "Auto Yield to ComfyUI"),
@@ -1158,6 +2278,11 @@ class LocalLLMServiceManager:
             "last_average_tokens_per_second": info.get("tokens_per_second"),
             "last_prompt_tokens_per_second": info.get("prompt_tokens_per_second"),
             "last_prompt_tokens": info.get("prompt_eval_tokens", info.get("prompt_tokens")),
+            "last_prompt_cache": copy.deepcopy(info.get("prompt_cache") or {}),
+            "last_prompt_cache_hit": bool((info.get("prompt_cache") or {}).get("hit")),
+            "last_prompt_cache_reused_tokens": (info.get("prompt_cache") or {}).get("reused_tokens"),
+            "last_prompt_cache_reuse_percent": (info.get("prompt_cache") or {}).get("reuse_percent"),
+            "last_prompt_cache_saved_seconds": (info.get("prompt_cache") or {}).get("estimated_seconds_saved"),
             "last_completion_tokens": info.get("completion_tokens"),
             "last_tokens": info.get("completion_tokens"),
             "last_total_tokens": info.get("total_tokens"),
@@ -1176,16 +2301,20 @@ SERVICE = LocalLLMServiceManager()
 
 def catalog():
     models, vision = _model_lists()
+    user_memory = memory_presets()
+    preset_payload = public_presets()
+    preset_payload["memory"].update({name: copy.deepcopy(item["settings"]) for name, item in user_memory.items()})
     return {
         "models": models,
         "vision": vision,
         "gpus": _gpu_choices(),
         "model_presets": ["Auto (Detected)", "Custom"] + list(MODEL_PRESETS.keys()),
-        "memory_presets": ["Custom"] + list(MEMORY_PRESETS.keys()),
+        "memory_presets": ["Custom"] + list(MEMORY_PRESETS.keys()) + sorted(user_memory, key=str.lower),
+        "memory_preset_files": {name: item.get("path") for name, item in user_memory.items()},
         "context_sizes": list(CONTEXT_SIZE_STEPS),
         "request_presets": SERVICE.request_preset_catalog(),
         "node_presets": SERVICE.node_preset_catalog(),
-        "presets": public_presets(),
+        "presets": preset_payload,
     }
 
 
@@ -1202,12 +2331,16 @@ def model_info(name):
     family = detect_family(md, name)
     context_sizes, native_context = _context_options_for_model(name)
     matching_vision = _find_matching_mmproj(name)
+    capabilities, speculative_support = _model_capabilities_with_runtime(md, family)
+    speculative = _resolve_service_speculative(SERVICE.get_config(), md, speculative_support)
     return {
         "metadata": {k: (v[:2000] + "…" if isinstance(v, str) and len(v) > 2000 else v) for k, v in md.items()},
         "family": family,
         "recommended_preset": recommended_model_preset(md, name),
         "available_presets": available_model_presets(md, name),
-        "capabilities": capabilities_for_family(family),
+        "capabilities": capabilities,
+        "speculative_support": speculative_support,
+        "speculative": speculative,
         "matching_vision": matching_vision,
         "matching_vision_validation": (
             _validate_mmproj_pair(name, matching_vision) if matching_vision else None
@@ -1235,22 +2368,73 @@ def maybe_autostart():
 # Lightweight ComfyUI nodes backed by the global service
 # ---------------------------------------------------------------------------
 
-class GetLocalLLMService:
+class LocalLLMSettings:
+    """Reusable request-local sampler/vision/seed settings for Local LLM Generate."""
+
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {}}
+        return {
+            "required": {
+                "sampling_mode": (["Default", "Custom", *sampler_preset_names()], {"default": "Default", "tooltip": "Default mirrors the current global server generation defaults. Editing a sampler value switches this selector to Custom. Saved samplers live in models/LLM/local_LLM_presets/sampler."}),
+                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 5.0, "step": 0.01}),
+                "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "top_k": ("INT", {"default": 40, "min": 0, "max": 10000}),
+                "min_p": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "repeat_penalty": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.01}),
+                "presence_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01}),
+                "frequency_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01}),
+                "max_tokens": ("INT", {"default": 2048, "min": 1, "max": 262144}),
+                "vision_max_images": ("INT", {"default": 4, "min": 0, "max": 32, "tooltip": "Maximum still images accepted from the IMAGE batch. Set 0 to ignore still-image input for this request."}),
+                "vision_max_frames": ("INT", {"default": 24, "min": 0, "max": 1024, "tooltip": "Maximum evenly sampled video frames. Set 0 to ignore video-frame input for this request."}),
+                "vision_max_edge": ("INT", {"default": 1536, "min": 256, "max": 4096, "step": 64}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "control_after_generate": True}),
+            }
+        }
 
-    RETURN_TYPES = ("LOCAL_LLM_SERVICE_API",)
-    RETURN_NAMES = ("api",)
-    FUNCTION = "get_service"
+    RETURN_TYPES = ("LOCAL_LLM_SETTINGS",)
+    RETURN_NAMES = ("settings",)
+    FUNCTION = "build"
     CATEGORY = "LLM/Local Service"
-    DESCRIPTION = "Return a live facade for the global persistent Local LLM Server."
+    DESCRIPTION = "Reusable sampler, vision-limit, and seed settings for Local LLM Generate."
 
-    def get_service(self):
-        return (SERVICE.api,)
+    @classmethod
+    def IS_CHANGED(cls, sampling_mode="Default", **kwargs):
+        mode = str(sampling_mode or "Default")
+        payload = {"sampler_mode": mode}
+        for key in (*SAMPLER_PRESET_FIELDS, "vision_max_images", "vision_max_frames", "vision_max_edge", "seed"):
+            if key in kwargs:
+                payload[key] = kwargs.get(key)
+        if mode == "Default":
+            payload["sampler"] = SERVICE.request_generation_defaults()
+        elif mode != "Custom":
+            preset = sampler_presets().get(mode)
+            payload["sampler"] = copy.deepcopy((preset or {}).get("settings"))
+            payload["sampler_mtime_ns"] = (preset or {}).get("mtime_ns")
+        return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+    def build(self, sampling_mode, temperature, top_p, top_k, min_p, repeat_penalty,
+              presence_penalty, frequency_penalty, max_tokens, vision_max_images,
+              vision_max_frames, vision_max_edge, seed):
+        return ({
+            "schema": "local_llm_request_settings",
+            "schema_version": 1,
+            "sampling_mode": str(sampling_mode or "Default"),
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "top_k": int(top_k),
+            "min_p": float(min_p),
+            "repeat_penalty": float(repeat_penalty),
+            "presence_penalty": float(presence_penalty),
+            "frequency_penalty": float(frequency_penalty),
+            "max_tokens": int(max_tokens),
+            "vision_max_images": int(vision_max_images),
+            "vision_max_frames": int(vision_max_frames),
+            "vision_max_edge": int(vision_max_edge),
+            "seed": int(seed),
+        },)
 
 
-class LocalLLMServiceGenerate:
+class LocalLLMGenerate:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -1268,12 +2452,13 @@ class LocalLLMServiceGenerate:
                 "presence_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01}),
                 "frequency_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01}),
                 "max_tokens": ("INT", {"default": 2048, "min": 1, "max": 262144}),
-                "vision_max_images": ("INT", {"default": 4, "min": 1, "max": 32, "tooltip": "Maximum still images accepted from the IMAGE batch."}),
-                "vision_max_frames": ("INT", {"default": 24, "min": 1, "max": 1024, "tooltip": "Evenly sampled frames from the Video Frames IMAGE batch."}),
+                "vision_max_images": ("INT", {"default": 4, "min": 0, "max": 32, "tooltip": "Maximum still images accepted from the IMAGE batch. Set 0 to ignore still-image input for this request."}),
+                "vision_max_frames": ("INT", {"default": 24, "min": 0, "max": 1024, "tooltip": "Evenly sampled frames from the Video Frames IMAGE batch. Set 0 to ignore video-frame input for this request."}),
                 "vision_max_edge": ("INT", {"default": 1536, "min": 256, "max": 4096, "step": 64}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "control_after_generate": True}),
             },
             "optional": {
+                "settings": ("LOCAL_LLM_SETTINGS", {"tooltip": "Optional Local LLM Settings node. When connected, its sampler, vision-limit, and seed values override the matching widgets on this Generate node."}),
                 "image": ("IMAGE", {"tooltip": "One still image or an IMAGE batch."}),
                 "video_frames": ("IMAGE", {"tooltip": "Ordered video frames as an IMAGE batch; sampled evenly."}),
             },
@@ -1290,11 +2475,17 @@ class LocalLLMServiceGenerate:
         # This node depends on global server state and preset files that are not
         # fully represented by its serialized widget values. Include the effective
         # default/preset contents so changes on disk invalidate cached responses.
-        mode = str(sampling_mode or "Default")
-        payload = {"sampler_mode": mode}
-        for key in ("vision_max_images", "vision_max_frames", "vision_max_edge"):
-            if key in kwargs:
-                payload[key] = kwargs.get(key)
+        linked_settings = kwargs.get("settings") if isinstance(kwargs.get("settings"), dict) else None
+        mode = str((linked_settings or {}).get("sampling_mode", sampling_mode) or "Default")
+        payload = {"sampler_mode": mode, "settings_node": bool(linked_settings)}
+        if linked_settings:
+            for key in (*SAMPLER_PRESET_FIELDS, "vision_max_images", "vision_max_frames", "vision_max_edge", "seed"):
+                if key in linked_settings:
+                    payload[key] = linked_settings.get(key)
+        else:
+            for key in (*SAMPLER_PRESET_FIELDS, "vision_max_images", "vision_max_frames", "vision_max_edge", "seed"):
+                if key in kwargs:
+                    payload[key] = kwargs.get(key)
         if mode == "Default":
             payload["sampler"] = SERVICE.request_generation_defaults()
         elif mode != "Custom":
@@ -1328,7 +2519,22 @@ class LocalLLMServiceGenerate:
     def generate(self, system_prompt_preset, system_prompt, prompt_preset, prompt,
                  sampling_mode, temperature, top_p, top_k, min_p, repeat_penalty,
                  presence_penalty, frequency_penalty, max_tokens, vision_max_images, vision_max_frames,
-                 vision_max_edge, seed, image=None, video_frames=None):
+                 vision_max_edge, seed, image=None, video_frames=None, settings=None):
+        linked_settings = settings if isinstance(settings, dict) else None
+        if linked_settings:
+            sampling_mode = linked_settings.get("sampling_mode", sampling_mode)
+            temperature = linked_settings.get("temperature", temperature)
+            top_p = linked_settings.get("top_p", top_p)
+            top_k = linked_settings.get("top_k", top_k)
+            min_p = linked_settings.get("min_p", min_p)
+            repeat_penalty = linked_settings.get("repeat_penalty", repeat_penalty)
+            presence_penalty = linked_settings.get("presence_penalty", presence_penalty)
+            frequency_penalty = linked_settings.get("frequency_penalty", frequency_penalty)
+            max_tokens = linked_settings.get("max_tokens", max_tokens)
+            vision_max_images = linked_settings.get("vision_max_images", vision_max_images)
+            vision_max_frames = linked_settings.get("vision_max_frames", vision_max_frames)
+            vision_max_edge = linked_settings.get("vision_max_edge", vision_max_edge)
+            seed = linked_settings.get("seed", seed)
         mode = str(sampling_mode or "Default")
 
         effective_system_prompt = system_prompt
@@ -1383,7 +2589,7 @@ class LocalLLMServiceGenerate:
             prompt=effective_prompt,
             image=image,
             video_frames=video_frames,
-            client="ComfyUI Local LLM Service Generate",
+            client="ComfyUI Local LLM Generate",
             **overrides,
         )
         info = copy.deepcopy(result.get("info") or {})
@@ -1391,6 +2597,7 @@ class LocalLLMServiceGenerate:
             "sampler": mode,
             "system_prompt": str(system_prompt_preset or "Custom"),
             "prompt": str(prompt_preset or "Custom"),
+            "settings_node": bool(linked_settings),
         }
         return (
             result.get("response", ""),
@@ -1456,6 +2663,47 @@ try:
         except Exception as e:
             return _json_error(e)
 
+    @routes.post("/local_llm_server/vram_estimate")
+    async def local_llm_server_vram_estimate(request):
+        try:
+            data = await request.json()
+            estimate = await asyncio.to_thread(SERVICE.vram_estimate, data if isinstance(data, dict) else {})
+            return web.json_response(estimate)
+        except Exception as e:
+            return _json_error(e)
+
+    @routes.get("/local_llm_server/tuner/status")
+    async def local_llm_server_tuner_status(request):
+        return web.json_response(SERVICE.tuner_status())
+
+    @routes.post("/local_llm_server/tuner/start")
+    async def local_llm_server_tuner_start(request):
+        try:
+            body = await request.json()
+            status = await asyncio.to_thread(SERVICE.start_tuner, body if isinstance(body, dict) else {})
+            return web.json_response(status)
+        except Exception as e:
+            return _json_error(e, 409 if "already running" in str(e).lower() else 400)
+
+    @routes.post("/local_llm_server/tuner/cancel")
+    async def local_llm_server_tuner_cancel(request):
+        try:
+            return web.json_response(await asyncio.to_thread(SERVICE.cancel_tuner))
+        except Exception as e:
+            return _json_error(e)
+
+    @routes.post("/local_llm_server/memory_presets")
+    async def local_llm_server_memory_presets_post(request):
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise TypeError("request body must be an object")
+            saved = await asyncio.to_thread(save_memory_preset, body.get("name"), body.get("settings") or {})
+            SERVICE._log(f"Saved Local LLM memory/performance preset: {saved['name']}")
+            return web.json_response({"saved": saved, "catalog": catalog()})
+        except Exception as e:
+            return _json_error(e)
+
     @routes.get("/local_llm_server/logs")
     async def local_llm_server_logs(request):
         return web.json_response({"logs": SERVICE.logs()})
@@ -1514,10 +2762,39 @@ try:
         except Exception as e:
             return _json_error(e)
 
+    @routes.delete("/local_llm_server/node_presets")
+    async def local_llm_server_node_presets_delete(request):
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise TypeError("request body must be an object")
+            kind = str(body.get("kind") or "").strip()
+            if kind == "sampler":
+                deleted = await asyncio.to_thread(delete_sampler_preset, body.get("name"))
+                label = "sampler"
+            elif kind in {"system_prompts", "prompts"}:
+                deleted = await asyncio.to_thread(delete_text_preset, kind, body.get("name"))
+                label = "system prompt" if kind == "system_prompts" else "prompt"
+            else:
+                raise ValueError("kind must be sampler, system_prompts, or prompts")
+            SERVICE._log(f"Deleted Local LLM {label} preset: {deleted['name']}")
+            return web.json_response({"deleted": deleted, "catalog": SERVICE.node_preset_catalog()})
+        except Exception as e:
+            return _json_error(e)
+
+
     @routes.post("/local_llm_server/start")
     async def local_llm_server_start(request):
         try:
             status = await asyncio.to_thread(SERVICE.start)
+            return web.json_response(status)
+        except Exception as e:
+            return _json_error(e, 500)
+
+    @routes.post("/local_llm_server/suspend")
+    async def local_llm_server_suspend(request):
+        try:
+            status = await asyncio.to_thread(SERVICE.suspend)
             return web.json_response(status)
         except Exception as e:
             return _json_error(e, 500)

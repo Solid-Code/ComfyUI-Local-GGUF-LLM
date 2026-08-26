@@ -1,17 +1,43 @@
-from .nodes import LocalGGUFLLMAPI
-from .service import SERVICE, LocalLLMServiceAPI, GetLocalLLMService, LocalLLMServiceGenerate
+from pathlib import Path
 
-# Only expose the persistent-service workflow nodes.  LocalGGUFLLM remains an
-# internal engine used by the service and is intentionally not registered as a
-# standalone ComfyUI node.
+# Keep exactly one version of each frontend module. This matters when users
+# extract an update over an existing custom-node directory because ComfyUI loads
+# every JS module found under WEB_DIRECTORY.
+_js_dir = Path(__file__).resolve().parent / "web" / "js"
+_FRONTENDS = {
+    "local_llm_server": "local_llm_server_v088.js",
+    "prompt_enhancer": "prompt_enhancer_dom_v0610.js",
+}
+if _js_dir.is_dir():
+    for _candidate in _js_dir.glob("*.js"):
+        name = _candidate.name
+        keep = True
+        if name.startswith("local_llm_server"):
+            keep = name == _FRONTENDS["local_llm_server"]
+        elif name.startswith("prompt_enhancer"):
+            keep = name == _FRONTENDS["prompt_enhancer"]
+        if not keep:
+            try:
+                _candidate.unlink()
+            except OSError:
+                pass
+
+from .nodes import LocalGGUFLLMAPI
+from .service import SERVICE, LocalLLMServiceAPI, LocalLLMGenerate, LocalLLMSettings
+from .prompt_enhancer import LocalLLMPromptEnhancer
+
+# LocalGGUFLLM remains the internal engine behind the persistent service and is
+# intentionally not registered as a standalone ComfyUI node.
 NODE_CLASS_MAPPINGS = {
-    "GetLocalLLMService": GetLocalLLMService,
-    "LocalLLMServiceGenerate": LocalLLMServiceGenerate,
+    "LocalLLMGenerate": LocalLLMGenerate,
+    "LocalLLMSettings": LocalLLMSettings,
+    "LocalLLMPromptEnhancer": LocalLLMPromptEnhancer,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "GetLocalLLMService": "Get Local LLM Service",
-    "LocalLLMServiceGenerate": "Local LLM Service Generate",
+    "LocalLLMGenerate": "Local LLM Generate",
+    "LocalLLMSettings": "Local LLM Settings",
+    "LocalLLMPromptEnhancer": "Local LLM Prompt Enhancer",
 }
 
 WEB_DIRECTORY = "./web"

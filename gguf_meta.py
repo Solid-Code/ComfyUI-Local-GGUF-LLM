@@ -36,6 +36,7 @@ MEMORY_KEY_SUFFIXES = (
     ".attention.key_length",
     ".attention.value_length",
     ".context_length",
+    ".nextn_predict_layers",
 )
 
 

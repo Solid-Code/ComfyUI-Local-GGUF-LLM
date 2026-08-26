@@ -578,6 +578,120 @@ def _perf_delta(after, before):
     }
 
 
+
+def _prompt_cache_context_snapshot(llm):
+    """Cheap resident-context snapshot for prompt-cache accounting.
+
+    Do not copy ``_input_ids`` here: contexts can be hundreds of thousands of
+    tokens long. Native llama.cpp prompt perf counters tell us how many prompt
+    tokens were actually evaluated, while llama-cpp-python itself performs the
+    exact-token longest-prefix comparison.  Keeping this O(1) avoids turning a
+    cache optimization into a large Python memory/copy cost.
+    """
+    try:
+        n_tokens = max(0, int(getattr(llm, "n_tokens", 0) or 0))
+    except Exception:
+        n_tokens = 0
+    return {
+        "n_tokens": int(n_tokens),
+        "requires_eval": bool(getattr(llm, "_requires_eval", True)),
+    }
+
+
+def _prepare_resident_prompt_cache(llm, requested_mode, vision_active=False, signature_id=None):
+    """Prepare stage-1 resident prefix reuse and return a pre-request snapshot.
+
+    ``Auto`` intentionally leaves the current llama context intact so the
+    high-level generate() path can perform its exact-token longest-prefix match.
+    ``Off`` resets before each request. Vision requests are also reset/bypassed:
+    two different images can share identical placeholder text tokens, so textual
+    prefix identity alone is not sufficient proof that multimodal KV is reusable.
+    """
+    requested = str(requested_mode or "Auto").strip()
+    if requested not in {"Auto", "Off"}:
+        requested = "Auto"
+    before = _prompt_cache_context_snapshot(llm)
+    bypass_reason = None
+    effective = requested
+    if vision_active:
+        effective = "Off"
+        bypass_reason = "Multimodal request: resident text-prefix reuse is conservatively bypassed."
+    if effective == "Off":
+        try:
+            llm.reset()
+        except Exception:
+            pass
+    return {
+        "requested": requested,
+        "effective": effective,
+        "scope": "resident-context",
+        "signature_id": signature_id,
+        "resident_tokens_before": int(before.get("n_tokens") or 0),
+        "before_requires_eval": bool(before.get("requires_eval", True)),
+        "bypass_reason": bypass_reason,
+        "survives_suspend": False,
+    }
+
+
+def _resident_prompt_cache_metrics(llm, prepared, prompt_tokens, native_prompt_tokens, prompt_eval_seconds):
+    """Measure actual resident-prefix prefill reuse after a completion.
+
+    Native llama.cpp perf counters are authoritative: full prompt token count
+    minus prompt tokens actually evaluated is the prefill work avoided. We do not
+    duplicate llama-cpp-python's prefix scan in Python because doing so would copy
+    potentially enormous token arrays on every request.
+    """
+    prepared = prepared or {}
+    requested = str(prepared.get("requested") or "Auto")
+    effective = str(prepared.get("effective") or requested)
+    total = max(0, int(prompt_tokens or 0))
+    evaluated_native = max(0, int(native_prompt_tokens or 0))
+    after = _prompt_cache_context_snapshot(llm)
+
+    perf_proven = bool(total > 0 and evaluated_native > 0)
+    reused = max(0, total - evaluated_native) if perf_proven and effective == "Auto" else 0
+    evaluated = max(0, total - reused) if total > 0 else evaluated_native
+    hit = bool(effective == "Auto" and reused > 0)
+    reuse_pct = (100.0 * reused / total) if total > 0 else 0.0
+    eval_rate = (evaluated_native / float(prompt_eval_seconds)) if evaluated_native > 0 and prompt_eval_seconds > 0 else 0.0
+    effective_rate = (total / float(prompt_eval_seconds)) if total > 0 and prompt_eval_seconds > 0 else 0.0
+    saved_seconds = (reused / eval_rate) if reused > 0 and eval_rate > 0 else 0.0
+
+    reason = prepared.get("bypass_reason")
+    if not reason:
+        if requested == "Off":
+            reason = "Disabled by setting; the resident context is reset before each request."
+        elif total <= 0:
+            reason = "Prompt token count was unavailable from this binding/stream."
+        elif not perf_proven:
+            reason = "Native prompt-evaluation counters were unavailable, so reuse is not claimed."
+        elif hit:
+            reason = "Exact resident token prefix reused by llama.cpp."
+        else:
+            reason = "No reusable exact resident prefix was found for this request."
+
+    return {
+        "requested": requested,
+        "effective": effective,
+        "scope": str(prepared.get("scope") or "resident-context"),
+        "signature_id": prepared.get("signature_id"),
+        "hit": hit,
+        "prompt_tokens": total,
+        "evaluated_tokens": evaluated,
+        "native_evaluated_tokens": evaluated_native,
+        "reused_tokens": int(reused),
+        "reuse_percent": round(reuse_pct, 2),
+        "resident_tokens_before": int(prepared.get("resident_tokens_before") or 0),
+        "resident_tokens_after": int(after.get("n_tokens") or 0),
+        "uncached_prompt_tokens_per_second": round(eval_rate, 2),
+        "effective_prompt_tokens_per_second": round(effective_rate, 2),
+        "estimated_seconds_saved": round(saved_seconds, 3),
+        "metrics_source": "llama.cpp-perf" if perf_proven else "unavailable",
+        "reason": str(reason or ""),
+        "survives_suspend": False,
+    }
+
+
 def _scan_gguf():
     try:
         names = folder_paths.get_filename_list("llm")
@@ -958,9 +1072,21 @@ _GIB = 1024 * 1024 * 1024
 
 
 def _close_llama_object(llm):
-    """Close llama.cpp + multimodal contexts without assuming a binding version."""
+    """Close llama.cpp, multimodal, and speculative contexts safely."""
     if llm is None:
         return
+    # Capture the draft object before closing Llama. Experimental native MTP
+    # bridges may own a separate draft context; normal N-gram drafts are cheap
+    # Python objects. Cleanup is best-effort and intentionally idempotent.
+    draft_obj = None
+    for attr in ("draft_model", "_draft_model"):
+        try:
+            candidate = getattr(llm, attr, None)
+            if candidate is not None:
+                draft_obj = candidate
+                break
+        except Exception:
+            pass
     try:
         chat_handler = getattr(llm, "chat_handler", None)
         exit_stack = getattr(chat_handler, "_exit_stack", None)
@@ -974,6 +1100,11 @@ def _close_llama_object(llm):
             close()
     except Exception:
         pass
+    if draft_obj is not None:
+        try:
+            _close_speculative_object(draft_obj)
+        except Exception:
+            pass
 
 
 def _torch_cuda_snapshot():
@@ -1214,6 +1345,393 @@ def _meta_suffix_value(metadata, suffix, default=0):
     return default
 
 
+def _mtp_layer_count(metadata):
+    """Return embedded NextN/MTP layer count advertised by the GGUF, if any."""
+    return int(_meta_suffix_value(metadata or {}, ".nextn_predict_layers", 0) or 0)
+
+
+def _speculative_runtime_support():
+    """Probe speculative-decoding support without initializing CUDA/model state.
+
+    Normal llama-cpp-python exposes Python prompt-lookup speculation through the
+    ``draft_model`` constructor argument.  Newer JamePeng-derived wheels also
+    expose the O(1) ``LlamaNGramMapDecoding`` implementation.  Native MTP is not
+    part of upstream's stable high-level API yet, so it is enabled only when the
+    installed wheel explicitly provides the experimental native bridge *and*
+    exposes ``load_mtp`` on ``Llama``.
+    """
+    out = {
+        "available": False,
+        "llama_cpp_version": None,
+        "draft_model_arg": False,
+        "ngram": False,
+        "ngram_implementation": None,
+        "ngram_map": False,
+        "ngram_legacy": False,
+        "mtp": False,
+        "mtp_native_bridge": False,
+        "load_mtp": False,
+        "native_bridge_signature": None,
+    }
+    try:
+        import llama_cpp
+        from llama_cpp import Llama
+        out["available"] = True
+        out["llama_cpp_version"] = str(getattr(llama_cpp, "__version__", "unknown"))
+        params, has_var_kw = _signature_info(Llama.__init__)
+        out["draft_model_arg"] = bool("draft_model" in params or has_var_kw)
+        out["load_mtp"] = bool("load_mtp" in params)
+        try:
+            try:
+                from llama_cpp import llama_speculative as specmod
+            except Exception:
+                specmod = None
+            # Some experimental/fork wheels re-export speculative classes at the
+            # package root. Probe both locations so upgrades do not accidentally
+            # hide a supported provider from the UI.
+            def _spec_cls(name):
+                value = getattr(specmod, name, None) if specmod is not None else None
+                return value if value is not None else getattr(llama_cpp, name, None)
+
+            map_cls = _spec_cls("LlamaNGramMapDecoding")
+            legacy_cls = _spec_cls("LlamaPromptLookupDecoding")
+            native_cls = _spec_cls("LlamaNativeSpeculativeDecoding")
+            out["ngram_map"] = bool(map_cls is not None and out["draft_model_arg"])
+            out["ngram_legacy"] = bool(legacy_cls is not None and out["draft_model_arg"])
+            out["ngram"] = bool(out["ngram_map"] or out["ngram_legacy"])
+            out["ngram_implementation"] = (
+                "ngram-map" if out["ngram_map"] else
+                ("prompt-lookup-legacy" if out["ngram_legacy"] else None)
+            )
+            out["mtp_native_bridge"] = bool(native_cls is not None)
+            if native_cls is not None:
+                try:
+                    out["native_bridge_signature"] = str(inspect.signature(native_cls))
+                except Exception:
+                    out["native_bridge_signature"] = None
+        except Exception:
+            pass
+        # Internal/embedded MTP requires both the native speculative orchestrator
+        # and the target-model MTP layer loading switch. Do not claim support from
+        # low-level llama-ext symbols alone; those do not provide the full verified
+        # draft/rollback loop.
+        out["mtp"] = bool(out["draft_model_arg"] and out["mtp_native_bridge"] and out["load_mtp"])
+    except Exception:
+        pass
+    return out
+
+
+def _resolve_speculative_mode(requested, metadata, runtime_support=None):
+    support = runtime_support or _speculative_runtime_support()
+    requested = str(requested or "Off").strip()
+    mtp_layers = _mtp_layer_count(metadata)
+    mtp_model_capable = mtp_layers > 0
+    reason = None
+    if requested == "Off":
+        effective = "Off"
+    elif requested == "N-gram":
+        if support.get("ngram"):
+            effective = "N-gram"
+        else:
+            effective = "Off"
+            reason = "N-gram speculative decoding is unavailable in the installed llama-cpp-python build."
+    elif requested == "MTP":
+        if not mtp_model_capable:
+            effective = "Off"
+            reason = "The selected GGUF does not advertise embedded NextN/MTP layers."
+        elif not support.get("mtp"):
+            effective = "Off"
+            reason = "The installed llama-cpp-python build does not expose the native MTP speculative bridge."
+        else:
+            effective = "MTP"
+    else:  # Auto
+        if mtp_model_capable and support.get("mtp"):
+            effective = "MTP"
+        elif support.get("ngram"):
+            effective = "N-gram"
+            if mtp_model_capable and not support.get("mtp"):
+                reason = "Embedded MTP was detected, but this Python build lacks the native MTP bridge; Auto fell back to N-gram."
+        else:
+            effective = "Off"
+            reason = "No supported speculative-decoding provider is available."
+    return {
+        "requested": requested,
+        "effective": effective,
+        "mtp_layers": int(mtp_layers),
+        "mtp_model_capable": bool(mtp_model_capable),
+        "runtime": copy.deepcopy(support),
+        "reason": reason,
+    }
+
+
+def _close_speculative_object(obj):
+    if obj is None:
+        return
+    for name in ("close", "clear"):
+        fn = getattr(obj, name, None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:
+                pass
+            if name == "close":
+                break
+
+
+def _build_ngram_draft(ngram_size=3, num_pred_tokens=10, mode="k", min_hits=2,
+                       max_entries_per_key=8, sync_check_tokens=16):
+    try:
+        import llama_cpp
+        try:
+            from llama_cpp import llama_speculative as specmod
+        except Exception:
+            specmod = None
+    except Exception as e:
+        raise RuntimeError("llama-cpp-python speculative-decoding module is unavailable.") from e
+
+    map_cls = getattr(specmod, "LlamaNGramMapDecoding", None) if specmod is not None else None
+    if map_cls is None:
+        map_cls = getattr(llama_cpp, "LlamaNGramMapDecoding", None)
+    if map_cls is not None:
+        kwargs = {
+            "ngram_size": int(ngram_size),
+            "num_pred_tokens": int(num_pred_tokens),
+            "mode": str(mode or "k"),
+            "min_hits": int(min_hits),
+            "max_entries_per_key": (None if int(max_entries_per_key or 0) <= 0 else int(max_entries_per_key)),
+            "sync_check_tokens": int(sync_check_tokens),
+        }
+        clean, _unsupported = _filter_supported_kwargs(map_cls, kwargs)
+        return map_cls(**clean), {
+            "implementation": "ngram-map",
+            "settings": clean,
+        }
+
+    legacy_cls = getattr(specmod, "LlamaPromptLookupDecoding", None) if specmod is not None else None
+    if legacy_cls is None:
+        legacy_cls = getattr(llama_cpp, "LlamaPromptLookupDecoding", None)
+    if legacy_cls is not None:
+        # Official llama-cpp-python currently exposes this sliding-window fallback.
+        # It is slower than the newer map implementation on long contexts but is
+        # still valid lossless speculative decoding.
+        kwargs = {
+            "max_ngram_size": int(ngram_size),
+            "num_pred_tokens": int(num_pred_tokens),
+        }
+        clean, _unsupported = _filter_supported_kwargs(legacy_cls, kwargs)
+        return legacy_cls(**clean), {
+            "implementation": "prompt-lookup-legacy",
+            "settings": clean,
+        }
+    raise RuntimeError(
+        "N-gram speculative decoding is not available in the installed llama-cpp-python build. "
+        "Use Off or install a build exposing LlamaNGramMapDecoding/LlamaPromptLookupDecoding."
+    )
+
+
+def _build_native_mtp_draft(model_path, family, gpu_layers=-1, n_max=2, p_min=0.5, verbose=False):
+    """Build the experimental *internal* MTP decoder when the wheel exposes it.
+
+    Current native bridge semantics use ``model_path=None`` for embedded NextN
+    layers in the target GGUF.  The decoder is still attached to the target
+    ``Llama`` instance through ``draft_model`` and target construction receives
+    ``load_mtp=True``.  This is intentionally capability-gated because upstream
+    llama-cpp-python does not yet promise this experimental bridge ABI.
+    """
+    support = _speculative_runtime_support()
+    if not support.get("mtp"):
+        raise RuntimeError(
+            "Native MTP requires a llama-cpp-python build exposing "
+            "LlamaNativeSpeculativeDecoding plus Llama(load_mtp=...). "
+            "Use Auto/N-gram or install a compatible experimental native-MTP wheel."
+        )
+    import llama_cpp
+    try:
+        from llama_cpp import llama_speculative as specmod
+    except Exception:
+        specmod = None
+    cls = getattr(specmod, "LlamaNativeSpeculativeDecoding", None) if specmod is not None else None
+    if cls is None:
+        cls = getattr(llama_cpp, "LlamaNativeSpeculativeDecoding", None)
+    if cls is None:
+        raise RuntimeError("Installed llama-cpp-python does not expose LlamaNativeSpeculativeDecoding.")
+
+    # The currently supported in-process internal-MTP bridge requires full target
+    # GPU offload. Enforce it instead of silently falling back to CPU layers.
+    if int(gpu_layers) >= 0:
+        raise RuntimeError(
+            "Native embedded MTP currently requires GPU layers = -1 (full GPU offload) "
+            "with the supported in-process bridge."
+        )
+
+    provider = "internal_qwen35" if family in {"qwen3.5", "qwen3.6", "qwen3.8"} else "internal"
+    known = {
+        "model_path": None,
+        "spec_type": "draft-mtp",
+        "n_gpu_layers": int(gpu_layers),
+        "n_max": int(n_max),
+        "n_min": 0,
+        "p_min": float(p_min),
+        "verbose": bool(verbose),
+    }
+    try:
+        sig = inspect.signature(cls)
+        params = sig.parameters
+    except Exception:
+        sig = None
+        params = {}
+
+    if params:
+        has_var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+        required_unknown = [
+            name for name, par in params.items()
+            if name not in {"self", "args", "kwargs"}
+            and name not in known
+            and par.default is inspect.Parameter.empty
+            and par.kind not in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}
+        ]
+        if required_unknown:
+            raise RuntimeError(
+                "Installed LlamaNativeSpeculativeDecoding has an unsupported constructor signature; "
+                f"unrecognized required parameter(s): {', '.join(required_unknown)}. "
+                f"Signature: {support.get('native_bridge_signature')}"
+            )
+        # Preserve model_path=None intentionally. For internal MTP it means the
+        # target GGUF supplies the embedded NextN layers.
+        kwargs = {k: v for k, v in known.items() if has_var_kw or k in params}
+    else:
+        kwargs = dict(known)
+
+    try:
+        obj = cls(**kwargs)
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to initialize the installed native MTP bridge. "
+            f"Bridge signature: {support.get('native_bridge_signature')}; error: {e}"
+        ) from e
+
+    # Experimental wheels that expose these flags give us a cheap sanity check
+    # that we really constructed the requested embedded-MTP provider.
+    if getattr(obj, "is_mtp", None) is False or getattr(obj, "is_internal_mtp", None) is False:
+        _close_speculative_object(obj)
+        raise RuntimeError(
+            "The installed native speculative decoder did not initialize as internal MTP. "
+            "Use Auto/N-gram or install a compatible native-MTP wheel."
+        )
+
+    return obj, {
+        "implementation": "native-mtp",
+        "provider": provider,
+        "model_path": None,
+        "n_gpu_layers": int(gpu_layers),
+        "n_max": int(n_max),
+        "n_min": 0,
+        "p_min": float(p_min),
+        "settings": {
+            "n_max": int(n_max),
+            "n_min": 0,
+            "p_min": float(p_min),
+            "n_gpu_layers": int(gpu_layers),
+        },
+        "bridge_signature": support.get("native_bridge_signature"),
+    }
+
+
+def _materialize_speculative_kwargs(base_load_kwargs, speculative_config, model_path, family, gpu_layers=-1, verbose=False):
+    """Create per-load draft resources from a stable speculative configuration."""
+    load_kwargs = dict(base_load_kwargs)
+    draft = None
+    info = copy.deepcopy(speculative_config or {})
+    effective = str(info.get("effective") or "Off")
+    if effective == "N-gram":
+        draft, built = _build_ngram_draft(
+            ngram_size=info.get("ngram_size", 3),
+            num_pred_tokens=info.get("ngram_pred_tokens", 10),
+            mode=info.get("ngram_mode", "k"),
+            min_hits=info.get("ngram_min_hits", 2),
+            max_entries_per_key=info.get("ngram_max_entries_per_key", 8),
+            sync_check_tokens=info.get("ngram_sync_check_tokens", 16),
+        )
+        load_kwargs["draft_model"] = draft
+        info.update(built)
+    elif effective == "MTP":
+        draft, built = _build_native_mtp_draft(
+            model_path=model_path,
+            family=family,
+            gpu_layers=gpu_layers,
+            n_max=info.get("mtp_draft_tokens", 2),
+            p_min=info.get("mtp_p_min", 0.5),
+            verbose=verbose,
+        )
+        load_kwargs["draft_model"] = draft
+        load_kwargs["load_mtp"] = True
+        info.update(built)
+    return load_kwargs, draft, info
+
+
+def _reset_speculative_for_request(llm, speculative_config):
+    """Clear Python n-gram history between unrelated requests without reloading."""
+    if str((speculative_config or {}).get("effective") or "Off") != "N-gram":
+        return
+    for attr in ("draft_model", "_draft_model"):
+        obj = getattr(llm, attr, None)
+        clear = getattr(obj, "clear", None)
+        if callable(clear):
+            try:
+                clear()
+                return
+            except Exception:
+                return
+
+
+def _speculative_stats_snapshot(llm):
+    """Best-effort public-ish statistics snapshot; never depend on one fork ABI."""
+    for attr in ("draft_model", "_draft_model"):
+        obj = getattr(llm, attr, None)
+        if obj is None:
+            continue
+        for name in ("get_stats", "stats", "statistics", "get_statistics"):
+            value = getattr(obj, name, None)
+            try:
+                value = value() if callable(value) else value
+            except Exception:
+                continue
+            if isinstance(value, dict):
+                return copy.deepcopy(value)
+    return {}
+
+
+def _speculative_stats_delta(before, after):
+    """Return numeric per-request draft statistics and a best-effort acceptance rate."""
+    before = before or {}
+    after = after or {}
+    delta = {}
+    for key, value in after.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        prev = before.get(key, 0)
+        if isinstance(prev, bool) or not isinstance(prev, (int, float)):
+            prev = 0
+        delta[key] = value - prev
+
+    def first(keys):
+        for key in keys:
+            value = delta.get(key)
+            if isinstance(value, (int, float)):
+                return float(value)
+        return None
+
+    drafted = first(("drafted_tokens", "tokens_drafted", "n_drafted", "draft_tokens", "proposed_tokens", "num_drafted"))
+    accepted = first(("accepted_tokens", "tokens_accepted", "n_accepted", "accept_tokens", "num_accepted"))
+    if drafted is not None:
+        delta["drafted_tokens_normalized"] = int(max(0, drafted))
+    if accepted is not None:
+        delta["accepted_tokens_normalized"] = int(max(0, accepted))
+    if drafted is not None and drafted > 0 and accepted is not None:
+        delta["acceptance_rate"] = max(0.0, min(1.0, accepted / drafted))
+    return delta
+
+
 def _kv_scalar_bytes(kind):
     # GGML block-format effective payload sizes. These are planning estimates,
     # not exact allocator sizes; actual native VRAM replaces the estimate after load.
@@ -1248,13 +1766,62 @@ def _estimate_kv_vram(metadata, n_ctx, type_k, type_v, location):
     return int(n_ctx * blocks * (k_dim * _kv_scalar_bytes(type_k) + v_dim * _kv_scalar_bytes(type_v)))
 
 
-def _estimate_native_vram(model_path, mmproj_path, metadata, gpu_layers, n_ctx, kv_k, kv_v, kv_location):
-    """Conservative first-load estimate for ComfyUI pressure planning."""
+_HYBRID_MTMD_BATCH_SAFE_FAMILIES = {"qwen3.5", "qwen3.6", "qwen3.8"}
+
+
+def _effective_decode_batch_sizes(family, mmproj_path, n_batch, n_ubatch):
+    """Resolve safe llama.cpp logical/physical batch sizes for a request.
+
+    Normal llama.cpp text inference supports n_batch > n_ubatch: the backend
+    splits a logical prompt batch into physical micro-batches.  Current MTMD
+    handlers for hybrid Qwen architectures can instead feed a complete text
+    chunk through Llama.eval() before a media chunk.  Some recent llama.cpp /
+    llama-cpp-python combinations reject that decode when the logical chunk is
+    larger than the physical recurrent-state batch capacity.
+
+    Keep the user's tuned text settings intact, but cap the *effective* logical
+    batch to n_ubatch only while one of the affected hybrid models is actually
+    using an mmproj.  This prevents Fatal Decode Error / Invalid input batch at
+    position 0 without degrading ordinary text-only prompt processing.
+    """
     try:
-        model_bytes = os.path.getsize(model_path)
+        nb = max(1, int(n_batch or 1))
+    except Exception:
+        nb = 2048
+    try:
+        ub = max(1, int(n_ubatch or 1))
+    except Exception:
+        ub = 512
+    adjusted = False
+    reason = None
+    if mmproj_path and str(family or "").lower() in _HYBRID_MTMD_BATCH_SAFE_FAMILIES and nb > ub:
+        original = nb
+        nb = ub
+        adjusted = True
+        reason = (
+            f"hybrid MTMD decode safety: effective n_batch capped from {original} to n_ubatch {ub}"
+        )
+    return nb, ub, adjusted, reason
+
+
+def _estimate_native_vram_components(model_path, mmproj_path, metadata, gpu_layers, n_ctx,
+                                     kv_k, kv_v, kv_location, n_batch=2048, n_ubatch=512,
+                                     flash_attention=True, speculative_mode="Off"):
+
+    """Return a conservative, explainable native llama.cpp VRAM estimate.
+
+    The estimate is intentionally simple enough to remain stable across llama.cpp
+    releases.  Weight and mmproj estimates use backing-file size, KV is derived
+    from GGUF architecture metadata, and compute/batch memory is a conservative
+    allowance calibrated around the existing first-load estimator.  The same
+    function feeds both the UI estimator and Auto-Yield first-load planning so
+    they cannot silently drift apart.
+    """
+    try:
+        model_bytes = int(os.path.getsize(model_path))
     except Exception:
         model_bytes = 0
-    blocks = _meta_suffix_value(metadata, ".block_count")
+    blocks = int(_meta_suffix_value(metadata, ".block_count") or 0)
     if int(gpu_layers) == 0:
         weight_gpu = 0
     elif int(gpu_layers) < 0:
@@ -1264,17 +1831,90 @@ def _estimate_native_vram(model_path, mmproj_path, metadata, gpu_layers, n_ctx, 
     else:
         # No architecture metadata: do not under-reserve an explicitly GPU-loaded model.
         weight_gpu = model_bytes
-    kv_gpu = _estimate_kv_vram(metadata, int(n_ctx), kv_k, kv_v, kv_location)
+
+    kv_gpu = int(_estimate_kv_vram(metadata, int(n_ctx), kv_k, kv_v, kv_location))
     vision_gpu = 0
     if mmproj_path:
         try:
-            vision_gpu = os.path.getsize(mmproj_path)
+            vision_file = int(os.path.getsize(mmproj_path))
+            # Projectors also create native/compute state beyond the raw GGUF
+            # tensors. Keep a modest separate allowance rather than hiding it in
+            # the base text-model overhead.
+            vision_gpu = int(vision_file + 128 * _MIB + min(384 * _MIB, vision_file * 0.05))
         except Exception:
-            pass
-    core = weight_gpu + kv_gpu + vision_gpu
-    overhead = (384 * _MIB) if core else 0
-    overhead += int(min(1536 * _MIB, core * 0.04)) if core else 0
-    return max(0, int(core + overhead))
+            vision_gpu = 0
+
+    # Keep the previous fixed/proportional safety allowance, but make the batch
+    # component visible and mildly responsive to n_batch/n_ubatch.  n_ubatch is
+    # the physical batch and therefore dominates temporary activation storage;
+    # n_batch contributes only a small logical-batch bookkeeping allowance.
+    base_core = int(weight_gpu + kv_gpu)
+    fixed_overhead = (384 * _MIB) if base_core else 0
+    proportional_overhead = int(min(1536 * _MIB, base_core * 0.04)) if base_core else 0
+    emb = int(_meta_suffix_value(metadata, ".embedding_length") or 0)
+    try:
+        nb = max(1, int(n_batch or 1))
+    except Exception:
+        nb = 2048
+    try:
+        ub = max(1, int(n_ubatch or 1))
+    except Exception:
+        ub = 512
+    ub = min(nb, ub)
+    activation_bytes = 0
+    logical_batch_bytes = 0
+    if emb > 0 and int(gpu_layers) != 0:
+        # This is an allowance, not a claim about llama.cpp's exact graph layout.
+        # Flash Attention generally reduces transient attention storage, so use a
+        # slightly smaller activation multiplier when enabled.
+        scalar = 2 if bool(flash_attention) else 4
+        multiplier = 10 if bool(flash_attention) else 12
+        activation_bytes = int(min(1024 * _MIB, ub * emb * scalar * multiplier))
+        logical_batch_bytes = int(min(256 * _MIB, nb * emb * 2))
+    compute_batch = int(fixed_overhead + proportional_overhead + activation_bytes + logical_batch_bytes)
+
+    # N-gram drafting is Python/CPU-side and adds negligible GPU memory. Native
+    # embedded MTP uses the target GGUF's NextN tensors (already included in the
+    # model file/weight estimate) but creates an additional draft context and
+    # transient buffers. Reserve a modest explicit runtime allowance until a
+    # verified load gives us the real driver-visible allocation.
+    spec_mode = str(speculative_mode or "Off")
+    speculative_gpu = 0
+    if spec_mode == "MTP" and int(gpu_layers) != 0:
+        speculative_gpu = int(256 * _MIB + min(512 * _MIB, kv_gpu * 0.10))
+
+    base_total = int(max(0, weight_gpu + kv_gpu + compute_batch + speculative_gpu))
+    total_with_vision = int(max(0, base_total + vision_gpu))
+    return {
+        "model_file_bytes": int(model_bytes),
+        "weights_bytes": int(weight_gpu),
+        "kv_cache_bytes": int(kv_gpu),
+        "compute_batch_bytes": int(compute_batch),
+        "speculative_bytes": int(speculative_gpu),
+        "speculative_mode": spec_mode,
+        "vision_bytes": int(vision_gpu),
+        "base_total_bytes": int(base_total),
+        "total_bytes": int(total_with_vision),
+        "gpu_layers": int(gpu_layers),
+        "block_count": int(blocks),
+        "context_size": int(n_ctx),
+        "n_batch": int(nb),
+        "n_ubatch": int(ub),
+        "flash_attention": bool(flash_attention),
+        "estimate_kind": "conservative-first-load",
+    }
+
+
+def _estimate_native_vram(model_path, mmproj_path, metadata, gpu_layers, n_ctx, kv_k, kv_v,
+                          kv_location, n_batch=2048, n_ubatch=512, flash_attention=True,
+                          speculative_mode="Off"):
+
+    """Conservative first-load estimate for ComfyUI pressure planning."""
+    return int(_estimate_native_vram_components(
+        model_path, mmproj_path, metadata, gpu_layers, n_ctx, kv_k, kv_v, kv_location,
+        n_batch=n_batch, n_ubatch=n_ubatch, flash_attention=flash_attention,
+        speculative_mode=speculative_mode,
+    )["total_bytes"])
 
 
 class _NativeLLMResident:
@@ -1287,7 +1927,8 @@ class _NativeLLMResident:
     check and free_memory yield hook.
     """
     def __init__(self, llama_cpp, Llama, load_key, load_kwargs, metadata, family,
-                 estimated_vram, model_file_size, main_gpu_index, gpu_layers):
+                 estimated_vram, model_file_size, main_gpu_index, gpu_layers,
+                 speculative_config=None, model_path=None, verbose=False):
         import torch
         self._llama_cpp = llama_cpp
         self._Llama = Llama
@@ -1296,6 +1937,9 @@ class _NativeLLMResident:
         self._load_kwargs = dict(load_kwargs)
         self._metadata = metadata
         self._family = family
+        self._speculative_config = copy.deepcopy(speculative_config or {"effective": "Off"})
+        self._model_path = str(model_path or load_kwargs.get("model_path") or "")
+        self._verbose = bool(verbose)
         self._estimated_vram = int(max(0, estimated_vram))
         self._model_file_size = int(max(0, model_file_size))
         gpu_expected = int(gpu_layers) != 0 or bool(load_kwargs.get("offload_kqv", False))
@@ -1361,26 +2005,35 @@ class _NativeLLMResident:
                 reload_count=self._reload_count,
                 estimated_mib=self._estimated_vram / _MIB,
             )
-            if self._verified_once:
-                self._reload_count += 1
-                llm, diag = _load_llama_fast(
-                    self._Llama,
-                    self._load_kwargs,
-                    prior_diagnostics=self._diagnostics,
-                    reload_count=self._reload_count,
-                )
-                path = "direct-fast-reload"
-            else:
-                llm, diag = _load_llama_verified(
-                    self._llama_cpp, self._Llama, self._load_kwargs, self._gpu_layers
-                )
-                self._verified_once = True
-                path = "verified-first-load"
+            runtime_kwargs, draft_obj, speculative_info = _materialize_speculative_kwargs(
+                self._load_kwargs, self._speculative_config, self._model_path, self._family,
+                gpu_layers=self._gpu_layers, verbose=self._verbose
+            )
+            try:
+                if self._verified_once:
+                    self._reload_count += 1
+                    llm, diag = _load_llama_fast(
+                        self._Llama,
+                        runtime_kwargs,
+                        prior_diagnostics=self._diagnostics,
+                        reload_count=self._reload_count,
+                    )
+                    path = "direct-fast-reload"
+                else:
+                    llm, diag = _load_llama_verified(
+                        self._llama_cpp, self._Llama, runtime_kwargs, self._gpu_layers
+                    )
+                    self._verified_once = True
+                    path = "verified-first-load"
+            except Exception:
+                _close_speculative_object(draft_obj)
+                raise
             self._llm = llm
             self._base_chat_handler = getattr(llm, "chat_handler", None)
             diag = dict(diag or {})
             diag["load_path"] = path
             diag["signature_id"] = self.signature_id
+            diag["speculative"] = copy.deepcopy(speculative_info)
             diag["native_residency_policy"] = "all-or-nothing"
             diag["comfyui_loaded_model_registration"] = False
             self._diagnostics = diag
@@ -1641,7 +2294,10 @@ def _image_to_data_uris(image, max_images=4, max_edge=1536):
     arr = _tensor_batch(image)
     if arr is None:
         return []
-    count = min(len(arr), max(1, int(max_images)))
+    limit = int(max_images)
+    if limit <= 0:
+        return []
+    count = min(len(arr), limit)
     return _encode_image_samples(arr, range(count), max_edge)
 
 
@@ -1651,7 +2307,10 @@ def _video_frames_to_data_uris(video_frames, max_frames=24, max_edge=1536):
     if arr is None or len(arr) == 0:
         return []
     n = len(arr)
-    take = min(n, max(1, int(max_frames)))
+    limit = int(max_frames)
+    if limit <= 0:
+        return []
+    take = min(n, limit)
     if take == 1:
         indices = [0]
     else:
@@ -1925,6 +2584,104 @@ _REASONING_BLOCK_TYPES = {
     "reasoning", "thinking", "analysis", "thought", "reasoning_text",
     "thinking_text", "analysis_text", "summary_text",
 }
+
+_REASONING_OPEN_RE = re.compile(r"<(?:think|thinking|reasoning|analysis)(?:\s[^>]*)?>", flags=re.I)
+_REASONING_CLOSE_RE = re.compile(r"</(?:think|thinking|reasoning|analysis)\s*>", flags=re.I)
+_REASONING_STREAM_TAIL = 48
+
+
+def _prefilled_reasoning_expected(family, thinking_mode):
+    """Whether a chat template is expected to prefill the opening reasoning tag.
+
+    Qwen thinking templates commonly place ``<think>`` in the assistant prefix, so
+    llama.cpp starts generated text *inside* the reasoning block and the generated
+    stream only contains the closing ``</think>`` delimiter.  When thinking is
+    explicitly disabled we must never infer this state.
+    """
+    fam = str(family or "").strip().lower()
+    mode = str(thinking_mode or "").strip().lower()
+    if mode != "enabled":
+        return False
+    return fam in {"qwen3", "qwen3-vl", "qwen3.5", "qwen3.6", "qwen3.8"}
+
+
+class _ReasoningStreamSplitter:
+    """Incrementally separate inline reasoning markup from visible content.
+
+    The splitter deliberately consumes reasoning delimiters instead of forwarding
+    them.  For Qwen-style prefilled thinking, ``assume_reasoning=True`` means the
+    stream begins inside a reasoning block even when no opening tag is generated.
+    A small tail is retained between chunks so split XML delimiters are recognized.
+    """
+
+    def __init__(self, assume_reasoning=False):
+        self.in_reasoning = bool(assume_reasoning)
+        self.pending = ""
+
+    def force_content(self):
+        """Switch to structured-reasoning mode where content is already final."""
+        events = []
+        if self.pending:
+            events.append(("reasoning" if self.in_reasoning else "content", self.pending))
+            self.pending = ""
+        self.in_reasoning = False
+        return events
+
+    def feed(self, text):
+        if text in (None, ""):
+            return []
+        self.pending += str(text)
+        events = []
+
+        while self.pending:
+            if self.in_reasoning:
+                # An explicit opener may still be emitted by some templates; eat it.
+                opener = _REASONING_OPEN_RE.match(self.pending)
+                if opener:
+                    self.pending = self.pending[opener.end():]
+                    continue
+
+                closer = _REASONING_CLOSE_RE.search(self.pending)
+                if closer:
+                    before = self.pending[:closer.start()]
+                    if before:
+                        events.append(("reasoning", before))
+                    self.pending = self.pending[closer.end():]
+                    self.in_reasoning = False
+                    continue
+
+                safe = len(self.pending) - _REASONING_STREAM_TAIL
+                if safe > 0:
+                    events.append(("reasoning", self.pending[:safe]))
+                    self.pending = self.pending[safe:]
+                break
+
+            opener = _REASONING_OPEN_RE.search(self.pending)
+            if opener:
+                before = self.pending[:opener.start()]
+                if before:
+                    events.append(("content", before))
+                self.pending = self.pending[opener.end():]
+                self.in_reasoning = True
+                continue
+
+            # In ordinary content mode retain only enough suffix to recognize an
+            # opening tag split across SSE/token chunks.
+            safe = len(self.pending) - _REASONING_STREAM_TAIL
+            if safe > 0:
+                events.append(("content", self.pending[:safe]))
+                self.pending = self.pending[safe:]
+            break
+
+        return events
+
+    def flush(self):
+        if not self.pending:
+            return []
+        event_type = "reasoning" if self.in_reasoning else "content"
+        text = self.pending
+        self.pending = ""
+        return [(event_type, text)] if text else []
 
 
 def _as_mapping(value):
@@ -2427,6 +3184,16 @@ class LocalGGUFLLM:
                 "memory_batch_size": ("INT", {"default": 512, "min": 1, "max": 32768}),
                 "use_mmap": ("BOOLEAN", {"default": True}),
                 "use_mlock": ("BOOLEAN", {"default": False}),
+                "prompt_cache_mode": (["Auto", "Off"], {"default": "Auto", "tooltip": "Reuse an exact token prefix already present in the resident llama.cpp KV context. Adds no separate RAM cache. Suspend, Stop/Unload, model reload, and vision requests clear or bypass this resident prefix state."}),
+                "speculative_mode": (["Off", "Auto", "N-gram", "MTP"], {"default": "Off", "tooltip": "Lossless speculative decoding. Auto prefers embedded native MTP when both the model and installed binding support it, otherwise falls back to N-gram."}),
+                "ngram_pred_tokens": ("INT", {"default": 10, "min": 1, "max": 64, "tooltip": "Maximum N-gram draft tokens proposed per verification step."}),
+                "ngram_size": ("INT", {"default": 3, "min": 1, "max": 16, "tooltip": "N-gram lookup key length. 3 is a good general starting point."}),
+                "ngram_mode": (["k", "k4v"], {"default": "k", "tooltip": "k uses less RAM; k4v caches continuations for cheaper lookup and can use more RAM."}),
+                "ngram_min_hits": ("INT", {"default": 2, "min": 1, "max": 16, "tooltip": "Historical matches required before an N-gram draft is proposed."}),
+                "ngram_max_entries_per_key": ("INT", {"default": 8, "min": 0, "max": 1024, "tooltip": "RAM cap per key for supported N-gram map implementations. 0 means unlimited/default."}),
+                "ngram_sync_check_tokens": ("INT", {"default": 16, "min": 1, "max": 256, "tooltip": "Trailing tokens used by supported N-gram map implementations to verify incremental history."}),
+                "mtp_draft_tokens": ("INT", {"default": 2, "min": 1, "max": 8, "tooltip": "Maximum native MTP draft depth. 2 is a conservative starting point; higher is not always faster."}),
+                "mtp_p_min": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Minimum MTP draft probability. Higher values stop uncertain drafts earlier and can improve net throughput."}),
                 "model_retention": (["Persistent (Driver Managed)", "ComfyUI Managed", "Unload After Run"], {"default": "Persistent (Driver Managed)", "tooltip": "Persistent keeps llama.cpp resident until settings change or explicit unload. ComfyUI Managed/Auto Yield also keeps a native all-or-nothing context, but closes it first when ComfyUI needs VRAM and reloads directly from the cached signature on the next request. Unload After Run closes after every generation."}),
 
                 # Prompting
@@ -2521,7 +3288,9 @@ class LocalGGUFLLM:
                  presence_penalty, frequency_penalty, max_tokens, seed,
                  memory_preset, context_size, kv_cache_k, kv_cache_v, kv_cache_location,
                  gpu_layers, flash_attention, prompt_batch_size, memory_batch_size,
-                 use_mmap, use_mlock, model_retention,
+                 use_mmap, use_mlock, prompt_cache_mode, speculative_mode, ngram_pred_tokens, ngram_size,
+                 ngram_mode, ngram_min_hits, ngram_max_entries_per_key, ngram_sync_check_tokens,
+                 mtp_draft_tokens, mtp_p_min, model_retention,
                  system_prompt, prompt,
                  split_mode, main_gpu, tensor_split, threads, threads_batch, last_n_tokens,
                  tfs_z, mirostat_mode, mirostat_tau, mirostat_eta, penalize_newline,
@@ -2631,6 +3400,62 @@ class LocalGGUFLLM:
             mmproj_check = None
         mmproj_path = selected_mmproj_path if vision_active else None
 
+        speculative_runtime = _speculative_runtime_support()
+        runtime_caps = copy.deepcopy(caps)
+        runtime_caps["mtp"] = bool(_mtp_layer_count(metadata) > 0)
+        runtime_caps["mtp_layers"] = int(_mtp_layer_count(metadata))
+        _implemented_caps = copy.deepcopy(runtime_caps.get("implemented") or {})
+        _implemented_caps["mtp"] = bool(runtime_caps["mtp"] and speculative_runtime.get("mtp"))
+        _implemented_caps["ngram_speculative"] = bool(speculative_runtime.get("ngram"))
+        runtime_caps["implemented"] = _implemented_caps
+        speculative_config = _resolve_speculative_mode(speculative_mode, metadata, speculative_runtime)
+        speculative_config.update({
+            "ngram_pred_tokens": int(ngram_pred_tokens),
+            "ngram_size": int(ngram_size),
+            "ngram_mode": str(ngram_mode),
+            "ngram_min_hits": int(ngram_min_hits),
+            "ngram_max_entries_per_key": int(ngram_max_entries_per_key),
+            "ngram_sync_check_tokens": int(ngram_sync_check_tokens),
+            "mtp_draft_tokens": int(mtp_draft_tokens),
+            "mtp_p_min": float(mtp_p_min),
+        })
+        requested_spec = str(speculative_config.get("requested") or "Off")
+        if requested_spec in {"N-gram", "MTP"} and speculative_config.get("effective") == "Off":
+            raise RuntimeError(str(speculative_config.get("reason") or f"{requested_spec} speculative decoding is unavailable."))
+        # The experimental in-process MTP bridge currently supports text-only
+        # requests. Auto may gracefully fall back to N-gram; explicit MTP fails
+        # rather than silently ignoring media.
+        if speculative_config.get("effective") == "MTP" and vision_active:
+            if requested_spec == "Auto" and speculative_runtime.get("ngram"):
+                speculative_config["effective"] = "N-gram"
+                speculative_config["reason"] = "Native MTP is text-only in the installed bridge; Auto fell back to N-gram for this vision request."
+            else:
+                raise RuntimeError("Native MTP speculative decoding is currently limited to text-only requests in the supported in-process bridge.")
+
+        # Current in-process native-MTP bridge constraints. Auto is deliberately
+        # forgiving and falls back to N-gram; an explicit MTP selection fails so
+        # the user never thinks MTP is active when it is not.
+        if speculative_config.get("effective") == "MTP" and int(gpu_layers) >= 0:
+            if requested_spec == "Auto" and speculative_runtime.get("ngram"):
+                speculative_config["effective"] = "N-gram"
+                speculative_config["reason"] = "Native MTP requires full GPU offload (GPU layers = -1); Auto fell back to N-gram."
+            else:
+                raise RuntimeError("Native MTP speculative decoding requires GPU layers = -1 (full GPU offload) with the supported bridge.")
+        if speculative_config.get("effective") == "MTP" and int(context_size) < int(mtp_draft_tokens) + 1:
+            if requested_spec == "Auto" and speculative_runtime.get("ngram"):
+                speculative_config["effective"] = "N-gram"
+                speculative_config["reason"] = "Context size is too small for the configured MTP draft block; Auto fell back to N-gram."
+            else:
+                raise RuntimeError("Context size must be at least MTP draft tokens + 1 for native MTP speculative decoding.")
+
+        effective_prompt_batch_size, effective_memory_batch_size, batch_safety_adjusted, batch_safety_reason = \
+            _effective_decode_batch_sizes(family, mmproj_path, prompt_batch_size, memory_batch_size)
+        if batch_safety_adjusted:
+            _LOGGER.warning(
+                "[Local GGUF LLM] %s (configured n_batch=%s, n_ubatch=%s, family=%s).",
+                batch_safety_reason, prompt_batch_size, memory_batch_size, family,
+            )
+
         chat_fmt = None
         if chat_format == "Custom":
             chat_fmt = custom_chat_format.strip() or None
@@ -2646,6 +3471,10 @@ class LocalGGUFLLM:
 
         template_kwargs = _thinking_template_kwargs(family, thinking_mode, preserve_thinking, reasoning_effort)
         llama_init_params, llama_init_var_kw = _signature_info(Llama.__init__)
+        if speculative_config.get("effective") in {"N-gram", "MTP"}:
+            _require_init_option(llama_init_params, llama_init_var_kw, "draft_model", "speculative decoding")
+        if speculative_config.get("effective") == "MTP":
+            _require_init_option(llama_init_params, False, "load_mtp", "native embedded MTP")
 
         # Memory controls must never silently degrade. If a user selected a
         # quantized KV type or CPU KV cache, verify the installed Python binding
@@ -2666,8 +3495,8 @@ class LocalGGUFLLM:
             use_mmap=use_mmap,
             use_mlock=use_mlock,
             n_ctx=context_size,
-            n_batch=prompt_batch_size,
-            n_ubatch=memory_batch_size,
+            n_batch=effective_prompt_batch_size,
+            n_ubatch=effective_memory_batch_size,
             n_threads=(None if threads == 0 else threads),
             n_threads_batch=(None if threads_batch == 0 else threads_batch),
             offload_kqv=(kv_cache_location == "GPU"),
@@ -2748,6 +3577,21 @@ class LocalGGUFLLM:
             resolved_vision or "",
             tuple(sorted(template_kwargs.items())),
         ) if mmproj_path else ("text_behavior",)
+        speculative_key = (
+            "speculative",
+            str(speculative_config.get("effective") or "Off"),
+            int(speculative_config.get("ngram_pred_tokens") or 10),
+            int(speculative_config.get("ngram_size") or 3),
+            str(speculative_config.get("ngram_mode") or "k"),
+            int(speculative_config.get("ngram_min_hits") or 2),
+            int(speculative_config.get("ngram_max_entries_per_key") or 0),
+            int(speculative_config.get("ngram_sync_check_tokens") or 16),
+            int(speculative_config.get("mtp_draft_tokens") or 2),
+            float(speculative_config.get("mtp_p_min") or 0.0),
+            int(speculative_config.get("mtp_layers") or 0),
+            str((speculative_config.get("runtime") or {}).get("ngram_implementation") or ""),
+            bool((speculative_config.get("runtime") or {}).get("mtp")),
+        )
         def allocation_file_state(path):
             if not path:
                 return None
@@ -2767,6 +3611,7 @@ class LocalGGUFLLM:
             ("vision_file_state", allocation_file_state(mmproj_path)),
             ("custom_chat_format", custom_chat_format if chat_format == "Custom" else ""),
             vision_behavior_key,
+            speculative_key,
         )
 
         # Legacy retention labels all map to the persistent native-context mode.
@@ -2799,6 +3644,10 @@ class LocalGGUFLLM:
         estimated_vram = _estimate_native_vram(
             model_path, mmproj_path, metadata, gpu_layers, context_size,
             kv_cache_k, kv_cache_v, kv_cache_location,
+            n_batch=effective_prompt_batch_size,
+            n_ubatch=effective_memory_batch_size,
+            flash_attention=flash_attention,
+            speculative_mode=str(speculative_config.get("effective") or "Off"),
         )
 
         # A change in allocation settings OR management mode invalidates the old
@@ -2857,6 +3706,9 @@ class LocalGGUFLLM:
                         model_file_size=model_file_size,
                         main_gpu_index=main_gpu_index,
                         gpu_layers=gpu_layers,
+                        speculative_config=speculative_config,
+                        model_path=model_path,
+                        verbose=verbose,
                     )
                     _MODEL_CACHE.update({
                         "key": load_key,
@@ -3001,7 +3853,17 @@ class LocalGGUFLLM:
                         preload_memory["error"] = str(e)
                         _LOGGER.warning("[Local GGUF LLM] conditional pre-load ComfyUI memory release failed: %s", e)
 
-                llm, load_diagnostics = _load_llama_verified(llama_cpp, Llama, load_kwargs, gpu_layers)
+                runtime_load_kwargs, draft_obj, speculative_info = _materialize_speculative_kwargs(
+                    load_kwargs, speculative_config, model_path, family,
+                    gpu_layers=gpu_layers, verbose=verbose
+                )
+                try:
+                    llm, load_diagnostics = _load_llama_verified(llama_cpp, Llama, runtime_load_kwargs, gpu_layers)
+                except Exception:
+                    _close_speculative_object(draft_obj)
+                    raise
+                load_diagnostics = dict(load_diagnostics or {})
+                load_diagnostics["speculative"] = copy.deepcopy(speculative_info)
                 if model_retention == "Persistent (Driver Managed)":
                     load_diagnostics = dict(load_diagnostics or {})
                     load_diagnostics["preload_memory"] = preload_memory
@@ -3137,6 +3999,9 @@ class LocalGGUFLLM:
             except Exception:
                 pass
         started = time.perf_counter()
+        _reset_speculative_for_request(llm, speculative_config)
+        speculative_stats_before = _speculative_stats_snapshot(llm)
+        prompt_cache_prepared = None
         perf_before = _llama_perf_snapshot(llm)
         first_output_at = None
         last_output_at = None
@@ -3144,6 +4009,14 @@ class LocalGGUFLLM:
         # Keep the native context alive for the entire generation. Manual unloads
         # or concurrent ComfyUI eviction requests wait until llama.cpp returns.
         with _MODEL_LOCK:
+            # Prompt-cache state is deliberately scoped to this exact resident
+            # native allocation signature. It is never serialized across a yield.
+            prompt_cache_prepared = _prepare_resident_prompt_cache(
+                llm,
+                prompt_cache_mode,
+                vision_active=vision_active,
+                signature_id=_load_signature_id(load_key),
+            )
             # Some older chat handlers do not expose a per-call seed argument.
             # Set the sampler seed directly as a compatibility fallback as well as
             # passing it in completion_kwargs when supported.
@@ -3167,9 +4040,13 @@ class LocalGGUFLLM:
                 usage = {}
                 token_events = 0
                 emitted_any = False
+                reasoning_splitter = _ReasoningStreamSplitter(
+                    assume_reasoning=_prefilled_reasoning_expected(family, thinking_mode)
+                )
+                structured_reasoning_seen = False
 
                 def consume_stream(iterator):
-                    nonlocal usage, token_events, emitted_any, first_output_at, last_output_at, prompt_perf_at_first
+                    nonlocal usage, token_events, emitted_any, first_output_at, last_output_at, prompt_perf_at_first, structured_reasoning_seen
                     for chunk in iterator:
                         emitted_any = True
                         chunk_map = _as_mapping(chunk)
@@ -3198,16 +4075,25 @@ class LocalGGUFLLM:
                             or (delta.get("analysis") if delta else None)
                         )
                         event_has_text = False
-                        if content not in (None, ""):
-                            content_text = str(content)
-                            parts.append(content_text)
-                            event_has_text = True
-                            if token_callback is not None:
-                                try:
-                                    token_callback({"type": "content", "text": content_text})
-                                except Exception:
-                                    pass
+
+                        # Structured reasoning from llama.cpp is authoritative. Once
+                        # it appears, ordinary delta.content is final answer text and
+                        # must not be reclassified by the inline-tag compatibility
+                        # parser. This matches KoboldCpp/OpenAI-compatible behavior.
                         if reasoning_delta not in (None, ""):
+                            if not structured_reasoning_seen:
+                                structured_reasoning_seen = True
+                                for pending_type, pending_text in reasoning_splitter.force_content():
+                                    if not pending_text:
+                                        continue
+                                    if pending_type == "reasoning":
+                                        reasoning_parts.append(pending_text)
+                                    if token_callback is not None:
+                                        try:
+                                            token_callback({"type": pending_type, "text": pending_text})
+                                        except Exception:
+                                            pass
+                                    event_has_text = True
                             reasoning_text = str(reasoning_delta)
                             reasoning_parts.append(reasoning_text)
                             event_has_text = True
@@ -3216,6 +4102,24 @@ class LocalGGUFLLM:
                                     token_callback({"type": "reasoning", "text": reasoning_text})
                                 except Exception:
                                     pass
+
+                        if content not in (None, ""):
+                            content_text = str(content)
+                            parts.append(content_text)
+                            split_events = (
+                                [("content", content_text)]
+                                if structured_reasoning_seen
+                                else reasoning_splitter.feed(content_text)
+                            )
+                            for event_type, event_text in split_events:
+                                if not event_text:
+                                    continue
+                                event_has_text = True
+                                if token_callback is not None:
+                                    try:
+                                        token_callback({"type": event_type, "text": event_text})
+                                    except Exception:
+                                        pass
                         if event_has_text:
                             # The first streamed output marks the prompt->decode
                             # transition.  Throughput from this point forward must
@@ -3255,6 +4159,20 @@ class LocalGGUFLLM:
                                 })
                             except Exception:
                                 pass
+
+                    # Flush the retained delimiter-detection tail.  When Qwen's
+                    # template prefilled <think> and generation ended before a
+                    # closing tag, the remainder is still correctly reported as
+                    # reasoning rather than leaking into visible content.
+                    if not structured_reasoning_seen:
+                        for event_type, event_text in reasoning_splitter.flush():
+                            if not event_text:
+                                continue
+                            if token_callback is not None:
+                                try:
+                                    token_callback({"type": event_type, "text": event_text})
+                                except Exception:
+                                    pass
 
                 try:
                     streamed = llm.create_chat_completion(**stream_kwargs)
@@ -3305,6 +4223,8 @@ class LocalGGUFLLM:
 
         request_generation_seconds = time.perf_counter() - started
         perf_after = _perf_delta(_llama_perf_snapshot(llm), perf_before)
+        speculative_stats_after = _speculative_stats_snapshot(llm)
+        speculative_stats = _speculative_stats_delta(speculative_stats_before, speculative_stats_after)
         raw_response, structured_thinking, thinking_sources = _extract_response(result)
         stripped_response, inline_thinking, inline_modes = _split_reasoning_markup(raw_response)
 
@@ -3334,6 +4254,13 @@ class LocalGGUFLLM:
         prompt_eval_tokens = native_prompt_tokens or prompt_tokens
         prompt_eval_seconds = native_prompt_ms / 1000.0 if native_prompt_ms > 0 else 0.0
         prompt_tok_s = (prompt_eval_tokens / prompt_eval_seconds) if prompt_eval_tokens and prompt_eval_seconds > 0 else 0.0
+        prompt_cache = _resident_prompt_cache_metrics(
+            llm,
+            prompt_cache_prepared,
+            prompt_tokens=prompt_tokens,
+            native_prompt_tokens=native_prompt_tokens,
+            prompt_eval_seconds=prompt_eval_seconds,
+        )
 
         if native_eval_ms > 0 and native_eval_tokens > 0:
             decode_seconds = native_eval_ms / 1000.0
@@ -3397,8 +4324,23 @@ class LocalGGUFLLM:
                 "flash_attention": flash_attention,
                 "prompt_batch_size": prompt_batch_size,
                 "memory_batch_size": memory_batch_size,
+                "effective_prompt_batch_size": effective_prompt_batch_size,
+                "effective_memory_batch_size": effective_memory_batch_size,
+                "batch_safety_adjusted": batch_safety_adjusted,
+                "batch_safety_reason": batch_safety_reason,
                 "use_mmap": use_mmap,
                 "use_mlock": use_mlock,
+                "prompt_cache_mode": prompt_cache_mode,
+                "speculative_mode": speculative_mode,
+                "speculative_effective": speculative_config.get("effective"),
+                "ngram_pred_tokens": ngram_pred_tokens,
+                "ngram_size": ngram_size,
+                "ngram_mode": ngram_mode,
+                "ngram_min_hits": ngram_min_hits,
+                "ngram_max_entries_per_key": ngram_max_entries_per_key,
+                "ngram_sync_check_tokens": ngram_sync_check_tokens,
+                "mtp_draft_tokens": mtp_draft_tokens,
+                "mtp_p_min": mtp_p_min,
                 "model_retention": model_retention,
             },
             "prompting": {
@@ -3451,7 +4393,19 @@ class LocalGGUFLLM:
             "architecture": metadata.get("general.architecture", "unknown"),
             "model_preset": model_preset,
             "resolved_model_preset": model_preset_resolved,
-            "model_capabilities": capabilities_for_family(family),
+            "model_capabilities": runtime_caps,
+            "speculative": {
+                "requested": speculative_config.get("requested"),
+                "effective": speculative_config.get("effective"),
+                "reason": speculative_config.get("reason"),
+                "mtp_layers": speculative_config.get("mtp_layers", 0),
+                "mtp_model_capable": speculative_config.get("mtp_model_capable", False),
+                "runtime": copy.deepcopy(speculative_config.get("runtime") or {}),
+                "implementation": ((load_diagnostics or {}).get("speculative") or {}).get("implementation"),
+                "provider": ((load_diagnostics or {}).get("speculative") or {}).get("provider"),
+                "settings": copy.deepcopy(((load_diagnostics or {}).get("speculative") or {}).get("settings") or {}),
+                "stats": speculative_stats,
+            },
             "effective_model_settings": {
                 "thinking_mode": thinking_mode,
                 "reasoning_effort": reasoning_effort,
@@ -3503,6 +4457,7 @@ class LocalGGUFLLM:
             "prompt_tokens": prompt_tokens,
             "prompt_eval_tokens": prompt_eval_tokens,
             "prompt_tokens_per_second": round(prompt_tok_s, 2),
+            "prompt_cache": prompt_cache,
             "completion_tokens": completion_tokens,
             "total_tokens": total_tokens,
             "tokens_per_second": round(tok_s, 2),
@@ -3546,6 +4501,16 @@ class LocalGGUFLLM:
             "memory_batch_size": memory_batch_size,
             "use_mmap": use_mmap,
             "use_mlock": use_mlock,
+            "prompt_cache_mode": prompt_cache_mode,
+            "speculative_mode": speculative_mode,
+            "ngram_pred_tokens": ngram_pred_tokens,
+            "ngram_size": ngram_size,
+            "ngram_mode": ngram_mode,
+            "ngram_min_hits": ngram_min_hits,
+            "ngram_max_entries_per_key": ngram_max_entries_per_key,
+            "ngram_sync_check_tokens": ngram_sync_check_tokens,
+            "mtp_draft_tokens": mtp_draft_tokens,
+            "mtp_p_min": mtp_p_min,
             "model_retention": model_retention,
             "system_prompt": system_prompt,
             "prompt": prompt,
