@@ -111,7 +111,8 @@ PRESET_ROOT_DIR = Path(folder_paths.models_dir) / "LLM" / "local_LLM_presets"
 SAMPLER_PRESET_DIR = PRESET_ROOT_DIR / "sampler"
 SYSTEM_PROMPT_PRESET_DIR = PRESET_ROOT_DIR / "system_prompts"
 PROMPT_PRESET_DIR = PRESET_ROOT_DIR / "prompts"
-MEMORY_PRESET_DIR = PRESET_ROOT_DIR / "memory"
+MEMORY_PRESET_DIR = PRESET_ROOT_DIR / "memory"  # legacy v0.17 and earlier
+SETTINGS_PRESET_DIR = PRESET_ROOT_DIR / "settings"
 
 MEMORY_PRESET_FIELDS = (
     "context_size", "kv_cache_k", "kv_cache_v", "kv_cache_location", "gpu_layers",
@@ -122,6 +123,26 @@ MEMORY_PRESET_FIELDS = (
 )
 MEMORY_PRESET_SCHEMA = "local_llm_memory_preset"
 MEMORY_PRESET_VERSION = 1
+
+
+# Complete presets intentionally cover the LLM runtime itself, not server/admin
+# state such as API keys, startup behavior, logging, or UI preferences.  They
+# replace the old memory-only preset concept in the user interface.
+COMPLETE_SETTINGS_PRESET_FIELDS = (
+    "model", "vision_model", "model_preset", "thinking_mode", "reasoning_effort",
+    "preserve_thinking",
+    "temperature", "top_p", "top_k", "min_p", "repeat_penalty",
+    "presence_penalty", "frequency_penalty", "max_tokens",
+    "vision_max_images", "vision_max_frames", "vision_max_edge",
+    "context_size", "kv_cache_k", "kv_cache_v", "kv_cache_location", "gpu_layers",
+    "flash_attention", "prompt_batch_size", "memory_batch_size", "use_mmap", "use_mlock",
+    "prompt_cache_mode", "speculative_mode", "ngram_pred_tokens", "ngram_size",
+    "ngram_mode", "ngram_min_hits", "ngram_max_entries_per_key",
+    "ngram_sync_check_tokens", "mtp_draft_tokens", "mtp_p_min",
+    "split_mode", "main_gpu", "tensor_split", "vram_policy",
+)
+COMPLETE_SETTINGS_PRESET_SCHEMA = "local_llm_complete_settings_preset"
+COMPLETE_SETTINGS_PRESET_VERSION = 1
 
 
 _RESERVED_PRESET_NAMES = frozenset({"default", "custom", "server default"})
@@ -140,7 +161,7 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _ensure_preset_dirs():
-    for path in (PRESET_ROOT_DIR, SAMPLER_PRESET_DIR, SYSTEM_PROMPT_PRESET_DIR, PROMPT_PRESET_DIR, MEMORY_PRESET_DIR):
+    for path in (PRESET_ROOT_DIR, SAMPLER_PRESET_DIR, SYSTEM_PROMPT_PRESET_DIR, PROMPT_PRESET_DIR, MEMORY_PRESET_DIR, SETTINGS_PRESET_DIR):
         path.mkdir(parents=True, exist_ok=True)
 
 
@@ -370,6 +391,98 @@ def save_memory_preset(name: str, settings: dict[str, Any]) -> dict[str, Any]:
     return {"name": clean_name, "settings": copy.deepcopy(clean), "path": str(path)}
 
 
+def _validate_complete_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(settings, dict):
+        raise TypeError("complete settings preset must be an object")
+    int_fields = {
+        "top_k", "max_tokens", "vision_max_images", "vision_max_frames", "vision_max_edge",
+        "context_size", "gpu_layers", "prompt_batch_size", "memory_batch_size",
+        "ngram_pred_tokens", "ngram_size", "ngram_min_hits",
+        "ngram_max_entries_per_key", "ngram_sync_check_tokens", "mtp_draft_tokens",
+    }
+    float_fields = {
+        "temperature", "top_p", "min_p", "repeat_penalty",
+        "presence_penalty", "frequency_penalty", "mtp_p_min",
+    }
+    bool_fields = {"preserve_thinking", "flash_attention", "use_mmap", "use_mlock"}
+    out = {}
+    for key in COMPLETE_SETTINGS_PRESET_FIELDS:
+        if key not in settings:
+            continue
+        value = settings[key]
+        try:
+            if key in bool_fields:
+                value = bool(value)
+            elif key in int_fields:
+                value = int(value)
+            elif key in float_fields:
+                value = float(value)
+            else:
+                value = str(value)
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid value for complete preset field '{key}': {value!r}")
+        out[key] = value
+    if not out:
+        raise ValueError("complete settings preset contains no supported settings")
+    return out
+
+
+def complete_settings_presets() -> dict[str, dict[str, Any]]:
+    _ensure_preset_dirs()
+    found = {}
+    for path in sorted(SETTINGS_PRESET_DIR.glob("*.json"), key=lambda x: x.name.lower()):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
+            clean = _validate_complete_settings(data.get("settings", data))
+            name = str(data.get("name") or path.stem).strip() or path.stem
+            found[name] = {
+                "name": name, "settings": clean, "path": str(path),
+                "mtime_ns": int(path.stat().st_mtime_ns),
+            }
+        except Exception as e:
+            log.warning("[Local LLM Server] Ignoring invalid complete settings preset %s: %s", path, e)
+    return found
+
+
+def complete_settings_preset_names() -> list[str]:
+    return sorted(complete_settings_presets(), key=str.lower)
+
+
+def load_complete_settings_preset(name: str) -> dict[str, Any] | None:
+    item = complete_settings_presets().get(str(name))
+    return None if item is None else copy.deepcopy(item.get("settings") or {})
+
+
+def save_complete_settings_preset(name: str, settings: dict[str, Any]) -> dict[str, Any]:
+    clean_name = _safe_preset_name(name)
+    clean = _validate_complete_settings(settings)
+    path = SETTINGS_PRESET_DIR / (clean_name + ".json")
+    payload = {
+        "schema": COMPLETE_SETTINGS_PRESET_SCHEMA,
+        "schema_version": COMPLETE_SETTINGS_PRESET_VERSION,
+        "name": clean_name,
+        "settings": clean,
+    }
+    _atomic_write_json(path, payload)
+    return {"name": clean_name, "settings": copy.deepcopy(clean), "path": str(path)}
+
+
+def delete_complete_settings_preset(name: str) -> dict[str, Any]:
+    requested = str(name or "").strip()
+    if requested.lower() in _RESERVED_PRESET_NAMES:
+        raise ValueError(f"'{requested or 'Custom'}' is reserved and cannot be deleted")
+    item = complete_settings_presets().get(requested)
+    if item is None:
+        raise ValueError(f"Complete settings preset '{requested}' was not found")
+    path = Path(str(item.get("path") or ""))
+    if path.resolve().parent != SETTINGS_PRESET_DIR.resolve():
+        raise ValueError("Refusing to delete a preset outside the Local LLM settings preset directory")
+    path.unlink()
+    return {"name": requested, "path": str(path)}
+
+
 # Backward-compatible aliases for v0.8 internal names.  New code and files use
 # the sampler-specific terminology above.
 REQUEST_PRESET_FIELDS = SAMPLER_PRESET_FIELDS
@@ -510,6 +623,9 @@ def _default_config() -> dict[str, Any]:
     # resident it behaves like the persistent server, but ComfyUI can evict it
     # automatically through its normal VRAM pressure path.
     d["model_retention"] = "ComfyUI Managed"
+    # The service now stores concrete memory values; memory-only presets are a
+    # legacy workflow compatibility feature, not part of global configuration.
+    d["memory_preset"] = "Custom"
     d["system_prompt"] = "You are a helpful assistant."
     d["prompt"] = ""
     d.update({
@@ -556,6 +672,7 @@ def _load_config_file() -> dict[str, Any]:
     if config.get("vision_model") not in vision:
         config["vision_model"] = _NONE
     config["context_size"] = _normalize_context_size(config.get("context_size"), config.get("model"))
+    config["memory_preset"] = "Custom"
     if config.get("vram_policy") not in {"Auto Yield to ComfyUI", "Keep Resident"}:
         config["vram_policy"] = "Auto Yield to ComfyUI"
     config["model_retention"] = (
@@ -828,8 +945,17 @@ class LocalLLMServiceManager:
         samplers = sampler_presets()
         systems = text_presets("system_prompts")
         prompts = text_presets("prompts")
+        complete = complete_settings_presets()
+        builtins = public_presets()
         return {
             "root_directory": str(PRESET_ROOT_DIR),
+            "model_runtime_presets": copy.deepcopy(builtins.get("model") or {}),
+            "settings": {
+                "directory": str(SETTINGS_PRESET_DIR),
+                "names": ["Current Server", "Custom", *sorted(complete, key=str.lower)],
+                "deletable_names": sorted(complete, key=str.lower),
+                "presets": {name: copy.deepcopy(item["settings"]) for name, item in complete.items()},
+            },
             "sampler": {
                 "directory": str(SAMPLER_PRESET_DIR),
                 "default": self.request_generation_defaults(),
@@ -860,6 +986,10 @@ class LocalLLMServiceManager:
         with self._config_lock:
             before = copy.deepcopy(self._config)
             self._config.update(clean)
+            # Global service configuration uses concrete memory values.  Keep the
+            # old field pinned to Custom so LocalGGUFLLM cannot re-apply a legacy
+            # memory preset over user/preset values.
+            self._config["memory_preset"] = "Custom"
             self._config["context_size"] = _normalize_context_size(
                 self._config.get("context_size"), self._config.get("model")
             )
@@ -886,8 +1016,8 @@ class LocalLLMServiceManager:
         self.update_config({"api_key": key})
         return key
 
-    def _call_args(self):
-        cfg = self.get_config()
+    def _call_args(self, config=None):
+        cfg = self.get_config() if config is None else copy.deepcopy(config)
         args = _node_defaults()
         args.update({k: v for k, v in cfg.items() if k in args})
         args["model_retention"] = (
@@ -1149,13 +1279,36 @@ class LocalLLMServiceManager:
             # A READY service with an evicted/yielded model is reloaded on demand.
             self.start(wait_for_comfy=not workflow_owned)
 
-    def generate_messages(self, messages, image=None, video_frames=None, client="unknown", overrides=None, token_callback=None):
+    def generate_messages(self, messages, image=None, video_frames=None, client="unknown", overrides=None, token_callback=None, runtime_config=None):
         messages = _normalized_messages(messages)
         overrides = dict(overrides or {})
         # API/client request fields may not change persistent allocation settings.
+        # Workflow Settings nodes use the separate runtime_config channel below;
+        # those values are request-local and never mutate the modal/server config.
         forbidden = sorted(set(overrides) & LOAD_FIELDS)
         if forbidden:
             raise ValueError("Request cannot override server load/memory setting(s): " + ", ".join(forbidden))
+
+        persistent_cfg = self.get_config()
+        effective_cfg = copy.deepcopy(persistent_cfg)
+        runtime_clean = {}
+        if isinstance(runtime_config, dict) and runtime_config:
+            runtime_clean = _validate_complete_settings(runtime_config)
+            effective_cfg.update(copy.deepcopy(runtime_clean))
+            effective_cfg["memory_preset"] = "Custom"
+            effective_cfg["context_size"] = _normalize_context_size(
+                effective_cfg.get("context_size"), effective_cfg.get("model")
+            )
+            if effective_cfg.get("vram_policy") not in {"Auto Yield to ComfyUI", "Keep Resident"}:
+                effective_cfg["vram_policy"] = "Auto Yield to ComfyUI"
+            effective_cfg["model_retention"] = (
+                "ComfyUI Managed" if effective_cfg.get("vram_policy") == "Auto Yield to ComfyUI"
+                else "Persistent (Driver Managed)"
+            )
+        temporary_load_change = bool(runtime_clean) and any(
+            key in runtime_clean and persistent_cfg.get(key) != effective_cfg.get(key)
+            for key in LOAD_FIELDS
+        )
 
         with self._state_lock:
             self._queue_count += 1
@@ -1176,9 +1329,19 @@ class LocalLLMServiceManager:
                 if not workflow_owned:
                     comfy_wait_seconds = float(self._wait_for_comfy_idle("servicing the LLM request") or 0.0)
                 ensure_started_at = time.perf_counter()
-                self._ensure_started(workflow_owned=workflow_owned)
+                if temporary_load_change:
+                    # A Settings-node model/memory selection is temporary. Do not
+                    # rewrite/reload the authoritative modal configuration merely
+                    # to prepare this request. LocalGGUFLLM will switch native
+                    # residency by its normal load signature for this call only.
+                    with self._state_lock:
+                        request_state = self._state
+                    if request_state == STATE_STOPPED and persistent_cfg.get("startup_mode", "On Demand") == "Off":
+                        raise RuntimeError("Local LLM Server is stopped. Start it from the LLM sidebar panel.")
+                else:
+                    self._ensure_started(workflow_owned=workflow_owned)
                 ensure_started_seconds = time.perf_counter() - ensure_started_at
-                request_needs_reload = not self._resident_snapshot()
+                request_needs_reload = temporary_load_change or not self._resident_snapshot()
                 self._log(
                     "PERF request preflight: "
                     f"queue_wait={queue_wait_seconds:.3f}s • "
@@ -1201,15 +1364,15 @@ class LocalLLMServiceManager:
                     self._requests_total += 1
                 self._emit()
                 self._log(f"Processing request from {client}")
-                cfg = self.get_config()
+                cfg = effective_cfg
                 if cfg.get("log_prompt_content"):
                     self._log("Prompt content: " + self._safe_content_for_log(messages))
                 started = time.perf_counter()
-                # Re-enter the canonical node execution path with the CURRENT
-                # server configuration on every request. Persistent load settings
-                # still reuse the same native llama.cpp context, while edits to
-                # sampling/model presets take effect immediately without a reload.
-                args = self._call_args()
+                # Re-enter the canonical node execution path with the effective
+                # request configuration. Normally this is the authoritative modal
+                # configuration; a connected Settings node may supply a temporary
+                # workflow-only runtime overlay without persisting it.
+                args = self._call_args(cfg)
                 args["messages_override"] = messages
                 args.update(overrides)
                 cfg_model = str(cfg.get("model") or "")
@@ -2311,7 +2474,8 @@ SERVICE = LocalLLMServiceManager()
 
 def catalog():
     models, vision = _model_lists()
-    user_memory = memory_presets()
+    user_memory = memory_presets()  # legacy files remain readable for old workflows
+    complete = complete_settings_presets()
     preset_payload = public_presets()
     preset_payload["memory"].update({name: copy.deepcopy(item["settings"]) for name, item in user_memory.items()})
     return {
@@ -2321,6 +2485,12 @@ def catalog():
         "model_presets": ["Auto (Detected)", "Custom"] + list(MODEL_PRESETS.keys()),
         "memory_presets": ["Custom"] + list(MEMORY_PRESETS.keys()) + sorted(user_memory, key=str.lower),
         "memory_preset_files": {name: item.get("path") for name, item in user_memory.items()},
+        "settings_presets": {
+            "directory": str(SETTINGS_PRESET_DIR),
+            "names": ["Custom", *sorted(complete, key=str.lower)],
+            "deletable_names": sorted(complete, key=str.lower),
+            "presets": {name: copy.deepcopy(item["settings"]) for name, item in complete.items()},
+        },
         "context_sizes": list(CONTEXT_SIZE_STEPS),
         "request_presets": SERVICE.request_preset_catalog(),
         "node_presets": SERVICE.node_preset_catalog(),
@@ -2379,68 +2549,87 @@ def maybe_autostart():
 # ---------------------------------------------------------------------------
 
 class LocalLLMSettings:
-    """Reusable request-local sampler/vision/seed settings for Local LLM Generate."""
+    """Reusable complete Local LLM runtime settings for workflow generation.
+
+    Complete presets are load-only from the node.  Creation/deletion is owned by
+    the server Presets tab so workflows cannot accidentally mutate the shared
+    preset library.
+    """
+
+    EXPOSED_FIELDS = (
+        "model", "vision_model", "model_preset", "thinking_mode", "reasoning_effort",
+        "preserve_thinking",
+        "temperature", "top_p", "top_k", "min_p", "repeat_penalty",
+        "presence_penalty", "frequency_penalty", "max_tokens",
+        "vision_max_images", "vision_max_frames", "vision_max_edge",
+        "context_size", "kv_cache_k", "kv_cache_v", "kv_cache_location", "gpu_layers",
+        "flash_attention", "prompt_batch_size", "memory_batch_size", "use_mmap", "use_mlock",
+        "prompt_cache_mode", "speculative_mode", "ngram_pred_tokens", "ngram_size",
+        "ngram_mode", "ngram_min_hits", "ngram_max_entries_per_key",
+        "ngram_sync_check_tokens", "mtp_draft_tokens", "mtp_p_min",
+        "split_mode", "main_gpu", "tensor_split", "vram_policy",
+    )
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "sampling_mode": (["Default", "Custom", *sampler_preset_names()], {"default": "Default", "tooltip": "Default mirrors the current global server generation defaults. Editing a sampler value switches this selector to Custom. Saved samplers live in models/LLM/local_LLM_presets/sampler."}),
-                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 5.0, "step": 0.01}),
-                "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "top_k": ("INT", {"default": 40, "min": 0, "max": 10000}),
-                "min_p": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "repeat_penalty": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.01}),
-                "presence_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01}),
-                "frequency_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01}),
-                "max_tokens": ("INT", {"default": 2048, "min": 1, "max": 262144}),
-                "vision_max_images": ("INT", {"default": 4, "min": 0, "max": 32, "tooltip": "Maximum still images accepted from the IMAGE batch. Set 0 to ignore still-image input for this request."}),
-                "vision_max_frames": ("INT", {"default": 24, "min": 0, "max": 1024, "tooltip": "Maximum evenly sampled video frames. Set 0 to ignore video-frame input for this request."}),
-                "vision_max_edge": ("INT", {"default": 1536, "min": 256, "max": 4096, "step": 64}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "control_after_generate": True}),
-            }
+        source = LocalGGUFLLM.INPUT_TYPES()["required"]
+        required = {
+            "settings_preset": (["Current Server", "Custom", *complete_settings_preset_names()], {
+                "default": "Current Server",
+                "tooltip": "Load the current Local LLM server settings or a saved Settings Preset. Editing any field switches this node to Custom.",
+            }),
         }
+        for key in cls.EXPOSED_FIELDS:
+            if key == "vram_policy":
+                required[key] = (["Auto Yield to ComfyUI", "Keep Resident"], {"default": "Auto Yield to ComfyUI"})
+            else:
+                required[key] = copy.deepcopy(source[key])
+        required["seed"] = copy.deepcopy(source["seed"])
+        return {"required": required}
 
     RETURN_TYPES = ("LOCAL_LLM_SETTINGS",)
     RETURN_NAMES = ("settings",)
     FUNCTION = "build"
     CATEGORY = "LLM/Local Service"
-    DESCRIPTION = "Reusable sampler, vision-limit, and seed settings for Local LLM Generate."
+    DESCRIPTION = "Reusable model, generation, vision, memory/performance, and seed settings for Local LLM Generate."
 
     @classmethod
-    def IS_CHANGED(cls, sampling_mode="Default", **kwargs):
-        mode = str(sampling_mode or "Default")
-        payload = {"sampler_mode": mode}
-        for key in (*SAMPLER_PRESET_FIELDS, "vision_max_images", "vision_max_frames", "vision_max_edge", "seed"):
-            if key in kwargs:
-                payload[key] = kwargs.get(key)
-        if mode == "Default":
-            payload["sampler"] = SERVICE.request_generation_defaults()
-        elif mode != "Custom":
-            preset = sampler_presets().get(mode)
-            payload["sampler"] = copy.deepcopy((preset or {}).get("settings"))
-            payload["sampler_mtime_ns"] = (preset or {}).get("mtime_ns")
+    def IS_CHANGED(cls, settings_preset="Current Server", **kwargs):
+        name = str(settings_preset or "Current Server")
+        payload = {"settings_preset": name, "values": {k: kwargs.get(k) for k in (*cls.EXPOSED_FIELDS, "seed") if k in kwargs}}
+        if name == "Current Server":
+            current = SERVICE.get_config()
+            payload["current_server_settings"] = {k: copy.deepcopy(current.get(k)) for k in cls.EXPOSED_FIELDS if k in current}
+        elif name != "Custom":
+            item = complete_settings_presets().get(name)
+            payload["preset_settings"] = copy.deepcopy((item or {}).get("settings"))
+            payload["preset_mtime_ns"] = (item or {}).get("mtime_ns")
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
-    def build(self, sampling_mode, temperature, top_p, top_k, min_p, repeat_penalty,
-              presence_penalty, frequency_penalty, max_tokens, vision_max_images,
-              vision_max_frames, vision_max_edge, seed):
+    def build(self, settings_preset="Current Server", **kwargs):
+        name = str(settings_preset or "Current Server")
+        values = {k: copy.deepcopy(kwargs.get(k)) for k in self.EXPOSED_FIELDS if k in kwargs}
+        if name == "Current Server":
+            current = SERVICE.get_config()
+            values.update({k: copy.deepcopy(current.get(k)) for k in self.EXPOSED_FIELDS if k in current})
+        elif name != "Custom":
+            saved = load_complete_settings_preset(name)
+            if saved is not None:
+                # Saved preset is authoritative while selected.  Preserve any
+                # future preset fields not yet surfaced as node widgets too.
+                values.update(copy.deepcopy(saved))
+        clean = _validate_complete_settings(values)
         return ({
-            "schema": "local_llm_request_settings",
-            "schema_version": 1,
-            "sampling_mode": str(sampling_mode or "Default"),
-            "temperature": float(temperature),
-            "top_p": float(top_p),
-            "top_k": int(top_k),
-            "min_p": float(min_p),
-            "repeat_penalty": float(repeat_penalty),
-            "presence_penalty": float(presence_penalty),
-            "frequency_penalty": float(frequency_penalty),
-            "max_tokens": int(max_tokens),
-            "vision_max_images": int(vision_max_images),
-            "vision_max_frames": int(vision_max_frames),
-            "vision_max_edge": int(vision_max_edge),
-            "seed": int(seed),
+            "schema": "local_llm_complete_request_settings",
+            "schema_version": 2,
+            "settings_preset": name,
+            "sampling_mode": "Custom",
+            "server_config": clean,
+            **{k: copy.deepcopy(clean.get(k, kwargs.get(k))) for k in SAMPLER_PRESET_FIELDS},
+            "vision_max_images": int(clean.get("vision_max_images", kwargs.get("vision_max_images", 4))),
+            "vision_max_frames": int(clean.get("vision_max_frames", kwargs.get("vision_max_frames", 24))),
+            "vision_max_edge": int(clean.get("vision_max_edge", kwargs.get("vision_max_edge", 1536))),
+            "seed": int(kwargs.get("seed", 0)),
         },)
 
 
@@ -2512,18 +2701,23 @@ class LocalLLMGenerate:
                 payload[kind]["mtime_ns"] = None if item is None else item.get("mtime_ns")
 
         # Model/template configuration affects output even when request-level
-        # sampler and prompt fields are custom.
-        cfg = SERVICE.get_config()
-        payload["server"] = {
-            "model": cfg.get("model"),
-            "vision_model": cfg.get("vision_model"),
-            "model_preset": cfg.get("model_preset"),
-            "thinking_mode": cfg.get("thinking_mode"),
-            "reasoning_effort": cfg.get("reasoning_effort"),
-            "preserve_thinking": cfg.get("preserve_thinking"),
-            "chat_format": cfg.get("chat_format"),
-            "custom_chat_format": cfg.get("custom_chat_format"),
-        }
+        # sampler and prompt fields are custom.  A connected Settings node owns
+        # that runtime configuration for this workflow request.
+        if linked_settings and isinstance(linked_settings.get("server_config"), dict):
+            payload["server"] = copy.deepcopy(linked_settings.get("server_config"))
+            payload["complete_settings_preset"] = linked_settings.get("settings_preset", "Custom")
+        else:
+            cfg = SERVICE.get_config()
+            payload["server"] = {
+                "model": cfg.get("model"),
+                "vision_model": cfg.get("vision_model"),
+                "model_preset": cfg.get("model_preset"),
+                "thinking_mode": cfg.get("thinking_mode"),
+                "reasoning_effort": cfg.get("reasoning_effort"),
+                "preserve_thinking": cfg.get("preserve_thinking"),
+                "chat_format": cfg.get("chat_format"),
+                "custom_chat_format": cfg.get("custom_chat_format"),
+            }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
     def generate(self, system_prompt_preset, system_prompt, prompt_preset, prompt,
@@ -2531,7 +2725,19 @@ class LocalLLMGenerate:
                  presence_penalty, frequency_penalty, max_tokens, vision_max_images, vision_max_frames,
                  vision_max_edge, seed, image=None, video_frames=None, settings=None):
         linked_settings = settings if isinstance(settings, dict) else None
+        runtime_config = None
         if linked_settings:
+            server_patch = linked_settings.get("server_config")
+            # The modal/server configuration is authoritative. A Settings node
+            # selecting Custom or a saved preset supplies a temporary runtime
+            # configuration for this request only; Current Server uses the live
+            # authoritative configuration directly.
+            if (
+                str(linked_settings.get("settings_preset") or "Current Server") != "Current Server"
+                and isinstance(server_patch, dict)
+                and server_patch
+            ):
+                runtime_config = copy.deepcopy(server_patch)
             sampling_mode = linked_settings.get("sampling_mode", sampling_mode)
             temperature = linked_settings.get("temperature", temperature)
             top_p = linked_settings.get("top_p", top_p)
@@ -2594,19 +2800,24 @@ class LocalLLMGenerate:
                 }
             overrides.update(saved)
 
-        result = SERVICE.api.generate(
-            system_prompt=effective_system_prompt,
-            prompt=effective_prompt,
+        messages = []
+        if effective_system_prompt:
+            messages.append({"role": "system", "content": str(effective_system_prompt)})
+        messages.append({"role": "user", "content": "" if effective_prompt is None else str(effective_prompt)})
+        result = SERVICE.generate_messages(
+            messages,
             image=image,
             video_frames=video_frames,
             client="ComfyUI Local LLM Generate",
-            **overrides,
+            overrides=overrides,
+            runtime_config=runtime_config,
         )
         info = copy.deepcopy(result.get("info") or {})
         info["request_presets"] = {
             "sampler": mode,
             "system_prompt": str(system_prompt_preset or "Custom"),
             "prompt": str(prompt_preset or "Custom"),
+            "complete_settings": str((linked_settings or {}).get("settings_preset") or "Custom") if linked_settings else None,
             "settings_node": bool(linked_settings),
         }
         return (
@@ -2727,6 +2938,39 @@ try:
         except Exception as e:
             return _json_error(e)
 
+    @routes.get("/local_llm_server/settings_presets")
+    async def local_llm_server_settings_presets_get(request):
+        return web.json_response(catalog().get("settings_presets") or {})
+
+    @routes.post("/local_llm_server/settings_presets")
+    async def local_llm_server_settings_presets_post(request):
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise TypeError("request body must be an object")
+            source = body.get("settings")
+            if source is None:
+                source = SERVICE.get_config()
+            saved = await asyncio.to_thread(save_complete_settings_preset, body.get("name"), source)
+            SERVICE._log(f"Saved Local LLM complete settings preset: {saved['name']}")
+            return web.json_response({"saved": saved, "catalog": catalog()})
+        except Exception as e:
+            return _json_error(e)
+
+    @routes.delete("/local_llm_server/settings_presets")
+    async def local_llm_server_settings_presets_delete(request):
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise TypeError("request body must be an object")
+            deleted = await asyncio.to_thread(delete_complete_settings_preset, body.get("name"))
+            SERVICE._log(f"Deleted Local LLM complete settings preset: {deleted['name']}")
+            return web.json_response({"deleted": deleted, "catalog": catalog()})
+        except Exception as e:
+            return _json_error(e)
+
+    # Legacy endpoint retained for older workflows/frontends; the current UI no
+    # longer exposes memory-only presets.
     @routes.post("/local_llm_server/memory_presets")
     async def local_llm_server_memory_presets_post(request):
         try:
@@ -2734,7 +2978,6 @@ try:
             if not isinstance(body, dict):
                 raise TypeError("request body must be an object")
             saved = await asyncio.to_thread(save_memory_preset, body.get("name"), body.get("settings") or {})
-            SERVICE._log(f"Saved Local LLM memory/performance preset: {saved['name']}")
             return web.json_response({"saved": saved, "catalog": catalog()})
         except Exception as e:
             return _json_error(e)

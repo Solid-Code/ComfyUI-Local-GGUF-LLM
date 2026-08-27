@@ -1765,44 +1765,6 @@ def _estimate_kv_vram(metadata, n_ctx, type_k, type_v, location):
     return int(n_ctx * blocks * (k_dim * _kv_scalar_bytes(type_k) + v_dim * _kv_scalar_bytes(type_v)))
 
 
-_HYBRID_MTMD_BATCH_SAFE_FAMILIES = {"qwen3.5", "qwen3.6", "qwen3.8"}
-
-
-def _effective_decode_batch_sizes(family, mmproj_path, n_batch, n_ubatch):
-    """Resolve safe llama.cpp logical/physical batch sizes for a request.
-
-    Normal llama.cpp text inference supports n_batch > n_ubatch: the backend
-    splits a logical prompt batch into physical micro-batches.  Current MTMD
-    handlers for hybrid Qwen architectures can instead feed a complete text
-    chunk through Llama.eval() before a media chunk.  Some recent llama.cpp /
-    llama-cpp-python combinations reject that decode when the logical chunk is
-    larger than the physical recurrent-state batch capacity.
-
-    Keep the user's tuned text settings intact, but cap the *effective* logical
-    batch to n_ubatch only while one of the affected hybrid models is actually
-    using an mmproj.  This prevents Fatal Decode Error / Invalid input batch at
-    position 0 without degrading ordinary text-only prompt processing.
-    """
-    try:
-        nb = max(1, int(n_batch or 1))
-    except Exception:
-        nb = 2048
-    try:
-        ub = max(1, int(n_ubatch or 1))
-    except Exception:
-        ub = 512
-    adjusted = False
-    reason = None
-    if mmproj_path and str(family or "").lower() in _HYBRID_MTMD_BATCH_SAFE_FAMILIES and nb > ub:
-        original = nb
-        nb = ub
-        adjusted = True
-        reason = (
-            f"hybrid MTMD decode safety: effective n_batch capped from {original} to n_ubatch {ub}"
-        )
-    return nb, ub, adjusted, reason
-
-
 def _estimate_native_vram_components(model_path, mmproj_path, metadata, gpu_layers, n_ctx,
                                      kv_k, kv_v, kv_location, n_batch=2048, n_ubatch=512,
                                      flash_attention=True, speculative_mode="Off"):
@@ -2294,6 +2256,227 @@ def _video_frames_to_data_uris(video_frames, max_frames=24, max_edge=1536):
     return _encode_image_samples(arr, indices, max_edge)
 
 
+def _fallback_template_strftime_now(format_string="%Y-%m-%d %H:%M:%S"):
+    """Hugging Face-compatible Jinja helper used only when llama-cpp lacks one."""
+    from datetime import datetime
+    return datetime.now().strftime(str(format_string))
+
+
+def _fallback_template_raise_exception(message):
+    """Hugging Face-compatible Jinja helper used only when llama-cpp lacks one."""
+    try:
+        from jinja2.exceptions import TemplateError
+    except Exception:
+        TemplateError = RuntimeError
+    raise TemplateError(str(message))
+
+
+def _mtmd_template_compat_helpers():
+    """Return local HF-compatible helpers for MTMD environments that lack them.
+
+    Do not borrow helpers from llama-cpp-python's separate text-only Jinja
+    formatter.  MTMD owns a different Jinja environment, and copying a helper
+    descriptor across formatter implementations can produce an incompatible
+    callable in some fork/build combinations.  These helpers are only installed
+    by ``_ensure_mtmd_chat_template_compat`` when the MTMD environment does not
+    already provide its own implementation.
+    """
+    return {
+        "strftime_now": _fallback_template_strftime_now,
+        "raise_exception": _fallback_template_raise_exception,
+    }
+
+
+def _mtmd_template_helper_usable(name, helper):
+    """Return True only when an existing MTMD helper has the expected contract."""
+    if not callable(helper):
+        return False
+    if name == "strftime_now":
+        try:
+            return isinstance(helper("%Y-%m-%d"), str)
+        except Exception:
+            return False
+    return True
+
+
+def _mtmd_flatten_structured_content(content, media_marker):
+    """Convert OpenAI multimodal content blocks to a render-only MTMD string.
+
+    Generic MTMD extracts/decodes media from the original structured messages
+    before rendering.  Some otherwise-valid embedded GGUF templates are older
+    text-oriented Jinja templates and concatenate ``message["content"]``
+    directly with strings.  Such templates raise ``str + list`` when an OpenAI
+    multimodal content list is supplied.  For the render retry only, preserve
+    block order while replacing each recognized media block with MTMD's canonical
+    marker.  The original messages remain untouched for media extraction.
+
+    Return ``None`` when the value is not a compatible structured block list so
+    unrelated template errors are not hidden.
+    """
+    if not isinstance(content, (list, tuple)):
+        return None
+    if not media_marker:
+        return None
+
+    parts = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+            continue
+        if not isinstance(block, dict):
+            return None
+
+        block_type = str(block.get("type") or "").strip().lower()
+        if block_type == "text" or (not block_type and "text" in block):
+            parts.append(str(block.get("text") or ""))
+            continue
+        if block_type in {
+            "image", "image_url",
+            "audio", "audio_url", "input_audio",
+            "video", "video_url",
+        }:
+            parts.append(str(media_marker))
+            continue
+        return None
+
+    return "".join(parts)
+
+
+def _mtmd_render_messages_compat(messages, media_marker):
+    """Return a render-only copy with compatible list content flattened."""
+    if not isinstance(messages, (list, tuple)):
+        return None
+
+    changed = False
+    adapted = []
+    for message in messages:
+        if not isinstance(message, dict):
+            return None
+        item = copy.deepcopy(message)
+        content = item.get("content")
+        if isinstance(content, (list, tuple)):
+            flattened = _mtmd_flatten_structured_content(content, media_marker)
+            if flattened is None:
+                return None
+            item["content"] = flattened
+            changed = True
+        adapted.append(item)
+    return adapted if changed else None
+
+
+def _install_mtmd_structured_content_render_compat(handler):
+    """Add a narrow render-only fallback for old embedded MTMD templates.
+
+    Modern multimodal templates understand OpenAI content-block lists natively
+    and continue down the untouched native path.  A few GGUF embedded templates
+    still use expressions such as ``'[INST]' + message['content']``.  Generic
+    MTMD has already extracted the media payloads before that render occurs, so
+    when (and only when) Jinja raises the characteristic ``str + list`` TypeError
+    we can retry the *template render* with canonical MTMD markers in a temporary
+    message copy.  This is not a generation/decode retry and does not alter the
+    installed llama-cpp-python package or the caller's messages.
+    """
+    if handler is None or getattr(handler, "_local_llm_structured_render_compat", False):
+        return False
+
+    original = getattr(handler, "_render_mtmd_prompt", None)
+    if not callable(original):
+        return False
+
+    try:
+        from types import MethodType
+
+        def _render_with_compat(self, *args, **kwargs):
+            try:
+                return original(*args, **kwargs)
+            except TypeError as exc:
+                text = str(exc)
+                if "can only concatenate str" not in text or "list" not in text:
+                    raise
+
+                if "messages" in kwargs:
+                    messages = kwargs.get("messages")
+                    adapted = _mtmd_render_messages_compat(messages, getattr(self, "media_marker", None))
+                    if adapted is None:
+                        raise
+                    retry_kwargs = dict(kwargs)
+                    retry_kwargs["messages"] = adapted
+                    return original(*args, **retry_kwargs)
+
+                if not args:
+                    raise
+                adapted = _mtmd_render_messages_compat(args[0], getattr(self, "media_marker", None))
+                if adapted is None:
+                    raise
+                retry_args = list(args)
+                retry_args[0] = adapted
+                return original(*retry_args, **kwargs)
+
+        handler._render_mtmd_prompt = MethodType(_render_with_compat, handler)
+        handler._local_llm_structured_render_compat = True
+        return True
+    except Exception:
+        return False
+
+
+def _ensure_mtmd_chat_template_compat(handler):
+    """Fill missing/broken HF-style Jinja helpers on MTMD handlers only.
+
+    Newer JamePeng MTMD handlers can replace their compiled ``chat_template``
+    after the model is available so they can use the GGUF's embedded template.
+    Patching only the current Jinja environment is therefore not persistent.
+    When the handler exposes ``extra_template_arguments``, install compatibility
+    helpers there as well: that dictionary is passed into every MTMD render and
+    survives template replacement.  Existing working native helpers are left
+    untouched.  Text-only chat formatting is not modified.
+    """
+    if handler is None or not callable(getattr(handler, "_render_mtmd_prompt", None)):
+        return False
+
+    render_compat_changed = _install_mtmd_structured_content_render_compat(handler)
+
+    template = getattr(handler, "chat_template", None)
+    environment = getattr(template, "environment", None)
+    globals_map = getattr(environment, "globals", None)
+    extra_args = getattr(handler, "extra_template_arguments", None)
+    if not isinstance(extra_args, dict):
+        extra_args = None
+    if globals_map is None and extra_args is None:
+        return False
+
+    changed = bool(render_compat_changed)
+    for name, fallback in _mtmd_template_compat_helpers().items():
+        # Render-time arguments take precedence over environment globals. Keep a
+        # working render-time helper exactly as supplied by the binding/caller.
+        extra_helper = extra_args.get(name) if extra_args is not None else None
+        if _mtmd_template_helper_usable(name, extra_helper):
+            continue
+
+        native_helper = globals_map.get(name) if globals_map is not None else None
+        if _mtmd_template_helper_usable(name, native_helper):
+            # Preserve native behavior, but mirror that same callable into the
+            # handler's render-time arguments when available. Generic MTMD can
+            # replace its compiled Jinja environment after model availability;
+            # extra_template_arguments survives that replacement. This also
+            # prevents a malformed existing render-time value from shadowing a
+            # valid native global.
+            if extra_args is not None and extra_args.get(name) is not native_helper:
+                extra_args[name] = native_helper
+                changed = True
+            continue
+
+        # Missing or malformed helper: use our HF-compatible fallback. Persist it
+        # through future Generic MTMD template swaps when the handler supports the
+        # render-time argument dictionary, and patch the current environment too.
+        if extra_args is not None and extra_args.get(name) is not fallback:
+            extra_args[name] = fallback
+            changed = True
+        if globals_map is not None and globals_map.get(name) is not fallback:
+            globals_map[name] = fallback
+            changed = True
+    return changed
+
+
 def _vision_modules():
     """Return multimodal modules exposed by current and older llama-cpp-python builds."""
     modules = []
@@ -2385,7 +2568,9 @@ def _instantiate_handler(cls, mmproj_path, extra):
     last = None
     for kw in unique:
         try:
-            return cls(**kw)
+            handler = cls(**kw)
+            _ensure_mtmd_chat_template_compat(handler)
+            return handler
         except TypeError as e:
             last = e
     if last:
@@ -3417,13 +3602,13 @@ class LocalGGUFLLM:
             else:
                 raise RuntimeError("Context size must be at least MTP draft tokens + 1 for native MTP speculative decoding.")
 
-        effective_prompt_batch_size, effective_memory_batch_size, batch_safety_adjusted, batch_safety_reason = \
-            _effective_decode_batch_sizes(family, mmproj_path, prompt_batch_size, memory_batch_size)
-        if batch_safety_adjusted:
-            _LOGGER.warning(
-                "[Local GGUF LLM] %s (configured n_batch=%s, n_ubatch=%s, family=%s).",
-                batch_safety_reason, prompt_batch_size, memory_batch_size, family,
-            )
+        # Respect the configured llama.cpp logical and physical batch sizes exactly.
+        # n_batch may legitimately be larger than n_ubatch; recurrent/hybrid state
+        # reset correctness belongs to llama-cpp-python/llama.cpp, not this node.
+        effective_prompt_batch_size = int(prompt_batch_size)
+        effective_memory_batch_size = int(memory_batch_size)
+        batch_safety_adjusted = False
+        batch_safety_reason = None
 
         chat_fmt = None
         if chat_format == "Custom":
@@ -3861,6 +4046,12 @@ class LocalGGUFLLM:
                 load_diagnostics["page_cache_hint"] = "not-loaded"
 
         with _MODEL_LOCK:
+            # MTMD uses its own Jinja environment in some llama-cpp-python builds.
+            # Add only missing Hugging Face-style helpers to that environment;
+            # preserve any native implementation already supplied by the binding.
+            if mmproj_path:
+                _ensure_mtmd_chat_template_compat(getattr(llm, "chat_handler", None))
+
             # Direct llama-cpp-python does not currently expose arbitrary Jinja
             # template kwargs through Llama.create_chat_completion. Refresh a
             # lightweight embedded-template handler per run instead of reloading
@@ -4003,7 +4194,10 @@ class LocalGGUFLLM:
                 # semantics or exposing partial response text.
                 stream_kwargs = dict(completion_kwargs)
                 stream_kwargs["stream"] = True
-                stream_kwargs["stream_options"] = {"include_usage": True}
+                stream_params, stream_var_kw = _signature_info(llm.create_chat_completion)
+                stream_options_supported = stream_var_kw or not stream_params or "stream_options" in stream_params
+                if stream_options_supported:
+                    stream_kwargs["stream_options"] = {"include_usage": True}
                 parts = []
                 reasoning_parts = []
                 usage = {}
@@ -4154,11 +4348,17 @@ class LocalGGUFLLM:
                         if reasoning_parts:
                             msg["reasoning_content"] = "".join(reasoning_parts)
                         result = {"choices": [{"index": 0, "message": msg, "finish_reason": "stop"}], "usage": usage}
-                except TypeError:
-                    # Older llama-cpp-python builds may support stream=True but not
-                    # stream_options. Retry only when no output was emitted, so a
-                    # partially generated response can never be generated twice.
-                    if emitted_any:
+                except TypeError as exc:
+                    # Some bindings advertise **kwargs but still reject
+                    # stream_options internally. Retry only that exact compatibility
+                    # error and only before any output; unrelated TypeErrors (for
+                    # example a Jinja template failure) must surface immediately.
+                    message = str(exc)
+                    unsupported_stream_options = (
+                        "stream_options" in message
+                        and "unexpected keyword argument" in message
+                    )
+                    if emitted_any or not unsupported_stream_options:
                         raise
                     stream_kwargs.pop("stream_options", None)
                     streamed = llm.create_chat_completion(**stream_kwargs)

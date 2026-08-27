@@ -271,7 +271,7 @@ FAMILY_CAPABILITIES = {
     "gemma4": _cap("Generic Chat", vision=True, handlers=("Gemma4ChatHandler",)),
     "gemma3": _cap("Gemma 3 Instruct", vision=True, handlers=("Gemma3ChatHandler",)),
     "gpt-oss": _cap("GPT-OSS 20B", vision=False),
-    "mistral-small-3.2": _cap("Mistral Small 3.2 24B", vision=False),
+    "mistral-small-3.2": _cap("Mistral Small 3.2 24B", vision=True),
     "ministral-3-instruct": _cap("Ministral 3 Instruct", vision=False),
     "ministral-3-reasoning": _cap("Ministral 3 8B Reasoning", vision=False),
     "deepseek-r1": _cap("DeepSeek R1 Distill", vision=False),

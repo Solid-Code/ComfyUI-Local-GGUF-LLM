@@ -5,7 +5,7 @@ A single ComfyUI custom-node package for running a persistent local GGUF LLM and
 This package includes:
 
 - **Local LLM Generate** — send prompts, images, and sampled video frames to the persistent local LLM.
-- **Local LLM Settings** — reusable sampler, vision-limit, token, penalty, and seed settings.
+- **Local LLM Settings** — reusable model/generation settings with loadable Complete Settings Presets. Memory/performance tuning remains in the Local LLM service panel rather than crowding the workflow node.
 - **Local LLM Prompt Enhancer** — bundled **v0.6.12-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
 - **Local LLM Server panel** — model loading, presets, memory/VRAM controls, status, performance information, and the optional OpenAI-compatible API.
 
@@ -70,7 +70,7 @@ For a normal first setup:
 1. Select the GGUF under **Model**.
 2. Select the matching **Vision / mmproj** only when the model supports vision. Otherwise use `None` or `Auto`.
 3. Select a model preset or use **Auto (Detected)**.
-4. Select the memory/VRAM configuration you want.
+4. Adjust memory/VRAM settings directly, or load a **Complete Settings Preset** from the **Presets** tab.
 5. For a machine that also runs diffusion/video models, **Auto Yield to ComfyUI** is the recommended VRAM policy.
 6. Save the server settings.
 7. Start the model, or use **On Demand** so it loads on the first request.
@@ -85,7 +85,6 @@ The node provides:
 
 - System Prompt preset and editable System Prompt
 - Prompt preset and editable Prompt
-- sampler preset / custom sampler values
 - Temperature
 - Top P
 - Top K
@@ -108,7 +107,7 @@ Outputs:
 - `info`
 - `tokens`
 
-When a **Local LLM Settings** node is connected, its sampler, vision-limit, and seed values override the matching local Generate controls. Prompt text and media still come from Local LLM Generate.
+When a **Local LLM Settings** node is connected, its complete model/runtime settings, sampler values, vision limits, and seed become authoritative for that workflow request. Prompt text and media still come from Local LLM Generate.
 
 ### Number controls
 
@@ -123,9 +122,11 @@ The custom DOM numeric controls mirror Nodes 2.0 behavior:
 
 The underlying native ComfyUI widgets remain authoritative for serialization and execution.
 
-## Local LLM Settings
+## Complete Settings Presets and Local LLM Settings
 
-Use **Local LLM Settings** when several Local LLM nodes should share one generation configuration.
+The server panel has a dedicated **Presets** tab for Complete Settings Presets. A complete preset stores the LLM runtime configuration: model and vision projector, model behavior/sampling, and memory/KV/offload/speculative settings. API keys, startup mode, logging, and interface preferences are intentionally excluded. The Presets tab is the only place that creates or deletes Complete Settings Presets and shows a readable summary of the selected preset.
+
+Use **Local LLM Settings** when a workflow should own a reusable LLM configuration. The node can **load** Complete Settings Presets from the same preset library, but it does not save or delete them. Model, vision-projector, and model-preset selection come from the Complete Settings Preset rather than separate selectors on the workflow node. Thinking/reasoning and sampler controls remain directly adjustable; editing any visible preset-owned field changes the node to **Custom**. Detailed memory/performance tuning is managed in the Local LLM service panel and carried into the node when a Complete Settings Preset is loaded.
 
 It outputs:
 
@@ -133,9 +134,7 @@ It outputs:
 LOCAL_LLM_SETTINGS
 ```
 
-Connect that output to the `settings` input on **Local LLM Generate** or **Local LLM Prompt Enhancer**.
-
-Settings includes the sampler controls, generation limits, vision limits, and seed. When connected to Prompt Enhancer, the Settings node is authoritative and Prompt Enhancer's local Seed controls are disabled.
+Connect that output to the `settings` input on **Local LLM Generate** or **Local LLM Prompt Enhancer**. When connected, the Settings node is authoritative for model/runtime settings, sampler values, vision limits, and seed.
 
 ## Local LLM Prompt Enhancer
 
@@ -231,14 +230,15 @@ Local LLM presets are stored below:
 
 ```text
 ComfyUI/models/LLM/local_LLM_presets/
+├── settings/          # Complete Settings Presets
 ├── prompts/
 ├── system_prompts/
-├── sampler/
+├── sampler/           # legacy/user sampler files remain readable
 └── prompt_enhancer/
     └── prompt_sets/
 ```
 
-The Generate and Settings preset selectors support the package's built-in/default behavior plus user presets saved in these folders.
+**Local LLM Settings** loads Complete Settings Presets from `settings/`. Complete preset creation and deletion is intentionally centralized in the server panel's **Presets** tab.
 
 ## Vision input
 

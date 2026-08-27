@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import asyncio
 import json
 import logging
@@ -16,7 +18,7 @@ import folder_paths
 
 log = logging.getLogger(__name__)
 
-NODE_VERSION = "0.6.12-alpha"
+NODE_VERSION = "0.6.13-alpha"
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_DIR = PACKAGE_DIR / "templates" / "default"
 USER_TEMPLATE_DIR = Path(folder_paths.models_dir) / "LLM" / "local_LLM_presets" / "prompt_enhancer"
@@ -297,6 +299,17 @@ def _find_local_llm_export(name: str):
     return candidates[0][2]
 
 
+def _settings_runtime_config(settings: Any) -> dict[str, Any] | None:
+    """Return a request-local complete Settings-node override when selected."""
+    linked = settings if isinstance(settings, dict) else None
+    if not linked or str(linked.get("settings_preset") or "Current Server") == "Current Server":
+        return None
+    patch = linked.get("server_config")
+    if not isinstance(patch, dict) or not patch:
+        return None
+    return copy.deepcopy(patch)
+
+
 def _settings_overrides(settings: Any, fallback_seed: Any = 0) -> dict[str, Any]:
     """Translate LOCAL_LLM_SETTINGS into the same request overrides used by Local LLM Generate."""
     linked = settings if isinstance(settings, dict) else None
@@ -544,6 +557,7 @@ def _run_enhancement(
         video_frames=frames,
         client=client,
         overrides=_settings_overrides(settings, seed),
+        runtime_config=_settings_runtime_config(settings),
     )
     revised = _clean_response((result or {}).get("response", ""))
     if not revised:
@@ -634,6 +648,35 @@ def _next_prompt_index(
         return next_index, bag
 
     return current_index, _parse_shuffle_state(shuffle_state, count, current_index)
+
+
+def _prompt_preset_names() -> list[str]:
+    """Return shared Local LLM prompt-preset names without owning that storage here."""
+    loader = _find_local_llm_export("text_preset_names")
+    if not callable(loader):
+        return []
+    try:
+        return [str(name) for name in loader("prompts")]
+    except Exception as exc:
+        log.warning("[Local LLM Prompt Enhancer] Could not enumerate shared prompt presets: %s", exc)
+        return []
+
+
+def _effective_prompt_text(prompt_preset: Any, prompt: Any) -> str:
+    """Resolve a shared Prompt Preset exactly like Local LLM Generate."""
+    source = str(prompt or "")
+    name = str(prompt_preset or "Custom")
+    if name == "Custom":
+        return source
+    loader = _find_local_llm_export("load_text_preset")
+    if not callable(loader):
+        return source
+    try:
+        saved = loader("prompts", name)
+    except Exception as exc:
+        log.warning("[Local LLM Prompt Enhancer] Could not load prompt preset %r: %s", name, exc)
+        return source
+    return source if saved is None else str(saved)
 
 
 class LocalLLMPromptEnhancer:
@@ -781,6 +824,19 @@ class LocalLLMPromptEnhancer:
                         "dynamicPrompts": False,
                     },
                 ),
+                # Keep this appended after the existing serialized widgets so old
+                # Prompt Enhancer workflows retain their widget-value positions.
+                # The frontend renders this selector above Prompt.
+                "prompt_preset": (
+                    ["Custom", *_prompt_preset_names()],
+                    {
+                        "default": "Custom",
+                        "tooltip": (
+                            "Reusable prompts shared with Local LLM Generate from "
+                            "models/LLM/local_LLM_presets/prompts. Editing Prompt switches this selector to Custom."
+                        ),
+                    },
+                ),
             },
             "optional": {
                 "images": (
@@ -853,12 +909,13 @@ class LocalLLMPromptEnhancer:
         prompt_history_json: str = "[]",
         prompt_history_index: int = 0,
         prompt_shuffle_json: str = "[]",
+        prompt_preset: str = "Custom",
         settings: Any = None,
         images: Any = None,
         video: Any = None,
         unique_id: Any = None,
     ):
-        source = str(prompt or "")
+        source = _effective_prompt_text(prompt_preset, prompt)
         history = _parse_prompt_history(prompt_history_json, enhanced_prompt)
         active_index = _normalize_history_index(prompt_history_index, len(history))
         visible_enhanced = str(enhanced_prompt or "")
@@ -879,7 +936,7 @@ class LocalLLMPromptEnhancer:
         if pending is not None:
             token = str(pending.get("token") or "")
             result = _run_enhancement(
-                str(pending.get("prompt") or ""),
+                source,
                 str(pending.get("enhancement_text") or ""),
                 images=images,
                 video=video,
