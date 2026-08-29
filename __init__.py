@@ -5,7 +5,7 @@ from pathlib import Path
 # every JS module found under WEB_DIRECTORY.
 _js_dir = Path(__file__).resolve().parent / "web" / "js"
 _FRONTENDS = {
-    "local_llm_server": "local_llm_server_v098.js",
+    "local_llm_server": "local_llm_server_v099.js",
     "prompt_enhancer": "prompt_enhancer_dom_v0621.js",
 }
 if _js_dir.is_dir():

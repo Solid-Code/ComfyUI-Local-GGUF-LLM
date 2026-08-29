@@ -661,12 +661,14 @@ def _prepare_resident_prompt_cache(llm, requested_mode, vision_active=False, sig
             llm.reset()
         except Exception:
             pass
+    start = _prompt_cache_context_snapshot(llm)
     return {
         "requested": requested,
         "effective": effective,
         "scope": "resident-context",
         "signature_id": signature_id,
         "resident_tokens_before": int(before.get("n_tokens") or 0),
+        "resident_tokens_start": int(start.get("n_tokens") or 0),
         "before_requires_eval": bool(before.get("requires_eval", True)),
         "bypass_reason": bypass_reason,
         "survives_suspend": False,
@@ -722,6 +724,7 @@ def _resident_prompt_cache_metrics(llm, prepared, prompt_tokens, native_prompt_t
         "reused_tokens": int(reused),
         "reuse_percent": round(reuse_pct, 2),
         "resident_tokens_before": int(prepared.get("resident_tokens_before") or 0),
+        "resident_tokens_start": int(prepared.get("resident_tokens_start") or 0),
         "resident_tokens_after": int(after.get("n_tokens") or 0),
         "uncached_prompt_tokens_per_second": round(eval_rate, 2),
         "effective_prompt_tokens_per_second": round(effective_rate, 2),

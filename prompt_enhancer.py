@@ -643,6 +643,13 @@ def _run_enhancement(
     # not wait on the very workflow that is currently executing this node.
     client = "ComfyUI Local LLM Generate - Prompt Enhancer" if workflow_owned else "Prompt Enhancer"
     overrides, runtime_config, config_snapshot = _batch_request_snapshot(batch_id, settings, seed)
+    # Prompt Enhancer entries are independent rewrite requests, not turns in one
+    # chat conversation. Keeping the previous completion in llama.cpp's resident
+    # KV context can make later entries progressively more expensive to decode
+    # even though the native model itself remains hot. Reset only the KV context
+    # for each enhancement; this preserves resident GGUF/model allocations while
+    # paying the very small prompt-prefill cost again.
+    overrides["prompt_cache_mode"] = "Off"
     result = service.generate_messages(
         messages,
         image=images,

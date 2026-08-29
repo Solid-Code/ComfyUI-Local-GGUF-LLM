@@ -1,4 +1,7 @@
-# Local GGUF LLM — v0.18.44 alpha
+# Local GGUF LLM — v0.18.46 alpha
+
+## v0.18.46 alpha
+- Complete Settings **Load Preset** is disabled and rendered grey when the selected preset already exactly matches the current live settings. Selecting a different preset enables Load Preset again.
 
 This package contains the reusable Local LLM service, settings/generation nodes, OpenAI-compatible API, and Prompt Enhancer. The H3 Shot Generator is distributed separately and uses this package through a small in-process bridge.
 

@@ -1512,7 +1512,8 @@ class LocalLLMServiceManager:
                         f"effective={prompt_cache.get('effective', 'Auto')} • "
                         f"hit={bool(prompt_cache.get('hit'))} • reused={reused}/{total_prompt} ({reuse_pct:.1f}%) • "
                         f"evaluated={evaluated} • eval_rate={uncached_rate:.1f}t/s • effective_rate={effective_rate:.1f}t/s • "
-                        f"est_saved={saved:.3f}s • scope={prompt_cache.get('scope', 'resident-context')}"
+                        f"est_saved={saved:.3f}s • scope={prompt_cache.get('scope', 'resident-context')} • "
+                        f"resident_ctx={int(prompt_cache.get('resident_tokens_before') or 0)}→{int(prompt_cache.get('resident_tokens_start') or 0)}→{int(prompt_cache.get('resident_tokens_after') or 0)}"
                     )
                 gpu_backend = info.get("gpu_backend") or {}
                 preload = gpu_backend.get("preload_memory") or {}
