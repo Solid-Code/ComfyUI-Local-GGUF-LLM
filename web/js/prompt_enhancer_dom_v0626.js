@@ -2,7 +2,7 @@ import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
 const EXTENSION_NAME = "LocalLLM.PromptEnhancer";
-const FRONTEND_VERSION = "0.6.25-alpha";
+const FRONTEND_VERSION = "0.6.26-alpha";
 console.info(`[Local LLM Prompt Enhancer] frontend ${FRONTEND_VERSION}`);
 const NODE_CLASS = "LocalLLMPromptEnhancer";
 const DEFAULT_PRESET = "Default / Krea 2 - Image";
@@ -154,16 +154,37 @@ async function endEnhancementBatch(batchId) {
   }
 }
 
+function promptCycleRevision(node) {
+  const raw = Number(widget(node, "prompt_cycle_revision")?.value ?? 0);
+  if (!Number.isFinite(raw)) return 0;
+  return Math.max(0, Math.min(Math.trunc(raw), 0x7fffffff));
+}
+
+function bumpPromptCycleRevision(node) {
+  const w = widget(node, "prompt_cycle_revision");
+  if (!w) return 0;
+  const current = promptCycleRevision(node);
+  const next = current >= 0x7ffffffe ? 1 : current + 1;
+  setWidgetValue(w, next, false);
+  return next;
+}
+
 function resetBackendPromptCycle(node) {
   const nodeId = String(node?.id ?? "");
   if (!nodeId) return;
+  // Bump a value that is serialized with the workflow *before* the async reset.
+  // This makes a manual X/Y change immediately authoritative even if Run is
+  // clicked before the reset request reaches Python. Backend-driven cycle UI
+  // updates deliberately call setPromptHistoryState(..., backendSync:false), so
+  // normal cycling does not change this revision.
+  const revision = bumpPromptCycleRevision(node);
   // Explicit user navigation/mode changes must win over any in-flight state
   // read started before this reset. Suppress readback until the backend has
   // acknowledged the reset so a stale response cannot jump the visible index.
   const epoch = (Number(node.__promptEnhancerCycleSyncEpoch) || 0) + 1;
   node.__promptEnhancerCycleSyncEpoch = epoch;
   node.__promptEnhancerCycleResetPending = true;
-  void postJSON("/local_llm_prompt_enhancer/cycle_reset", { node_id: nodeId })
+  void postJSON("/local_llm_prompt_enhancer/cycle_reset", { node_id: nodeId, revision })
     .catch(() => {})
     .finally(() => {
       if (Number(node.__promptEnhancerCycleSyncEpoch) === epoch) {
@@ -188,11 +209,13 @@ async function syncPromptCycleFromBackend(node, { force = false } = {}) {
   node.__promptEnhancerCycleSyncAt = now;
 
   const epoch = Number(node.__promptEnhancerCycleSyncEpoch) || 0;
+  const revision = promptCycleRevision(node);
   const nodeId = String(node.id ?? "");
   const request = postJSON("/local_llm_prompt_enhancer/cycle_state", {
     node_id: nodeId,
     mode,
     history,
+    revision,
   }).then((data) => {
     if (!data?.valid || !node || node.__promptEnhancerCycleResetPending) return false;
     if ((Number(node.__promptEnhancerCycleSyncEpoch) || 0) !== epoch) return false;
@@ -201,7 +224,8 @@ async function syncPromptCycleFromBackend(node, { force = false } = {}) {
     // or changed cycle mode while this request was in flight, ignore it.
     const currentMode = String(widget(node, "prompt_cycle")?.value ?? "fixed").trim().toLowerCase();
     const currentHistory = promptHistory(node);
-    if (currentMode !== mode || JSON.stringify(currentHistory) !== JSON.stringify(history)) return false;
+    if (currentMode !== mode || promptCycleRevision(node) !== revision ||
+        JSON.stringify(currentHistory) !== JSON.stringify(history)) return false;
 
     const nextIndex = Math.max(0, Math.min(Math.trunc(Number(data.next_index) || 0), currentHistory.length - 1));
     const shuffle = Array.isArray(data.shuffle) ? data.shuffle : [];
@@ -3240,7 +3264,7 @@ function wrapDomPanelSyncCallbacks(node) {
   const widgets = [
     "prompt_preset", "prompt", "enhanced_prompt", "prompt_set", "prompt_cycle", "overwrite_enhanced",
     "enhancement_preset", "enhancement_text", "seed", "enhance_with_workflow",
-    "prompt_history_json", "prompt_history_index", "prompt_shuffle_json",
+    "prompt_history_json", "prompt_history_index", "prompt_cycle_revision", "prompt_shuffle_json",
   ].map((name) => widget(node, name)).filter(Boolean);
   const control = seedControlWidget(node);
   if (control) widgets.push(control);
@@ -3365,7 +3389,7 @@ function installControls(node, isNew = false, preservedSize = null) {
       setWidgetDisplayLabel(linked, "Control After Generate");
     }
   }
-  for (const name of ["prompt_history_json", "prompt_history_index", "prompt_shuffle_json"]) {
+  for (const name of ["prompt_history_json", "prompt_history_index", "prompt_cycle_revision", "prompt_shuffle_json"]) {
     hideInternalWidget(widget(node, name));
   }
 

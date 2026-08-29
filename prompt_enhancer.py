@@ -18,7 +18,7 @@ import folder_paths
 
 log = logging.getLogger(__name__)
 
-NODE_VERSION = "0.6.25-alpha"
+NODE_VERSION = "0.6.26-alpha"
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_DIR = PACKAGE_DIR / "templates" / "default"
 USER_TEMPLATE_DIR = Path(folder_paths.models_dir) / "LLM" / "local_LLM_presets" / "prompt_enhancer"
@@ -956,15 +956,40 @@ def _prompt_preset_names() -> list[str]:
         return []
 
 
-def _prompt_cycle_signature(mode: str, history: list[str]) -> tuple[str, tuple[str, ...]]:
-    return (str(mode or "fixed").strip().lower(), tuple(str(item) for item in history))
+def _normalize_cycle_revision(value: Any) -> int:
+    try:
+        revision = int(value)
+    except (TypeError, ValueError, OverflowError):
+        revision = 0
+    return max(0, min(revision, 0x7FFFFFFF))
 
 
-def _clear_prompt_cycle_state(unique_id: Any) -> None:
+def _prompt_cycle_signature(mode: str, history: list[str], revision: Any = 0) -> tuple[str, tuple[str, ...], int]:
+    return (
+        str(mode or "fixed").strip().lower(),
+        tuple(str(item) for item in history),
+        _normalize_cycle_revision(revision),
+    )
+
+
+def _clear_prompt_cycle_state(unique_id: Any, revision: Any = None) -> None:
+    """Clear an old cursor without letting a delayed browser reset erase a newer run.
+
+    When ``revision`` is supplied, a state already created with that same
+    revision is newer than (or concurrent with) the reset request and must be
+    preserved. Calls from backend-owned lifecycle changes omit the revision and
+    clear unconditionally.
+    """
     key = str(unique_id or "").strip()
     if not key:
         return
+    requested_revision = None if revision is None else _normalize_cycle_revision(revision)
     with _PROMPT_CYCLE_LOCK:
+        state = _PROMPT_CYCLE_STATES.get(key)
+        if state is None:
+            return
+        if requested_revision is not None and _normalize_cycle_revision(state.get("revision", 0)) == requested_revision:
+            return
         _PROMPT_CYCLE_STATES.pop(key, None)
 
 
@@ -981,6 +1006,7 @@ def _prompt_cycle_state_snapshot(
     unique_id: Any,
     mode: str,
     history: list[str],
+    revision: Any = 0,
 ) -> dict[str, Any]:
     """Read the authoritative live cycle cursor without advancing it.
 
@@ -996,7 +1022,7 @@ def _prompt_cycle_state_snapshot(
     if not key or count <= 0:
         return {"valid": False}
 
-    signature = _prompt_cycle_signature(mode, history)
+    signature = _prompt_cycle_signature(mode, history, revision)
     now = time.monotonic()
     with _PROMPT_CYCLE_LOCK:
         _prune_prompt_cycle_states_locked(now)
@@ -1021,6 +1047,7 @@ def _advance_prompt_cycle_backend(
     history: list[str],
     requested_index: int,
     shuffle_state: Any,
+    revision: Any = 0,
 ) -> tuple[int, int, list[int]]:
     """Return (index used now, index for next run, next shuffle bag).
 
@@ -1042,7 +1069,8 @@ def _advance_prompt_cycle_backend(
         next_index, next_shuffle = _next_prompt_index(mode, count, requested, shuffle_state)
         return requested, next_index, next_shuffle
 
-    signature = _prompt_cycle_signature(mode, history)
+    cycle_revision = _normalize_cycle_revision(revision)
+    signature = _prompt_cycle_signature(mode, history, cycle_revision)
     now = time.monotonic()
     with _PROMPT_CYCLE_LOCK:
         _prune_prompt_cycle_states_locked(now)
@@ -1059,6 +1087,7 @@ def _advance_prompt_cycle_backend(
         )
         _PROMPT_CYCLE_STATES[key] = {
             "signature": signature,
+            "revision": cycle_revision,
             "next_index": next_index,
             "shuffle": list(next_shuffle),
             "updated_at": now,
@@ -1220,6 +1249,14 @@ class LocalLLMPromptEnhancer:
                         "max": 0x7FFFFFFF,
                     },
                 ),
+                "prompt_cycle_revision": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 0x7FFFFFFF,
+                    },
+                ),
                 "prompt_shuffle_json": (
                     "STRING",
                     {
@@ -1312,6 +1349,7 @@ class LocalLLMPromptEnhancer:
         enhance_with_workflow: bool = False,
         prompt_history_json: str = "[]",
         prompt_history_index: int = 0,
+        prompt_cycle_revision: int = 0,
         prompt_shuffle_json: str = "[]",
         prompt_preset: str = "Custom",
         settings: Any = None,
@@ -1410,9 +1448,10 @@ class LocalLLMPromptEnhancer:
                 "used_video": video is not None,
                 "used_settings": isinstance(settings, dict),
             }
+            final_manual_prompt = prompts[-1] if prompts and prompts[-1].strip() else (visible_enhanced if visible_enhanced.strip() else source)
             return {
                 "ui": {"prompt_enhancer": [json.dumps(payload, ensure_ascii=False)]},
-                "result": ((visible_enhanced if visible_enhanced.strip() else source), source),
+                "result": (final_manual_prompt, source),
             }
 
         if bool(enhance_with_workflow):
@@ -1447,6 +1486,7 @@ class LocalLLMPromptEnhancer:
             history,
             ui_active_index,
             prompt_shuffle_json,
+            prompt_cycle_revision,
         )
         active_enhanced = history[active_index] if history else visible_enhanced
         effective = active_enhanced if active_enhanced.strip() else source
@@ -1654,7 +1694,8 @@ try:
             body = await request.json()
             if not isinstance(body, dict):
                 raise TypeError("Request body must be an object")
-            _clear_prompt_cycle_state(body.get("node_id"))
+            revision = body.get("revision") if isinstance(body, dict) and "revision" in body else None
+            _clear_prompt_cycle_state(body.get("node_id"), revision)
             return web.json_response({"ok": True})
         except Exception as exc:
             log.exception("[Local LLM Prompt Enhancer] Prompt-cycle reset failed")
@@ -1698,7 +1739,7 @@ try:
         except Exception as exc:
             return _json_error(exc, 500)
 
-    # v0.18.51 keeps the old text-only direct HTTP execution path retired because it
+    # v0.18.52 keeps the old text-only direct HTTP execution path retired because it
     # ran llama.cpp outside ComfyUI's prompt queue and could overlap a newly
     # started diffusion workflow. The frontend now uses the same arm + targeted
     # partial-execution transport for text, image, video, and Settings requests.

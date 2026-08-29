@@ -48,6 +48,19 @@ _MODEL_LOCK = threading.RLock()
 _META_CACHE = {}
 
 
+class LocalLLMInterrupted(RuntimeError):
+    """Intentional user-requested interruption of native LLM work.
+
+    This is distinct from a llama.cpp decode failure: callers should unwind the
+    current request/batch without poisoning the resident-context recovery path.
+    """
+
+
+def _check_cancel(cancel_event):
+    if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+        raise LocalLLMInterrupted("Local LLM operation stopped by user")
+
+
 # ComfyUI/AIMDO integration state. The native llama.cpp allocation is deliberately
 # kept OUTSIDE ComfyUI's LoadedModel/ModelPatcher list. A thin free_memory hook
 # gives the all-or-nothing native context first right of refusal under real
@@ -3616,7 +3629,8 @@ class LocalGGUFLLM:
                  tfs_z, mirostat_mode, mirostat_tau, mirostat_eta, penalize_newline,
                  op_offload, swa_full, rope_freq_base, rope_freq_scale, yarn_ext_factor,
                  yarn_attn_factor, yarn_beta_fast, yarn_beta_slow, yarn_orig_ctx,
-                 stop_sequences, vision_max_images, vision_max_frames, vision_max_edge, verbose, image=None, video_frames=None, messages_override=None, progress_callback=None, token_callback=None):
+                 stop_sequences, vision_max_images, vision_max_frames, vision_max_edge, verbose, image=None, video_frames=None, messages_override=None, progress_callback=None, token_callback=None, cancel_event=None):
+        _check_cancel(cancel_event)
         if model == "No GGUF models found":
             raise FileNotFoundError(f"Put GGUF files in {LLM_DIR}")
         try:
@@ -3992,6 +4006,7 @@ class LocalGGUFLLM:
             except Exception:
                 pass
 
+        _check_cancel(cancel_event)
         started_load = time.perf_counter()
         _perf_log(
             "request load phase begin",
@@ -4246,6 +4261,7 @@ class LocalGGUFLLM:
             comfy_load_models_s=(load_diagnostics or {}).get("comfy_load_models_gpu_seconds"),
             handoff_s=((load_diagnostics or {}).get("preload_memory") or {}).get("handoff_seconds"),
         )
+        _check_cancel(cancel_event)
 
         effective_system = system_prompt.strip()
 
@@ -4311,6 +4327,16 @@ class LocalGGUFLLM:
             mirostat_eta=mirostat_eta,
             penalize_nl=penalize_newline,
         )
+        # Use llama-cpp-python's native stopping-criteria hook so Stop can
+        # terminate generation at the next sampling boundary. On GPU, llama.cpp's
+        # lower-level abort callback is documented as CPU-only, so prompt prefill
+        # itself cannot be torn down safely from another thread; we check the same
+        # event immediately before/after load/prefill and never destroy the native
+        # context concurrently.
+        if cancel_event is not None and hasattr(llama_cpp, "StoppingCriteriaList"):
+            def _stop_on_cancel(_tokens, _scores):
+                return bool(getattr(cancel_event, "is_set", lambda: False)())
+            completion_kwargs["stopping_criteria"] = llama_cpp.StoppingCriteriaList([_stop_on_cancel])
         # Filter kwargs for older llama-cpp-python chat handlers/signatures.
         try:
             call_sig = inspect.signature(llm.create_chat_completion)
@@ -4319,6 +4345,7 @@ class LocalGGUFLLM:
         except Exception:
             pass
 
+        _check_cancel(cancel_event)
         if progress_callback is not None:
             try:
                 progress_callback({"phase": "processing", "completion_tokens": 0, "tokens_per_second": 0.0, "elapsed": 0.0})
@@ -4381,6 +4408,7 @@ class LocalGGUFLLM:
                 def consume_stream(iterator):
                     nonlocal usage, token_events, emitted_any, first_output_at, last_output_at, prompt_perf_at_first, structured_reasoning_seen
                     for chunk in iterator:
+                        _check_cancel(cancel_event)
                         emitted_any = True
                         chunk_map = _as_mapping(chunk)
                         if not chunk_map:
@@ -4523,7 +4551,8 @@ class LocalGGUFLLM:
                         # Streaming failures may be raised while iterating rather
                         # than when create_chat_completion() returns. Close the
                         # iterator first, then discard a native context that has
-                        # exhausted llama.cpp's own decode fallback.
+                        # exhausted llama.cpp's own decode fallback. An intentional
+                        # Stop is not a poisoned decode context.
                         if stream_obj is not None:
                             try:
                                 close_stream = getattr(stream_obj, "close", None)
@@ -4531,7 +4560,8 @@ class LocalGGUFLLM:
                                     close_stream()
                             except Exception:
                                 pass
-                        _mark_decode_context_invalid(exc, llm)
+                        if not isinstance(exc, LocalLLMInterrupted):
+                            _mark_decode_context_invalid(exc, llm)
                         raise
 
                 try:
@@ -4569,6 +4599,7 @@ class LocalGGUFLLM:
                     result["usage"].setdefault("prompt_tokens", 0)
                     result["usage"]["total_tokens"] = int(result["usage"].get("prompt_tokens") or 0) + int(ct)
 
+        _check_cancel(cancel_event)
         request_generation_seconds = time.perf_counter() - started
         perf_after = _perf_delta(_llama_perf_snapshot(llm), perf_before)
         speculative_stats_after = _speculative_stats_snapshot(llm)

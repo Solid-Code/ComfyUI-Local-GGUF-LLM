@@ -1,7 +1,11 @@
-# Local GGUF LLM — v0.18.51 alpha
+# Local GGUF LLM — v0.18.52 alpha
 
 
-## v0.18.51 alpha
+## v0.18.52 alpha
+
+- Prompt Cycle now carries a serialized revision so an explicit X/Y selection wins immediately even if Run is queued before the asynchronous backend reset arrives; stale/background UI still follows the backend-owned cursor.
+- Delayed cycle-reset requests can no longer erase a newer cursor created by an already-started workflow run.
+- A manual Enhance batch now reports its final generated prompt on the `enhanced_prompt` output when its enhancer-only queue item completes.
 
 - Manual Prompt Enhancer queue jobs are now physically pruned to the enhancer node and its upstream dependencies. This prevents unrelated workflow branches from running even on ComfyUI frontend builds that drop partial-execution targeting metadata.
 
@@ -9,7 +13,7 @@
 - **The Enhance batch owns its full queue lifetime:** all internal LLM iterations plus the final native llama.cpp VRAM suspend happen before the single Prompt Enhancer queue item returns, so the next queued diffusion job cannot begin early.
 - **Queued-snapshot reconciliation:** workflows queued during the batch may have serialized the Prompt Enhancer before all progress updates reached the browser. The backend now recognizes pre-batch/intermediate history snapshots and upgrades them to the completed batch history when those queued jobs execute, without delaying queue submission.
 - Removed the v0.18.49 informational “Workflow queued until…” Run gate/notification.
-- Prompt Enhancer frontend: **v0.6.25-alpha**.
+- Prompt Enhancer frontend: **v0.6.26-alpha**.
 
 
 ## v0.18.49 alpha
@@ -40,7 +44,7 @@ This package includes:
 
 - **Local LLM Generate** — send prompts, images, and sampled video frames to the persistent local LLM.
 - **Local LLM Settings** — reusable model/generation settings with loadable Complete Settings Presets. Memory/performance tuning remains in the Local LLM service panel rather than crowding the workflow node.
-- **Local LLM Prompt Enhancer** — bundled **v0.6.25-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
+- **Local LLM Prompt Enhancer** — bundled **v0.6.26-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
 - **Local LLM Server panel** — model loading, presets, memory/VRAM controls, status, performance information, and the optional OpenAI-compatible API.
 
 
@@ -69,7 +73,7 @@ ComfyUI/custom_nodes/ComfyUI-Local-GGUF-LLM/
 
 Restart ComfyUI, then hard-refresh the browser if an older frontend is still cached.
 
-Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.25-alpha is already bundled here.
+Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.26-alpha is already bundled here.
 
 ## GGUF model folders
 
@@ -368,6 +372,8 @@ POST /local-llm/v1/completions
 
 `/local-llm/v1/chat/completions` supports streaming responses. Configure the API key and external-access options in the LLM panel before using an external client such as SillyTavern.
 
+`GET /local-llm/v1/models` also advertises the **configured usable context window** through `context_length`, `max_context_length`, and `n_ctx`. When the GGUF exposes its native/training context metadata, `n_ctx_train` is included separately. These are compatibility extensions: strict OpenAI clients can ignore them, while local clients that understand them can auto-size their context window.
+
 External GPU requests coordinate with ComfyUI GPU execution so the persistent LLM does not intentionally race a diffusion/video workload during VRAM handoff.
 
 ## Model residency and ComfyUI VRAM
@@ -380,6 +386,10 @@ The service is designed to coexist with normal ComfyUI model workloads.
 - **Auto Start** loads shortly after ComfyUI starts.
 
 Changing model-allocation settings requires a native model reload. Request-local prompts and sampler values do not.
+
+### Stop / Unload
+
+**Stop / Unload** is a global Local LLM interrupt and remains available while the service is loading, waiting for ComfyUI, evaluating a prompt, generating, running an Enhance batch, or running the performance tuner. A Stop request immediately cancels the active/queued Local LLM request generation epoch; native llama.cpp teardown is deferred until the active native call reaches a safe return boundary. This avoids destroying a live CUDA context from another thread. On GPU, a large native model load or prompt-prefill cannot be forcibly torn down mid-kernel, so Stop becomes effective at the next safe llama.cpp/Python boundary and then unloads the model. It does not invoke ComfyUI's global workflow interrupt.
 
 ## Updating
 

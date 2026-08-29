@@ -43,6 +43,7 @@ from .nodes import (
     _RELOAD_VRAM_MARGIN,
     _MODEL_CACHE,
     _MODEL_LOCK,
+    LocalLLMInterrupted,
 )
 from .gguf_meta import detect_family, recommended_model_preset, available_model_presets
 from .presets import MEMORY_PRESETS, MODEL_PRESETS, capabilities_for_family, public_presets
@@ -737,6 +738,16 @@ class LocalLLMServiceAPI:
         return self.generate(*args, **kwargs)["response"]
 
 
+class _RequestCancelToken:
+    """Generation-scoped cancellation token backed by the service stop epoch."""
+    def __init__(self, manager, epoch):
+        self._manager = manager
+        self._epoch = int(epoch)
+    def is_set(self):
+        with self._manager._state_lock:
+            return int(self._manager._stop_epoch) != self._epoch
+
+
 class LocalLLMServiceManager:
     def __init__(self):
         self._config_lock = threading.RLock()
@@ -766,6 +777,10 @@ class LocalLLMServiceManager:
         self._tuner_lock = threading.RLock()
         self._tuner_thread = None
         self._tuner_cancel = threading.Event()
+        self._stop_epoch = 0
+        self._stop_pending = threading.Event()
+        self._stop_worker_lock = threading.RLock()
+        self._stop_thread = None
         self._tuner = {
             "state": "idle", "phase": "Idle", "progress": 0.0, "candidate_index": 0,
             "candidate_total": 0, "current_candidate": None, "results": [],
@@ -844,13 +859,16 @@ class LocalLLMServiceManager:
         elapsed = float(update.get("elapsed") or 0.0)
         with self._state_lock:
             previous_state = self._state
+            stopping = self._stop_pending.is_set() or previous_state == STATE_STOPPING
             if phase == "loading":
-                self._state = STATE_LOADING
+                if not stopping:
+                    self._state = STATE_LOADING
                 self._current_phase_started = time.time()
                 self._current_completion_tokens = 0
                 self._current_tokens_per_second = 0.0
             elif phase == "processing":
-                self._state = STATE_PROCESSING
+                if not stopping:
+                    self._state = STATE_PROCESSING
                 self._current_phase_started = time.time()
                 self._current_completion_tokens = 0
                 self._current_tokens_per_second = 0.0
@@ -859,7 +877,8 @@ class LocalLLMServiceManager:
                     self._current_phase_started = time.time()
                 # No token stream event arrives until prompt evaluation has finished;
                 # generation progress is therefore the prompt->decode transition.
-                self._state = STATE_GENERATING
+                if not stopping:
+                    self._state = STATE_GENERATING
                 self._current_completion_tokens = tokens
                 self._current_tokens_per_second = speed
                 self._current_prompt_tokens = prompt_tokens
@@ -1053,7 +1072,7 @@ class LocalLLMServiceManager:
         except Exception:
             return []
 
-    def _wait_for_comfy_idle(self, reason="LLM GPU request"):
+    def _wait_for_comfy_idle(self, reason="LLM GPU request", cancel_event=None):
         """Serialize external/native LLM GPU work behind active ComfyUI execution.
 
         Calling ComfyUI's memory manager from another thread while diffusion CUDA
@@ -1066,6 +1085,8 @@ class LocalLLMServiceManager:
         logged = False
         started = time.perf_counter()
         while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise LocalLLMInterrupted("Local LLM operation stopped by user")
             running = self._comfy_running_jobs()
             if not running:
                 elapsed = time.perf_counter() - started
@@ -1084,7 +1105,7 @@ class LocalLLMServiceManager:
     def _is_workflow_client(client):
         return str(client or "").startswith("ComfyUI Local LLM Generate")
 
-    def _warm_load(self):
+    def _warm_load(self, cancel_event=None):
         args = self._call_args()
         model = args.get("model")
         if not model or model == "No GGUF models found":
@@ -1096,6 +1117,7 @@ class LocalLLMServiceManager:
             "max_tokens": 1,
             "seed": 0,
             "messages_override": [{"role": "user", "content": "Respond with OK."}],
+            "cancel_event": cancel_event,
         })
         response, thinking, info_json, tokens, api = LocalGGUFLLM().generate(**args)
         self._api = api
@@ -1106,13 +1128,19 @@ class LocalLLMServiceManager:
         self._last_result = {"response": response, "thinking": thinking, "info": info, "tokens": int(tokens)}
 
     def start(self, wait_for_comfy=True):
-        # Lifecycle changes and generation must never manipulate the same native
-        # llama.cpp context concurrently. External starts wait for ComfyUI to go
-        # idle *before* taking the generation lock so an active workflow cannot
-        # deadlock waiting for this service later in the same prompt.
+        # Capture the current stop epoch so a Stop click can cancel both a
+        # ComfyUI-idle wait and the warm-load request without destroying native
+        # llama.cpp state concurrently.
+        with self._state_lock:
+            if self._state == STATE_STOPPING:
+                return self.status()
+            epoch = self._stop_epoch
+        cancel_token = _RequestCancelToken(self, epoch)
         if wait_for_comfy:
-            self._wait_for_comfy_idle("loading the LLM")
+            self._wait_for_comfy_idle("loading the LLM", cancel_event=cancel_token)
         with self._generation_lock:
+            if cancel_token.is_set():
+                raise LocalLLMInterrupted("Local LLM start stopped by user")
             with self._state_lock:
                 if self._state in {STATE_RELOADING, STATE_PROCESSING, STATE_GENERATING, STATE_STOPPING, STATE_TUNING}:
                     return self.status()
@@ -1123,13 +1151,22 @@ class LocalLLMServiceManager:
             self._emit()
             self._log("Loading persistent GGUF service")
             try:
-                self._warm_load()
+                self._warm_load(cancel_event=cancel_token)
+                if cancel_token.is_set():
+                    raise LocalLLMInterrupted("Local LLM start stopped by user")
                 with self._state_lock:
                     self._state = STATE_READY
                     self._model_loaded = True
                     self._restart_required = False
                     self._error = None
                 self._log("Model loaded; service ready")
+            except LocalLLMInterrupted:
+                with self._state_lock:
+                    if self._state != STATE_STOPPING:
+                        self._state = STATE_READY if self._api is not None else STATE_STOPPED
+                    self._error = None
+                self._log("LLM start interrupted by Stop")
+                raise
             except Exception as e:
                 with self._state_lock:
                     self._state = STATE_ERROR
@@ -1199,41 +1236,83 @@ class LocalLLMServiceManager:
                 self._emit()
         return self.status()
 
-    def stop(self):
-        if self.tuner_status().get("running"):
-            raise RuntimeError("Cancel the performance tuner before stopping the service")
-        # Serialize teardown behind any active request. This closes the race where
-        # Stop/Reload could clear Llama internals while a request was still using
-        # the chat formatter/tokenizer or collecting post-generation metrics.
-        with self._generation_lock:
+    def _stop_worker_main(self):
+        """Finish teardown only after active native work has safely unwound."""
+        try:
+            with self._tuner_lock:
+                tuner_thread = self._tuner_thread
+            if tuner_thread is not None and tuner_thread.is_alive() and tuner_thread is not threading.current_thread():
+                tuner_thread.join()
+
+            with self._generation_lock:
+                self._log("Stop barrier reached; unloading persistent GGUF")
+                try:
+                    _cleanup_llm()
+                finally:
+                    with self._state_lock:
+                        self._api = None
+                        self._model_loaded = False
+                        self._state = STATE_STOPPED
+                        self._error = None
+                        self._restart_required = False
+                        self._clear_current_request_locked(phase=True, metrics=True)
+                    self._stop_pending.clear()
+                    self._emit()
+                    self._log("Local LLM service stopped and native model unloaded")
+        except Exception as e:
             with self._state_lock:
-                if self._state == STATE_STOPPED:
-                    return self.status()
-                self._state = STATE_STOPPING
+                self._state = STATE_ERROR
+                self._error = f"{type(e).__name__}: {e}"
+            self._stop_pending.clear()
+            self._log(self._error, "error")
             self._emit()
-            self._log("Stopping service and unloading persistent GGUF")
-            try:
-                _cleanup_llm()
-            finally:
-                with self._state_lock:
-                    self._api = None
-                    self._model_loaded = False
-                    self._state = STATE_STOPPED
-                    self._error = None
-                    self._restart_required = False
-                    self._clear_current_request_locked()
-                self._emit()
+        finally:
+            with self._stop_worker_lock:
+                if self._stop_thread is threading.current_thread():
+                    self._stop_thread = None
+
+    def stop(self):
+        """Request a global LLM interrupt immediately and tear down safely.
+
+        This call never waits behind `_generation_lock`. Advancing the stop epoch
+        cancels the active request and all LLM requests already queued behind it.
+        A background worker unloads llama.cpp only after those calls unwind, which
+        avoids the CUDA/context corruption caused by destroying a live context from
+        another thread. GPU prompt-prefill can only stop at llama.cpp's next safe
+        Python/sampling boundary; current llama.cpp abort callbacks are CPU-only.
+        """
+        with self._state_lock:
+            if self._state == STATE_STOPPED and not self._stop_pending.is_set():
+                return self.status()
+            if not self._stop_pending.is_set():
+                self._stop_epoch += 1
+                self._stop_pending.set()
+            self._state = STATE_STOPPING
+            self._error = None
+        self._tuner_cancel.set()
+        self._emit()
+        self._log("Stop requested; interrupting active/queued LLM work")
+
+        with self._stop_worker_lock:
+            if self._stop_thread is None or not self._stop_thread.is_alive():
+                worker = threading.Thread(target=self._stop_worker_main, name="LocalLLMStopWorker", daemon=True)
+                self._stop_thread = worker
+                worker.start()
         return self.status()
 
     def reload(self, wait_for_comfy=True):
         if self.tuner_status().get("running"):
             raise RuntimeError("Cancel the performance tuner before reloading the service")
-        # Wait for an external ComfyUI workflow before taking the generation lock;
-        # otherwise that workflow could later block on this same lock at its LLM
-        # node while Reload is waiting for the workflow to finish.
+        with self._state_lock:
+            if self._state == STATE_STOPPING:
+                return self.status()
+            epoch = self._stop_epoch
+        cancel_token = _RequestCancelToken(self, epoch)
         if wait_for_comfy:
-            self._wait_for_comfy_idle("reloading the LLM")
+            self._wait_for_comfy_idle("reloading the LLM", cancel_event=cancel_token)
         with self._generation_lock:
+            if cancel_token.is_set():
+                raise LocalLLMInterrupted("Local LLM reload stopped by user")
             with self._state_lock:
                 self._state = STATE_RELOADING
                 self._error = None
@@ -1241,12 +1320,24 @@ class LocalLLMServiceManager:
             try:
                 _cleanup_llm()
                 self._api = None
-                self._warm_load()
+                if cancel_token.is_set():
+                    raise LocalLLMInterrupted("Local LLM reload stopped by user")
+                self._warm_load(cancel_event=cancel_token)
+                if cancel_token.is_set():
+                    raise LocalLLMInterrupted("Local LLM reload stopped by user")
                 with self._state_lock:
                     self._state = STATE_READY
                     self._model_loaded = True
                     self._restart_required = False
+                    self._error = None
                 self._log("Model reloaded")
+            except LocalLLMInterrupted:
+                with self._state_lock:
+                    if self._state != STATE_STOPPING:
+                        self._state = STATE_READY if self._api is not None else STATE_STOPPED
+                    self._error = None
+                self._log("LLM reload interrupted by Stop")
+                raise
             except Exception as e:
                 with self._state_lock:
                     self._state = STATE_ERROR
@@ -1333,7 +1424,11 @@ class LocalLLMServiceManager:
         )
 
         with self._state_lock:
+            if self._state == STATE_STOPPING:
+                raise LocalLLMInterrupted("Local LLM service is stopping")
+            request_epoch = self._stop_epoch
             self._queue_count += 1
+        cancel_token = _RequestCancelToken(self, request_epoch)
         self._emit()
         queued_at = time.perf_counter()
         try:
@@ -1342,6 +1437,8 @@ class LocalLLMServiceManager:
                 queue_wait_seconds = generation_lock_acquired - queued_at
                 with self._state_lock:
                     self._queue_count = max(0, self._queue_count - 1)
+                if cancel_token.is_set():
+                    raise LocalLLMInterrupted("Queued Local LLM request cancelled by Stop")
                 # External API clients must not run llama.cpp CUDA work concurrently
                 # with an executing ComfyUI workflow.  In particular, a managed
                 # on-demand reload may call mm.free_memory(), which is unsafe while
@@ -1349,7 +1446,9 @@ class LocalLLMServiceManager:
                 workflow_owned = self._is_workflow_client(client)
                 comfy_wait_seconds = 0.0
                 if not workflow_owned:
-                    comfy_wait_seconds = float(self._wait_for_comfy_idle("servicing the LLM request") or 0.0)
+                    comfy_wait_seconds = float(self._wait_for_comfy_idle("servicing the LLM request", cancel_event=cancel_token) or 0.0)
+                if cancel_token.is_set():
+                    raise LocalLLMInterrupted("Local LLM request cancelled by Stop")
                 ensure_started_at = time.perf_counter()
                 if temporary_load_change or snapshot_clean is not None:
                     # Request-local Settings and Prompt Enhancer batch snapshots
@@ -1365,6 +1464,8 @@ class LocalLLMServiceManager:
                 else:
                     self._ensure_started(workflow_owned=workflow_owned)
                 ensure_started_seconds = time.perf_counter() - ensure_started_at
+                if cancel_token.is_set():
+                    raise LocalLLMInterrupted("Local LLM request cancelled by Stop")
                 request_needs_reload = temporary_load_change or not self._resident_snapshot()
                 self._log(
                     "PERF request preflight: "
@@ -1374,6 +1475,8 @@ class LocalLLMServiceManager:
                     f"resident_before_call={not request_needs_reload}"
                 )
                 with self._state_lock:
+                    if cancel_token.is_set():
+                        raise LocalLLMInterrupted("Local LLM request cancelled by Stop")
                     self._state = STATE_LOADING if request_needs_reload else STATE_PROCESSING
                     self._model_loaded = True
                     self._current_client = str(client)
@@ -1422,6 +1525,7 @@ class LocalLLMServiceManager:
                     args["video_frames"] = video_frames
                 args["progress_callback"] = self._progress
                 args["token_callback"] = token_callback
+                args["cancel_event"] = cancel_token
                 node_call_started = time.perf_counter()
                 try:
                     response, thinking, info_json, tokens, api = LocalGGUFLLM().generate(**args)
@@ -1559,9 +1663,16 @@ class LocalLLMServiceManager:
                 )
                 self._log(f"Request complete in {elapsed:.2f}s" + (f" at {speed} tok/s" if speed is not None else ""))
                 return result
+        except LocalLLMInterrupted as e:
+            with self._state_lock:
+                if self._state != STATE_STOPPING:
+                    self._state = STATE_READY if self._api is not None else STATE_STOPPED
+                self._error = None
+                self._clear_current_request_locked(phase=True, metrics=True)
+            self._log(f"LLM request interrupted: {e}")
+            raise
         except Exception as e:
             with self._state_lock:
-                self._queue_count = max(0, self._queue_count - 1)
                 # A request error should not mark the whole service unusable if the
                 # model is still resident. Keep READY when possible.
                 self._state = STATE_READY if self._api is not None and self._api.is_loaded() else STATE_ERROR
@@ -1875,6 +1986,7 @@ class LocalLLMServiceManager:
             "seed": 8675309,
             "progress_callback": None,
             "token_callback": None,
+            "cancel_event": self._tuner_cancel,
         })
 
         # Warm once before measurement. This primes backend/JIT state and, with
@@ -2331,7 +2443,7 @@ class LocalLLMServiceManager:
                     f"Performance tuner complete: {improvement*100:.1f}% {score_name} improvement • "
                     f"recommendation={recommendation_patch or 'current settings'}"
                 )
-        except InterruptedError:
+        except (InterruptedError, LocalLLMInterrupted):
             self._set_tuner(
                 state="cancelled", phase="Cancelled", progress=0.0, current_candidate=None,
                 results=results, finished_at=time.time(), message="Cancelled after the current benchmark trial.",
@@ -2347,6 +2459,10 @@ class LocalLLMServiceManager:
             # Restore the user's saved load signature rather than leaving the last
             # benchmark candidate resident. This does not save any tuner result.
             try:
+                if self._stop_pending.is_set():
+                    # Global Stop owns final cleanup. Do not start a restore/warmup
+                    # after the tuner was cancelled by Stop.
+                    return
                 if self._api is not None:
                     restore_args = self._call_args()
                     restore_args.update({
@@ -3039,6 +3155,8 @@ try:
         try:
             status = await asyncio.to_thread(SERVICE.start)
             return web.json_response(status)
+        except LocalLLMInterrupted:
+            return web.json_response(SERVICE.status())
         except Exception as e:
             return _json_error(e, 500)
 
@@ -3063,6 +3181,8 @@ try:
         try:
             status = await asyncio.to_thread(SERVICE.reload)
             return web.json_response(status)
+        except LocalLLMInterrupted:
+            return web.json_response(SERVICE.status())
         except Exception as e:
             return _json_error(e, 500)
 
@@ -3081,7 +3201,32 @@ try:
             return _json_error(reason, 401 if SERVICE.get_config().get("api_key") else 403)
         cfg = SERVICE.get_config()
         model = str(cfg.get("model") or "local-llm")
-        return web.json_response({"object": "list", "data": [{"id": model, "object": "model", "created": 0, "owned_by": "local-llm-server"}]})
+        configured_ctx = int(_normalize_context_size(cfg.get("context_size"), model) or 0)
+        try:
+            md = _metadata_for(model) if model and model != "No GGUF models found" else {}
+        except Exception:
+            md = {}
+        native_ctx = _native_context_length(md or {})
+        # OpenAI does not standardize a context-length field on /v1/models.
+        # Advertise the common local-server spellings while retaining a strict
+        # OpenAI-compatible core; clients that do not recognize them ignore them.
+        item = {
+            "id": model,
+            "object": "model",
+            "created": 0,
+            "owned_by": "local-llm-server",
+            "context_length": configured_ctx,
+            "max_context_length": configured_ctx,
+            "n_ctx": configured_ctx,
+            "meta": {
+                "context_length": configured_ctx,
+                "n_ctx": configured_ctx,
+                "n_ctx_train": int(native_ctx) if native_ctx else None,
+            },
+        }
+        if native_ctx:
+            item["n_ctx_train"] = int(native_ctx)
+        return web.json_response({"object": "list", "data": [item]})
 
     def _request_overrides(body):
         mapping = {
@@ -3227,9 +3372,17 @@ try:
                         disconnected = True
                         break
 
-                # Even if the browser disconnects, let the native request finish
-                # cleanly so model/context state and locks are not abandoned.
-                result = await generation_task
+                # Even if the browser disconnects, let the native request unwind
+                # cleanly so model/context state and locks are not abandoned. A
+                # global Stop is an intentional finish, not a transport failure.
+                try:
+                    result = await generation_task
+                except LocalLLMInterrupted:
+                    if not disconnected:
+                        await write_chunk({}, finish_reason="stop")
+                        await _finish_sse(stream)
+                    SERVICE._log(f"OpenAI SSE interrupted by Stop for {client}")
+                    return stream
                 payload = _openai_response(result, requested_model)
                 final_content = str(payload["choices"][0]["message"].get("content") or "")
                 final_reasoning = str(payload["choices"][0]["message"].get("reasoning_content") or "")
@@ -3272,6 +3425,8 @@ try:
                 overrides=overrides,
             )
             return web.json_response(_openai_response(result, requested_model))
+        except LocalLLMInterrupted as e:
+            return _json_error(e, 409)
         except Exception as e:
             return _json_error(e, 500)
 
@@ -3353,7 +3508,14 @@ try:
                         disconnected = True
                         break
 
-                result = await generation_task
+                try:
+                    result = await generation_task
+                except LocalLLMInterrupted:
+                    if not disconnected:
+                        await write_text_chunk("", finish_reason="stop")
+                        await _finish_sse(stream)
+                    SERVICE._log(f"OpenAI text SSE interrupted by Stop for {client}")
+                    return stream
                 final_content = str(result.get("response") or "")
                 info = result.get("info") or {}
                 usage = {
@@ -3398,6 +3560,8 @@ try:
                     "total_tokens": int(result.get("tokens") or info.get("total_tokens") or 0),
                 },
             })
+        except LocalLLMInterrupted as e:
+            return _json_error(e, 409)
         except Exception as e:
             return _json_error(e, 500)
 

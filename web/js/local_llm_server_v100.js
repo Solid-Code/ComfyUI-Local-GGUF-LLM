@@ -1155,8 +1155,15 @@ function updateActionButtons() {
     suspend.title = yielded ? "Model is already suspended / yielded" : (resident ? "Release LLM VRAM while preserving fast-reload state" : "No resident model to suspend");
   }
   if (stop) {
-    stop.disabled = busy || !serviceActive;
-    stop.title = serviceActive ? "Stop the service and fully clear the model/load state" : "Service is not running";
+    // Stop is an interrupt control, not a normal lifecycle action. It must stay
+    // clickable during load, prompt processing, generation, ComfyUI waits, the
+    // performance tuner, and error states. The backend makes repeated Stop clicks
+    // idempotent and performs native teardown only after active work unwinds.
+    const canStop = status.state !== "stopped";
+    stop.disabled = !canStop;
+    stop.title = canStop
+      ? "Interrupt all Local LLM work, cancel queued LLM requests, and unload safely"
+      : "Service is already stopped";
   }
   if (reload) {
     const batchActive = enhancementBatchActive();
