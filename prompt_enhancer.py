@@ -18,7 +18,7 @@ import folder_paths
 
 log = logging.getLogger(__name__)
 
-NODE_VERSION = "0.6.18-alpha"
+NODE_VERSION = "0.6.24-alpha"
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_DIR = PACKAGE_DIR / "templates" / "default"
 USER_TEMPLATE_DIR = Path(folder_paths.models_dir) / "LLM" / "local_LLM_presets" / "prompt_enhancer"
@@ -57,6 +57,15 @@ _PENDING_TTL_SECONDS = 300.0
 _BATCH_LOCK = threading.Lock()
 _BATCH_SESSIONS: dict[str, dict[str, Any]] = {}
 _BATCH_TTL_SECONDS = 2 * 60 * 60.0
+
+# A normal workflow can be queued while a manual Enhance batch is still the
+# active ComfyUI queue item. ComfyUI serializes that later workflow immediately,
+# so its Prompt Enhancer widgets may represent the pre-batch (or an intermediate
+# progress) array. Keep the completed batch result briefly in the backend and
+# reconcile those already-queued snapshots when they eventually execute.
+_MANUAL_HISTORY_LOCK = threading.Lock()
+_MANUAL_HISTORY_STATES: dict[str, dict[str, Any]] = {}
+_MANUAL_HISTORY_TTL_SECONDS = 30 * 60.0
 
 # Prompt Cycle used to advance only when the browser processed ComfyUI's
 # `executed` event. Background tabs can throttle/delay that JavaScript, causing
@@ -572,12 +581,44 @@ def _normalize_seed(seed: Any) -> int:
     return value
 
 
-def _arm_request(node_id: str, prompt: str, enhancement_text: str, seed: Any = 0, batch_id: Any = "") -> str:
+def _arm_request(
+    node_id: str,
+    prompt: str,
+    enhancement_text: str,
+    seed: Any = 0,
+    batch_id: Any = "",
+    seeds: Any = None,
+    batch_count: Any = 1,
+    prompt_history_json: Any = "[]",
+    prompt_history_index: Any = 0,
+    enhanced_prompt: Any = "",
+    overwrite_enhanced: Any = False,
+) -> str:
     node_id = str(node_id or "").strip()
     if not node_id:
         raise ValueError("Missing Prompt Enhancer node id.")
     # Validate now so a malformed request fails before ComfyUI queues anything.
     _messages_for(prompt, enhancement_text)
+
+    try:
+        requested_count = int(batch_count)
+    except (TypeError, ValueError, OverflowError):
+        requested_count = 1
+    requested_count = max(1, min(64, requested_count))
+
+    seed_values: list[int] = []
+    if isinstance(seeds, list):
+        for value in seeds[:64]:
+            seed_values.append(_normalize_seed(value))
+    if not seed_values:
+        seed_values = [_normalize_seed(seed)]
+    if len(seed_values) < requested_count:
+        # Old/stale frontends only send one seed. Repeating it is the safest
+        # compatibility behavior; the current frontend sends the complete
+        # standard Control After Generate seed sequence for the whole batch.
+        seed_values.extend([seed_values[-1]] * (requested_count - len(seed_values)))
+    seed_values = seed_values[:requested_count]
+
     token = uuid.uuid4().hex
     with _PENDING_LOCK:
         _prune_pending_locked()
@@ -585,8 +626,14 @@ def _arm_request(node_id: str, prompt: str, enhancement_text: str, seed: Any = 0
             "token": token,
             "prompt": str(prompt or ""),
             "enhancement_text": str(enhancement_text or ""),
-            "seed": _normalize_seed(seed),
+            "seed": seed_values[0],
+            "seeds": seed_values,
+            "batch_count": len(seed_values),
             "batch_id": str(batch_id or "").strip(),
+            "prompt_history_json": str(prompt_history_json or "[]"),
+            "prompt_history_index": prompt_history_index,
+            "enhanced_prompt": str(enhanced_prompt or ""),
+            "overwrite_enhanced": bool(overwrite_enhanced),
             "created": time.monotonic(),
         }
     return token
@@ -629,6 +676,7 @@ def _run_enhancement(
     seed: Any = 0,
     settings: Any = None,
     batch_id: Any = "",
+    yield_after: bool = False,
 ) -> dict[str, Any]:
     frames = _video_frames(video) if video is not None else None
     messages = _messages_for(
@@ -650,28 +698,90 @@ def _run_enhancement(
     # for each enhancement; this preserves resident GGUF/model allocations while
     # paying the very small prompt-prefill cost again.
     overrides["prompt_cache_mode"] = "Off"
-    result = service.generate_messages(
-        messages,
-        image=images,
-        video_frames=frames,
-        client=client,
-        overrides=overrides,
-        runtime_config=runtime_config,
-        config_snapshot=config_snapshot,
-    )
-    revised = _clean_response((result or {}).get("response", ""))
-    if not revised:
-        thinking = str((result or {}).get("thinking", "") or "").strip()
-        if thinking:
-            raise RuntimeError(
-                "The Local LLM produced reasoning but no final prompt text. Review Thinking Mode, max tokens, or stop sequences."
-            )
-        raise RuntimeError("The Local LLM returned an empty prompt.")
-    return {
-        "prompt": revised,
-        "tokens": int((result or {}).get("tokens") or 0),
-        "info": (result or {}).get("info") or {},
-    }
+    result = None
+    try:
+        result = service.generate_messages(
+            messages,
+            image=images,
+            video_frames=frames,
+            client=client,
+            overrides=overrides,
+            runtime_config=runtime_config,
+            config_snapshot=config_snapshot,
+        )
+        revised = _clean_response((result or {}).get("response", ""))
+        if not revised:
+            thinking = str((result or {}).get("thinking", "") or "").strip()
+            if thinking:
+                raise RuntimeError(
+                    "The Local LLM produced reasoning but no final prompt text. Review Thinking Mode, max tokens, or stop sequences."
+                )
+            raise RuntimeError("The Local LLM returned an empty prompt.")
+        return {
+            "prompt": revised,
+            "tokens": int((result or {}).get("tokens") or 0),
+            "info": (result or {}).get("info") or {},
+        }
+    finally:
+        # Manual Enhance is commonly followed immediately by a GPU-heavy ComfyUI
+        # workflow. With Auto Yield, release the native llama.cpp allocation at a
+        # controlled boundary *before* returning control to the UI rather than
+        # making the next workflow discover and evict it inside mm.free_memory().
+        # Multi-item batches keep the model hot between items and suspend once in
+        # batch_end instead. Driver-managed/Keep Resident configurations are a
+        # no-op here because there is no managed native residency controller.
+        if bool(yield_after):
+            try:
+                service.suspend(reason="prompt-enhancer-complete")
+            except Exception as suspend_exc:
+                log.warning(
+                    "[Local LLM Prompt Enhancer] Post-enhance Auto-Yield failed: %s",
+                    suspend_exc,
+                )
+
+
+def _publish_manual_batch_progress(
+    node_id: Any,
+    token: str,
+    index: int,
+    total: int,
+    result: dict[str, Any],
+    *,
+    used_images: bool = False,
+    used_video: bool = False,
+    used_settings: bool = False,
+) -> None:
+    """Best-effort browser progress while one ComfyUI queue item owns the batch.
+
+    The final executed payload always contains the complete result list, so this
+    event is only for responsive UI/history updates and is safe to miss (for
+    example while a browser tab is throttled).
+    """
+    try:
+        from server import PromptServer
+
+        server = getattr(PromptServer, "instance", None)
+        sender = getattr(server, "send_sync", None)
+        if not callable(sender):
+            return
+        sender(
+            "local_llm_prompt_enhancer_batch_progress",
+            {
+                "node_id": str(node_id or ""),
+                "token": str(token or ""),
+                "index": int(index),
+                "total": int(total),
+                "prompt": str((result or {}).get("prompt") or ""),
+                "tokens": int((result or {}).get("tokens") or 0),
+                "used_images": bool(used_images),
+                "used_video": bool(used_video),
+                "used_settings": bool(used_settings),
+            },
+        )
+    except Exception:
+        # Never fail an enhancement because a UI progress event could not be
+        # delivered; the normal ComfyUI executed event remains authoritative.
+        pass
 
 
 def _parse_prompt_history(value: Any, enhanced_prompt: str = "") -> list[str]:
@@ -695,6 +805,90 @@ def _normalize_history_index(value: Any, count: int) -> int:
     except (TypeError, ValueError, OverflowError):
         index = 0
     return max(0, min(index, count - 1))
+
+
+def _manual_history_signature(history: list[str], index: int) -> tuple[tuple[str, ...], int]:
+    clean = [str(item) for item in history]
+    active = _normalize_history_index(index, len(clean))
+    return tuple(clean), active
+
+
+def _prune_manual_history_locked(now: float | None = None) -> None:
+    now = time.monotonic() if now is None else now
+    stale = [
+        node_id for node_id, state in _MANUAL_HISTORY_STATES.items()
+        if now - float(state.get("created", 0.0)) > _MANUAL_HISTORY_TTL_SECONDS
+    ]
+    for node_id in stale:
+        _MANUAL_HISTORY_STATES.pop(node_id, None)
+
+
+def _store_manual_batch_history(node_id: Any, pending: dict[str, Any], prompts: list[str]) -> None:
+    """Remember all pre/final batch history stages for already-queued workflows.
+
+    While this single batch queue item is running the browser may receive zero,
+    some, or all progress events before the user queues the next workflow. Each
+    queued workflow therefore can contain any intermediate prompt-array stage.
+    All such stages are safe to upgrade to the authoritative completed array.
+    """
+    key = str(node_id or "").strip()
+    if not key:
+        return
+
+    history = _parse_prompt_history(pending.get("prompt_history_json", "[]"), pending.get("enhanced_prompt", ""))
+    index = _normalize_history_index(pending.get("prompt_history_index", 0), len(history))
+    visible = str(pending.get("enhanced_prompt", "") or "")
+    if history:
+        history[index] = visible
+
+    accepted: set[tuple[tuple[str, ...], int]] = {_manual_history_signature(history, index)}
+    overwrite = bool(pending.get("overwrite_enhanced", False))
+    for batch_index, value in enumerate(prompts):
+        text = str(value or "")
+        if not text.strip():
+            continue
+        if batch_index == 0 and overwrite and history:
+            history[index] = text
+        else:
+            history.append(text)
+            index = len(history) - 1
+        accepted.add(_manual_history_signature(history, index))
+
+    with _MANUAL_HISTORY_LOCK:
+        _prune_manual_history_locked()
+        _MANUAL_HISTORY_STATES[key] = {
+            "created": time.monotonic(),
+            "accepted": accepted,
+            "history": list(history),
+            "index": _normalize_history_index(index, len(history)),
+        }
+
+
+def _reconcile_queued_manual_history(
+    node_id: Any,
+    history: list[str],
+    index: int,
+    visible_enhanced: str,
+) -> tuple[list[str], int, str, bool]:
+    """Upgrade a workflow snapshot queued while its Enhance batch was active."""
+    key = str(node_id or "").strip()
+    clean = [str(item) for item in history]
+    active = _normalize_history_index(index, len(clean))
+    visible = str(visible_enhanced or "")
+    if clean:
+        clean[active] = visible
+    incoming = _manual_history_signature(clean, active)
+
+    with _MANUAL_HISTORY_LOCK:
+        _prune_manual_history_locked()
+        state = _MANUAL_HISTORY_STATES.get(key)
+        if not state or incoming not in state.get("accepted", set()):
+            return clean, active, visible, False
+        final_history = [str(item) for item in state.get("history", [])]
+        final_index = _normalize_history_index(state.get("index", 0), len(final_history))
+
+    final_visible = final_history[final_index] if final_history else visible
+    return final_history, final_index, final_visible, True
 
 
 def _parse_shuffle_state(value: Any, count: int, current_index: int) -> list[int]:
@@ -1129,11 +1323,14 @@ class LocalLLMPromptEnhancer:
         history = _parse_prompt_history(prompt_history_json, enhanced_prompt)
         ui_active_index = _normalize_history_index(prompt_history_index, len(history))
         visible_enhanced = str(enhanced_prompt or "")
-        if history:
-            # Enhanced Prompt is the editable view of the browser's active array
-            # entry. Preserve that edit in the history even when the backend is
-            # already ahead because the tab was backgrounded.
-            history[ui_active_index] = visible_enhanced
+        # Normal ComfyUI workflows may have been queued while this node's manual
+        # Enhance batch was still executing. Their serialized widget snapshot can
+        # therefore contain the pre-batch or an intermediate prompt array. Upgrade
+        # only a recognized batch stage to the authoritative completed array; all
+        # unrelated/manual edits remain untouched.
+        history, ui_active_index, visible_enhanced, _queued_batch_reconciled = _reconcile_queued_manual_history(
+            unique_id, history, ui_active_index, visible_enhanced
+        )
         effective_seed = _effective_seed(settings, seed)
 
         # A manual media/settings-aware Enhance request always takes priority. The
@@ -1143,21 +1340,72 @@ class LocalLLMPromptEnhancer:
         if pending is not None:
             _clear_prompt_cycle_state(unique_id)
             token = str(pending.get("token") or "")
-            result = _run_enhancement(
-                source,
-                str(pending.get("enhancement_text") or ""),
-                images=images,
-                video=video,
-                workflow_owned=True,
-                seed=pending.get("seed", effective_seed),
-                settings=settings,
-                batch_id=pending.get("batch_id", ""),
-            )
+            batch_id = str(pending.get("batch_id", "") or "").strip()
+            raw_seeds = pending.get("seeds")
+            if isinstance(raw_seeds, list) and raw_seeds:
+                batch_seeds = [_normalize_seed(value) for value in raw_seeds[:64]]
+            else:
+                batch_seeds = [_normalize_seed(pending.get("seed", effective_seed))]
+
+            batch_results: list[dict[str, Any]] = []
+            try:
+                # The complete manual batch intentionally runs *inside this one
+                # ComfyUI partial-execution queue item*. No later enhancement is
+                # appended to the queue by JavaScript, so a normal workflow can
+                # safely wait behind the batch as a single atomic GPU owner.
+                for batch_index, batch_seed in enumerate(batch_seeds):
+                    result = _run_enhancement(
+                        source,
+                        str(pending.get("enhancement_text") or ""),
+                        images=images,
+                        video=video,
+                        workflow_owned=True,
+                        seed=batch_seed,
+                        settings=settings,
+                        batch_id=batch_id,
+                        yield_after=False,
+                    )
+                    batch_results.append(result)
+                    _publish_manual_batch_progress(
+                        unique_id,
+                        token,
+                        batch_index,
+                        len(batch_seeds),
+                        result,
+                        used_images=images is not None,
+                        used_video=video is not None,
+                        used_settings=isinstance(settings, dict),
+                    )
+            finally:
+                # Yield native llama.cpp VRAM before this ComfyUI queue item is
+                # allowed to finish. Therefore the next queued diffusion job can
+                # never begin while the enhancer is still tearing down GPU state.
+                if batch_id:
+                    _end_batch(batch_id)
+                try:
+                    service = _find_local_llm_service()
+                    service.suspend(reason="prompt-enhancer-batch-complete")
+                except Exception as suspend_exc:
+                    log.warning(
+                        "[Local LLM Prompt Enhancer] In-job post-batch Auto-Yield failed: %s",
+                        suspend_exc,
+                    )
+
+            prompts = [str(item.get("prompt") or "") for item in batch_results]
+            token_counts = [int(item.get("tokens") or 0) for item in batch_results]
+            # Preserve the completed history server-side so workflows that were
+            # already added to ComfyUI's queue during this batch can consume the
+            # finished enhancements even though their prompt snapshot was taken
+            # earlier. This does not delay or intercept queue submission.
+            _store_manual_batch_history(unique_id, pending, prompts)
             payload = {
-                "mode": "manual",
+                "mode": "manual_batch",
                 "token": token,
-                "prompt": result["prompt"],
-                "tokens": result["tokens"],
+                "prompt": prompts[-1] if prompts else "",
+                "prompts": prompts,
+                "tokens": sum(token_counts),
+                "token_counts": token_counts,
+                "batch_count": len(prompts),
                 "used_images": images is not None,
                 "used_video": video is not None,
                 "used_settings": isinstance(settings, dict),
@@ -1361,6 +1609,15 @@ try:
         try:
             body = await request.json()
             ended = _end_batch((body or {}).get("batch_id", ""))
+            if ended:
+                try:
+                    service = _find_local_llm_service()
+                    await asyncio.to_thread(service.suspend, "prompt-enhancer-batch-complete")
+                except Exception as suspend_exc:
+                    log.warning(
+                        "[Local LLM Prompt Enhancer] Post-batch Auto-Yield failed: %s",
+                        suspend_exc,
+                    )
             return web.json_response({"ended": bool(ended)})
         except Exception as exc:
             return _json_error(exc, 500)
@@ -1377,6 +1634,12 @@ try:
                 str(body.get("enhancement_text") or ""),
                 body.get("seed", 0),
                 body.get("batch_id", ""),
+                body.get("seeds"),
+                body.get("batch_count", 1),
+                body.get("prompt_history_json", "[]"),
+                body.get("prompt_history_index", 0),
+                body.get("enhanced_prompt", ""),
+                body.get("overwrite_enhanced", False),
             )
             return web.json_response({"token": token})
         except ValueError as exc:
@@ -1435,32 +1698,18 @@ try:
         except Exception as exc:
             return _json_error(exc, 500)
 
-    # Text-only manual enhancement route. Connected ComfyUI media uses arm + targeted partial execution.
+    # v0.18.50 keeps the old text-only direct HTTP execution path retired because it
+    # ran llama.cpp outside ComfyUI's prompt queue and could overlap a newly
+    # started diffusion workflow. The frontend now uses the same arm + targeted
+    # partial-execution transport for text, image, video, and Settings requests.
+    # Keep a guarded endpoint only so stale cached v0.18.47 JavaScript fails safe
+    # instead of recreating the GPU race.
     @routes.post("/local_llm_prompt_enhancer/run")
-    async def local_llm_prompt_enhancer_run(request):
-        try:
-            body = await request.json()
-            if not isinstance(body, dict):
-                raise TypeError("Request body must be an object")
-
-            prompt = str(body.get("prompt") or "")
-            enhancement_text = str(body.get("enhancement_text") or "")
-            result = await asyncio.to_thread(
-                _run_enhancement,
-                prompt,
-                enhancement_text,
-                images=None,
-                video=None,
-                workflow_owned=False,
-                seed=body.get("seed", 0),
-                batch_id=body.get("batch_id", ""),
-            )
-            return web.json_response({"prompt": result["prompt"]})
-        except ValueError as exc:
-            return _json_error(exc, 400)
-        except Exception as exc:
-            log.exception("[Local LLM Prompt Enhancer] Request failed")
-            return _json_error(exc, 500)
+    async def local_llm_prompt_enhancer_run(_request):
+        return _json_error(
+            "Direct Prompt Enhancer execution was retired for GPU safety. Refresh ComfyUI so the current frontend can use targeted queued execution.",
+            409,
+        )
 
 except Exception as route_error:
     log.warning("[Local LLM Prompt Enhancer] HTTP routes unavailable: %s", route_error)

@@ -1143,7 +1143,7 @@ class LocalLLMServiceManager:
                 self._emit()
         return self.status()
 
-    def suspend(self):
+    def suspend(self, reason="manual-suspend"):
         """Yield the native llama.cpp context while preserving fast-reload state.
 
         Unlike Stop / Unload, Suspend keeps the verified resident controller,
@@ -1176,7 +1176,7 @@ class LocalLLMServiceManager:
                 else:
                     sync_seconds = 0.0
                 released = resident_ctl._unload_native(
-                    reason="manual-suspend",
+                    reason=str(reason or "manual-suspend"),
                     heavy_cleanup=False,
                 )
                 with self._state_lock:

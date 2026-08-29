@@ -1,4 +1,29 @@
-# Local GGUF LLM — v0.18.46 alpha
+# Local GGUF LLM — v0.18.50 alpha
+
+
+## v0.18.50 alpha
+
+- **Normal ComfyUI queue behavior restored:** Prompt Enhancer no longer wraps/intercepts `app.queuePrompt()`. While the one-item Enhance batch is running, clicking Run immediately adds normal workflow jobs to ComfyUI's queue behind it.
+- **The Enhance batch owns its full queue lifetime:** all internal LLM iterations plus the final native llama.cpp VRAM suspend happen before the single Prompt Enhancer queue item returns, so the next queued diffusion job cannot begin early.
+- **Queued-snapshot reconciliation:** workflows queued during the batch may have serialized the Prompt Enhancer before all progress updates reached the browser. The backend now recognizes pre-batch/intermediate history snapshots and upgrades them to the completed batch history when those queued jobs execute, without delaying queue submission.
+- Removed the v0.18.49 informational “Workflow queued until…” Run gate/notification.
+- Prompt Enhancer frontend: **v0.6.24-alpha**.
+
+
+## v0.18.49 alpha
+
+- **One queue item per Enhance batch:** batch size 1–64 now executes as a single targeted ComfyUI partial-execution job. Individual LLM iterations run internally inside that job instead of JavaScript appending another queue item after each completion.
+- **Safe queued Run ordering:** if normal ComfyUI Run is clicked while the Enhance batch is active, that Run request waits until the single batch job has finished, its generated prompts have updated the node, and llama.cpp has yielded VRAM. The workflow is then submitted as the next queue item using the newly updated prompt state.
+- **In-job LLM yield:** Prompt Enhancer now suspends/yields the native GGUF allocation before the one batch queue item returns, eliminating the gap where the next diffusion item could start during llama.cpp teardown.
+- **Live batch UI remains:** each internally completed enhancement emits a best-effort progress event so generated prompts can populate the history while the one queue item is still running. The final executed payload contains the full batch and repairs any progress event missed by a background/throttled browser tab.
+- Batch seed generation still follows the node's standard **Control After Generate** lifecycle; all seeds are captured up front and passed to the one backend batch job.
+- The old direct HTTP generation path remains retired for GPU safety.
+- Prompt Enhancer frontend: **v0.6.23-alpha**.
+
+## v0.18.48 alpha
+
+- Manual Prompt Enhancer requests moved to ComfyUI targeted partial execution so text-only enhancement can no longer run llama.cpp outside ComfyUI's execution queue.
+- Added the browser-side Enhance/Run gate and post-batch Auto-Yield safety path that v0.18.49 consolidates into one batch queue item.
 
 ## v0.18.46 alpha
 - Complete Settings **Load Preset** is disabled and rendered grey when the selected preset already exactly matches the current live settings. Selecting a different preset enables Load Preset again.
@@ -13,7 +38,7 @@ This package includes:
 
 - **Local LLM Generate** — send prompts, images, and sampled video frames to the persistent local LLM.
 - **Local LLM Settings** — reusable model/generation settings with loadable Complete Settings Presets. Memory/performance tuning remains in the Local LLM service panel rather than crowding the workflow node.
-- **Local LLM Prompt Enhancer** — bundled **v0.6.15-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
+- **Local LLM Prompt Enhancer** — bundled **v0.6.24-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
 - **Local LLM Server panel** — model loading, presets, memory/VRAM controls, status, performance information, and the optional OpenAI-compatible API.
 
 
@@ -42,7 +67,7 @@ ComfyUI/custom_nodes/ComfyUI-Local-GGUF-LLM/
 
 Restart ComfyUI, then hard-refresh the browser if an older frontend is still cached.
 
-Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.15 is already bundled here.
+Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.24-alpha is already bundled here.
 
 ## GGUF model folders
 
