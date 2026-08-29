@@ -2,12 +2,14 @@ import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
 const EXTENSION_NAME = "LocalLLM.PromptEnhancer";
-const FRONTEND_VERSION = "0.6.10-alpha";
+const FRONTEND_VERSION = "0.6.25-alpha";
 console.info(`[Local LLM Prompt Enhancer] frontend ${FRONTEND_VERSION}`);
 const NODE_CLASS = "LocalLLMPromptEnhancer";
 const DEFAULT_PRESET = "Default / Krea 2 - Image";
 const PROMPT_SET_NONE = "Unsaved";
 const ENHANCE_TIMEOUT_MS = 5 * 60 * 1000;
+const ENHANCE_BATCH_MIN = 1;
+const ENHANCE_BATCH_MAX = 64;
 
 let graphConfigureDepth = 0;
 const pendingNodes = new Map();
@@ -111,10 +113,217 @@ async function postJSON(path, body, options = {}) {
   return data || {};
 }
 
+function publishEnhancementBatchState(batchId, active, total = 0) {
+  const id = String(batchId || "");
+  if (!id) return;
+  const registry = window.__localLLMEnhancementBatches ||= new Map();
+  if (active) registry.set(id, { total: Number(total) || 0 });
+  else registry.delete(id);
+  try {
+    window.dispatchEvent(new CustomEvent("local-llm-enhance-batch-state", {
+      detail: { batchId: id, active: !!active, total: Number(total) || 0 },
+    }));
+  } catch (_) {}
+}
+
+async function beginEnhancementBatch(total) {
+  // Snapshot the Local LLM configuration before the single targeted ComfyUI
+  // queue item is submitted. Normal ComfyUI Run clicks remain completely
+  // untouched: while this batch item is executing, new workflow runs can be
+  // added to ComfyUI's queue naturally behind it.
+  const data = await postJSON("/local_llm_prompt_enhancer/batch_begin", {});
+  const batchId = String(data?.batch_id || "");
+  if (!batchId) throw new Error("Could not snapshot Local LLM settings for the enhancement batch.");
+  // This state is informational for the Local LLM settings panel only. It does
+  // not wrap or delay app.queuePrompt().
+  publishEnhancementBatchState(batchId, true, total);
+  return batchId;
+}
+
+async function endEnhancementBatch(batchId) {
+  const id = String(batchId || "");
+  if (!id) return;
+  try {
+    // Normally the backend closes the batch lease and suspends llama.cpp before
+    // the Prompt Enhancer's one ComfyUI queue item returns. This endpoint is a
+    // defensive cleanup for cancellation/error paths only.
+    await postJSON("/local_llm_prompt_enhancer/batch_end", { batch_id: id });
+  } catch (_) {
+  } finally {
+    publishEnhancementBatchState(id, false, 0);
+  }
+}
+
+function resetBackendPromptCycle(node) {
+  const nodeId = String(node?.id ?? "");
+  if (!nodeId) return;
+  // Explicit user navigation/mode changes must win over any in-flight state
+  // read started before this reset. Suppress readback until the backend has
+  // acknowledged the reset so a stale response cannot jump the visible index.
+  const epoch = (Number(node.__promptEnhancerCycleSyncEpoch) || 0) + 1;
+  node.__promptEnhancerCycleSyncEpoch = epoch;
+  node.__promptEnhancerCycleResetPending = true;
+  void postJSON("/local_llm_prompt_enhancer/cycle_reset", { node_id: nodeId })
+    .catch(() => {})
+    .finally(() => {
+      if (Number(node.__promptEnhancerCycleSyncEpoch) === epoch) {
+        node.__promptEnhancerCycleResetPending = false;
+      }
+    });
+}
+
+async function syncPromptCycleFromBackend(node, { force = false } = {}) {
+  if (!node || node.comfyClass !== NODE_CLASS || node.__promptEnhancerCycleResetPending) return false;
+  if (!!widget(node, "enhance_with_workflow")?.value) return false;
+
+  const mode = String(widget(node, "prompt_cycle")?.value ?? "fixed").trim().toLowerCase();
+  if (mode === "fixed") return false;
+  const history = promptHistory(node);
+  if (!history.length) return false;
+
+  const now = performance.now();
+  const last = Number(node.__promptEnhancerCycleSyncAt) || 0;
+  if (!force && now - last < 250) return false;
+  if (node.__promptEnhancerCycleSyncPromise) return node.__promptEnhancerCycleSyncPromise;
+  node.__promptEnhancerCycleSyncAt = now;
+
+  const epoch = Number(node.__promptEnhancerCycleSyncEpoch) || 0;
+  const nodeId = String(node.id ?? "");
+  const request = postJSON("/local_llm_prompt_enhancer/cycle_state", {
+    node_id: nodeId,
+    mode,
+    history,
+  }).then((data) => {
+    if (!data?.valid || !node || node.__promptEnhancerCycleResetPending) return false;
+    if ((Number(node.__promptEnhancerCycleSyncEpoch) || 0) !== epoch) return false;
+
+    // Re-check the signature after the async hop. If the user edited the array
+    // or changed cycle mode while this request was in flight, ignore it.
+    const currentMode = String(widget(node, "prompt_cycle")?.value ?? "fixed").trim().toLowerCase();
+    const currentHistory = promptHistory(node);
+    if (currentMode !== mode || JSON.stringify(currentHistory) !== JSON.stringify(history)) return false;
+
+    const nextIndex = Math.max(0, Math.min(Math.trunc(Number(data.next_index) || 0), currentHistory.length - 1));
+    const shuffle = Array.isArray(data.shuffle) ? data.shuffle : [];
+    if (promptHistoryIndex(node, currentHistory) === nextIndex &&
+        JSON.stringify(promptShuffleState(node)) === JSON.stringify(shuffle)) {
+      return true;
+    }
+    setPromptHistoryState(node, currentHistory, nextIndex, shuffle, { backendSync: false });
+    return true;
+  }).catch(() => false).finally(() => {
+    if (node.__promptEnhancerCycleSyncPromise === request) node.__promptEnhancerCycleSyncPromise = null;
+  });
+  node.__promptEnhancerCycleSyncPromise = request;
+  return request;
+}
+
+function currentGraphPromptEnhancerNodes() {
+  const nodes = [];
+  const seen = new Set();
+  const visit = (graph) => {
+    if (!graph || seen.has(graph)) return;
+    seen.add(graph);
+    for (const candidate of graph._nodes || []) {
+      if (!candidate) continue;
+      if (candidate.comfyClass === NODE_CLASS) nodes.push(candidate);
+      visit(candidate.subgraph || candidate.graph?.subgraph);
+    }
+  };
+  visit(app?.rootGraph);
+  visit(app?.graph);
+  return nodes;
+}
+
+function syncCurrentGraphPromptCycles({ force = false } = {}) {
+  for (const node of currentGraphPromptEnhancerNodes()) {
+    void syncPromptCycleFromBackend(node, { force });
+  }
+}
+
+let graphActivationSyncGeneration = 0;
+
+function reconcilePromptCyclesAfterGraphActivation() {
+  // ComfyUI workflow-tab switches are asynchronous. Mouse/focus events happen
+  // before app.graph has necessarily been replaced, so they are not a reliable
+  // signal that the newly selected workflow is ready. afterConfigureGraph() is
+  // the authoritative lifecycle point; these passes only allow our async node
+  // panel initialization/rendering to settle after the graph itself is active.
+  const generation = ++graphActivationSyncGeneration;
+  const sync = () => {
+    if (generation !== graphActivationSyncGeneration) return;
+    syncCurrentGraphPromptCycles({ force: true });
+  };
+  queueMicrotask(sync);
+  requestAnimationFrame(sync);
+  setTimeout(sync, 80);
+  setTimeout(sync, 250);
+}
+
 function setBusy(node, busy, active = null) {
   if (!node) return;
   node.__promptEnhancerBusy = !!busy;
   node.__promptEnhancerActiveAction = busy ? active : null;
+  scheduleDomPanelSync(node);
+  redraw(node);
+}
+
+function normalizeEnhanceBatchCount(value) {
+  const number = Math.trunc(Number(value));
+  if (!Number.isFinite(number)) return ENHANCE_BATCH_MIN;
+  return Math.max(ENHANCE_BATCH_MIN, Math.min(ENHANCE_BATCH_MAX, number));
+}
+
+function enhanceBatchCount(node) {
+  if (!node) return ENHANCE_BATCH_MIN;
+  const current = Number(node.__promptEnhancerBatchCount);
+  if (Number.isFinite(current)) return normalizeEnhanceBatchCount(current);
+  const saved = node?.properties?.[PERSISTENCE_STATE_KEY]?.batchCount;
+  const count = normalizeEnhanceBatchCount(saved ?? ENHANCE_BATCH_MIN);
+  node.__promptEnhancerBatchCount = count;
+  return count;
+}
+
+function enforceBatchAddNew(node, { mark = true } = {}) {
+  if (!node || enhanceBatchCount(node) <= 1) return false;
+  const overwrite = widget(node, "overwrite_enhanced");
+  if (!overwrite || !overwrite.value) return false;
+  setWidgetValue(overwrite, false, false);
+  if (mark && !node.__promptEnhancerRestoringState) {
+    persistEnhancementState(node);
+    markWorkflowChanged(node);
+  }
+  scheduleDomPanelSync(node);
+  redraw(node);
+  return true;
+}
+
+function enforceBatchWorkflowDisabled(node, { mark = true } = {}) {
+  if (!node || enhanceBatchCount(node) <= 1) return false;
+  const workflow = widget(node, "enhance_with_workflow");
+  if (!workflow || !workflow.value) return false;
+  setWidgetValue(workflow, false, false);
+  if (mark && !node.__promptEnhancerRestoringState) {
+    persistEnhancementState(node);
+    markWorkflowChanged(node);
+  }
+  scheduleDomPanelSync(node);
+  redraw(node);
+  return true;
+}
+
+function setEnhanceBatchCount(node, value) {
+  if (!node || node.__promptEnhancerBusy) return;
+  const next = normalizeEnhanceBatchCount(value);
+  const changed = enhanceBatchCount(node) !== next;
+  node.__promptEnhancerBatchCount = next;
+  // A batch must append every result and workflow-time enhancement is a
+  // single-result mode. Force both settings immediately when the count crosses
+  // above one, then keep both controls locked until it returns to one.
+  const forcedAddNew = enforceBatchAddNew(node, { mark: false });
+  const forcedWorkflowDisabled = enforceBatchWorkflowDisabled(node, { mark: false });
+  persistEnhancementState(node);
+  if (changed || forcedAddNew || forcedWorkflowDisabled) markWorkflowChanged(node);
   scheduleDomPanelSync(node);
   redraw(node);
 }
@@ -169,7 +378,7 @@ function pushArrayUndo(node) {
   node.__promptEnhancerArrayRedo = [];
 }
 
-function setPromptHistoryState(node, history, index = 0, shuffle = [], { mark = true } = {}) {
+function setPromptHistoryState(node, history, index = 0, shuffle = [], { mark = true, backendSync = mark } = {}) {
   if (!node) return;
   const list = Array.isArray(history) ? history.map((item) => String(item ?? "")) : [];
   const clamped = list.length ? Math.max(0, Math.min(Math.trunc(Number(index) || 0), list.length - 1)) : 0;
@@ -188,6 +397,7 @@ function setPromptHistoryState(node, history, index = 0, shuffle = [], { mark = 
   }
   persistEnhancementState(node);
   if (mark) markWorkflowChanged(node);
+  if (backendSync) resetBackendPromptCycle(node);
   scheduleDomPanelSync(node);
   redraw(node);
 }
@@ -500,16 +710,155 @@ async function refreshTemplates(node, { loadSelected = false, selectLabel = null
   }
 }
 
-function clearEnhancePending(node) {
+function applyPromptPresetCatalog(node, data, { loadSelected = false, selectName = null } = {}) {
+  const section = data?.prompts || {};
+  const names = Array.isArray(section.names) && section.names.length ? section.names.map(String) : ["Custom"];
+  const presets = section.presets && typeof section.presets === "object" ? section.presets : {};
+  const deletable = new Set(Array.isArray(section.deletable_names) ? section.deletable_names.map(String) : Object.keys(presets));
+  node.__promptEnhancerPromptPresetCatalog = { names, presets, deletable };
+
+  const selector = widget(node, "prompt_preset");
+  updateComboValues(selector, names);
+  let next = selectName == null ? String(selector?.value ?? "Custom") : String(selectName);
+  if (!names.includes(next)) next = "Custom";
+  if (selector && String(selector.value ?? "") !== next) setWidgetValue(selector, next, false);
+
+  if (loadSelected && next !== "Custom" && Object.prototype.hasOwnProperty.call(presets, next)) {
+    node.__promptEnhancerApplyingPromptPreset = true;
+    try { setWidgetValue(widget(node, "prompt"), String(presets[next] ?? ""), false); }
+    finally { node.__promptEnhancerApplyingPromptPreset = false; }
+  }
+  persistEnhancementState(node);
+  scheduleDomPanelSync(node);
+  redraw(node);
+}
+
+async function refreshPromptPresets(node, { loadSelected = false, selectName = null } = {}) {
+  if (!node) return;
+  try {
+    const data = await getJSON("/local_llm_server/node_presets");
+    applyPromptPresetCatalog(node, data, { loadSelected, selectName });
+  } catch (error) {
+    notify("error", "Local LLM Prompt Enhancer", error?.message || String(error));
+  }
+}
+
+async function applyPromptPresetSelection(node, selection) {
+  if (!node) return;
+  const name = String(selection || "Custom");
+  if (name === "Custom") {
+    persistEnhancementState(node);
+    scheduleDomPanelSync(node);
+    return;
+  }
+  await refreshPromptPresets(node, { loadSelected: true, selectName: name });
+}
+
+async function savePromptPreset(node) {
+  if (!node || node.__promptEnhancerBusy) return;
+  const selector = widget(node, "prompt_preset");
+  if (!selector) return;
+  if (String(selector.value || "Custom") !== "Custom") {
+    notify("warn", "Local LLM Prompt Preset", "Edit Prompt first; edited text automatically switches this selector to Custom.");
+    return;
+  }
+  const entered = window.prompt("Name this prompt preset:", "");
+  if (entered === null) return;
+  const name = String(entered).trim();
+  if (!name) {
+    notify("warn", "Local LLM Prompt Preset", "Prompt preset name cannot be empty.");
+    return;
+  }
+  setBusy(node, true, "save_prompt_preset");
+  try {
+    const result = await postJSON("/local_llm_server/node_presets", {
+      kind: "prompts", name, text: String(widget(node, "prompt")?.value ?? ""),
+    });
+    const data = result?.catalog || await getJSON("/local_llm_server/node_presets");
+    const savedName = String(result?.saved?.name || name);
+    applyPromptPresetCatalog(node, data, { loadSelected: true, selectName: savedName });
+    markWorkflowChanged(node);
+    notify("success", "Local LLM Prompt Preset", `Saved ${savedName}.`);
+  } catch (error) {
+    notify("error", "Local LLM Prompt Preset", error?.message || String(error));
+  } finally {
+    setBusy(node, false);
+  }
+}
+
+async function deletePromptPreset(node) {
+  if (!node || node.__promptEnhancerBusy) return;
+  const selector = widget(node, "prompt_preset");
+  const name = String(selector?.value || "Custom").trim();
+  if (!name || name === "Custom") {
+    notify("warn", "Local LLM Prompt Preset", "Select a saved prompt preset to delete.");
+    return;
+  }
+  let catalog = node.__promptEnhancerPromptPresetCatalog;
+  if (!catalog) {
+    try {
+      const data = await getJSON("/local_llm_server/node_presets");
+      applyPromptPresetCatalog(node, data);
+      catalog = node.__promptEnhancerPromptPresetCatalog;
+    } catch (error) {
+      notify("error", "Local LLM Prompt Preset", error?.message || String(error));
+      return;
+    }
+  }
+  if (!catalog?.deletable?.has(name)) {
+    notify("warn", "Local LLM Prompt Preset", `“${name}” is not a deletable user preset.`);
+    return;
+  }
+  if (!globalThis.confirm?.(`Delete prompt preset “${name}”?\n\nThe current Prompt text will remain.`)) return;
+  setBusy(node, true, "delete_prompt_preset");
+  try {
+    const response = await api.fetchApi("/local_llm_server/node_presets", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kind: "prompts", name }),
+    });
+    let result = null;
+    try { result = await response.json(); } catch (_) {}
+    if (!response.ok) throw new Error(result?.error?.message || result?.message || `HTTP ${response.status}`);
+    const data = result?.catalog || await getJSON("/local_llm_server/node_presets");
+    applyPromptPresetCatalog(node, data, { loadSelected: false, selectName: "Custom" });
+    markWorkflowChanged(node);
+    notify("success", "Local LLM Prompt Preset", `Deleted ${name}.`);
+  } catch (error) {
+    notify("error", "Local LLM Prompt Preset", error?.message || String(error));
+  } finally {
+    setBusy(node, false);
+  }
+}
+
+function clearEnhanceTransport(node) {
   if (!node) return;
   if (node.__promptEnhancerTimeout) clearTimeout(node.__promptEnhancerTimeout);
   node.__promptEnhancerTimeout = null;
   node.__promptEnhancerPendingToken = null;
   node.__promptEnhancerJobId = null;
   node.__promptEnhancerRequestController = null;
+  pendingNodes.delete(String(node.id));
+}
+
+function settleEnhanceExecution(node, error = null, data = null) {
+  const waiter = node?.__promptEnhancerExecutionWaiter;
+  if (!waiter) return false;
+  node.__promptEnhancerExecutionWaiter = null;
+  if (error) waiter.reject(error);
+  else waiter.resolve(data);
+  return true;
+}
+
+function clearEnhancePending(node) {
+  if (!node) return;
+  clearEnhanceTransport(node);
+  settleEnhanceExecution(node, new DOMException("Enhancement cancelled.", "AbortError"));
   node.__promptEnhancerCancelRequested = false;
   node.__promptEnhancerOverwriteAtStart = null;
-  pendingNodes.delete(String(node.id));
+  node.__promptEnhancerBatchProgress = null;
+  node.__promptEnhancerProgressApplied = null;
+  if (node.__promptEnhancerManualSeedSource) node.__promptEnhancerManualSeedSource = null;
   setBusy(node, false);
 }
 
@@ -534,7 +883,8 @@ function handleEnhanceExecuted(node, output) {
       ? Math.max(0, Math.min(Number(data.next_index ?? 0), history.length - 1))
       : 0;
     const shuffle = Array.isArray(data.shuffle) ? data.shuffle : [];
-    setPromptHistoryState(node, history, nextIndex, shuffle);
+    setPromptHistoryState(node, history, nextIndex, shuffle, { backendSync: false });
+    node.__promptEnhancerCycleSyncAt = performance.now();
     return true;
   }
 
@@ -552,11 +902,27 @@ function handleEnhanceExecuted(node, output) {
   if (!pendingToken || String(data.token || "") !== pendingToken) return false;
 
   if (!revised.trim()) {
-    clearEnhancePending(node);
-    notify("error", "Local LLM Prompt Enhancer", "The Local LLM returned an empty prompt.");
+    const error = new Error("The Local LLM returned an empty prompt.");
+    clearEnhanceTransport(node);
+    if (!settleEnhanceExecution(node, error)) {
+      clearEnhancePending(node);
+      notify("error", "Local LLM Prompt Enhancer", error.message);
+    }
     return true;
   }
 
+  // The complete backend batch is one partial-execution queue item. Hand its
+  // authoritative final payload back to the batch runner and keep the node busy
+  // until the UI has reconciled all progress/final results.
+  if (node.__promptEnhancerExecutionWaiter) {
+    clearEnhanceTransport(node);
+    settleEnhanceExecution(node, null, data);
+    redraw(node);
+    return true;
+  }
+
+  // Compatibility fallback for a single already-armed request created by an
+  // older frontend instance during a hot reload.
   applyGeneratedPrompt(node, revised, node.__promptEnhancerOverwriteAtStart);
   clearEnhancePending(node);
 
@@ -569,6 +935,31 @@ function handleEnhanceExecuted(node, output) {
   return true;
 }
 
+function handleEnhanceBatchProgressEvent(detail) {
+  const data = detail?.detail ?? detail ?? {};
+  const nodeId = String(data?.node_id ?? "");
+  const token = String(data?.token ?? "");
+  if (!nodeId || !token) return;
+  const node = pendingNodes.get(nodeId);
+  if (!node || String(node.__promptEnhancerPendingToken || "") !== token) return;
+
+  const revised = String(data?.prompt ?? "");
+  const index = Math.max(0, Math.trunc(Number(data?.index) || 0));
+  const total = Math.max(1, Math.trunc(Number(data?.total) || 1));
+  if (!revised.trim()) return;
+
+  const applied = node.__promptEnhancerProgressApplied instanceof Set
+    ? node.__promptEnhancerProgressApplied
+    : (node.__promptEnhancerProgressApplied = new Set());
+  if (applied.has(index)) return;
+
+  applyGeneratedPrompt(node, revised, node.__promptEnhancerOverwriteAtStart);
+  applied.add(index);
+  node.__promptEnhancerBatchProgress = { current: Math.min(total, index + 1), total };
+  scheduleDomPanelSync(node);
+  redraw(node);
+}
+
 async function cancelArmed(node, token) {
   try {
     await postJSON("/local_llm_prompt_enhancer/cancel", {
@@ -576,6 +967,12 @@ async function cancelArmed(node, token) {
       token: String(token || ""),
     });
   } catch (_) {}
+}
+
+function applyPromptEnhancerInputLabels(node) {
+  for (const input of node?.inputs || []) {
+    if (input?.name === "images") input.label = "image(s)";
+  }
 }
 
 function hasConnectedMedia(node) {
@@ -598,47 +995,20 @@ function inputOriginNode(node, inputName) {
   return graph?.getNodeById?.(originId) || null;
 }
 
-function connectedSettingsSeedNode(node) {
-  let current = inputOriginNode(node, "settings");
-  const visited = new Set();
-  for (let depth = 0; current && depth < 12; depth += 1) {
-    const key = String(current.id ?? "");
-    if (visited.has(key)) break;
-    visited.add(key);
-    if (widget(current, "seed")) return current;
-
-    // Follow simple reroute/pass-through nodes so a Settings connection through
-    // a reroute still drives the source node's standard seed control lifecycle.
-    const linkedInput = (current.inputs || []).find((item) => item?.link != null);
-    if (!linkedInput) break;
-    const graph = current?.graph || app?.graph;
-    const link = graph?.links?.[linkedInput.link] || graph?.links?.get?.(linkedInput.link);
-    const originId = link?.origin_id ?? link?.originId;
-    current = originId == null ? null : (graph?.getNodeById?.(originId) || null);
-  }
-  return null;
-}
-
 function setSeedOverrideUI(node) {
   if (!node) return;
+  // Settings never owns seed. Keep Prompt Enhancer's Seed + Control After
+  // Generate active regardless of whether LOCAL_LLM_SETTINGS is connected.
   const connected = hasConnectedSettings(node);
-  const seedWidget = widget(node, "seed");
-  const control = seedControlWidget(node);
-
-  // Do not assign widget.disabled here. Current ComfyUI renderers may expose
-  // disabled as a computed/getter-only property (notably ComboWidget in the
-  // Nodes 2.0 path). The embedded DOM panel owns the visible disabled state.
-  // For native DOM-backed widgets, mirror the state onto their actual element
-  // when available; otherwise leave the hidden/native widget untouched.
-  for (const w of [seedWidget, control]) {
+  for (const w of [widget(node, "seed"), seedControlWidget(node)]) {
     if (!w) continue;
     try {
       const el = w.element;
-      if (el && "disabled" in el) el.disabled = connected;
-      if (el) el.setAttribute?.("aria-disabled", connected ? "true" : "false");
+      if (el && "disabled" in el) el.disabled = false;
+      if (el) el.setAttribute?.("aria-disabled", "false");
     } catch (_) {}
     try {
-      if (w.options && Object.isExtensible(w.options)) w.options.readOnly = connected;
+      if (w.options && Object.isExtensible(w.options)) w.options.readOnly = false;
     } catch (_) {}
   }
   node.__promptEnhancerSettingsConnected = connected;
@@ -667,16 +1037,10 @@ function seedControlWidget(node) {
 }
 
 function beginSeedControlCycle(node) {
-  // Manual Enhance bypasses app.queuePrompt(), so drive the authoritative seed
-  // node's standard control_after_generate lifecycle ourselves. When Local LLM
-  // Settings is connected, that source node is authoritative; otherwise the
-  // Prompt Enhancer's own seed remains the fallback.
-  const settingsConnected = hasConnectedSettings(node);
-  const sourceNode = settingsConnected ? connectedSettingsSeedNode(node) : node;
-  if (!sourceNode) {
-    node.__promptEnhancerManualSeedSource = null;
-    return 0;
-  }
+  // Manual Enhance bypasses app.queuePrompt(), so drive this Prompt Enhancer's
+  // own standard control_after_generate lifecycle. Settings never owns seed.
+  const sourceNode = node;
+  if (!sourceNode) return 0;
   const control = seedControlWidget(sourceNode);
   try { control?.beforeQueued?.({ isPartialExecution: false }); } catch (error) { console.warn(error); }
 
@@ -702,6 +1066,21 @@ function finishSeedControlCycle(node) {
   redraw(sourceNode);
   redraw(node);
   if (node) node.__promptEnhancerManualSeedSource = null;
+}
+
+function captureEnhancementBatchSeeds(node, count) {
+  // A batch is now one ComfyUI queue item, but each internal LLM iteration must
+  // still honor ComfyUI's standard Control After Generate seed lifecycle. Drive
+  // that widget locally to capture the exact seed sequence before the single
+  // queue item is submitted. The displayed seed therefore ends at the same
+  // value it would have reached after N individually queued enhancement runs.
+  const seeds = [];
+  const total = Math.max(1, normalizeEnhanceBatchCount(count));
+  for (let index = 0; index < total; index += 1) {
+    seeds.push(beginSeedControlCycle(node));
+    finishSeedControlCycle(node);
+  }
+  return seeds;
 }
 
 async function cancelEnhancement(node) {
@@ -730,34 +1109,70 @@ async function cancelEnhancement(node) {
     }
   }
 
-  clearEnhancePending(node);
+  clearEnhanceTransport(node);
+  settleEnhanceExecution(node, new DOMException("Enhancement cancelled.", "AbortError"));
   notify("info", "Local LLM Prompt Enhancer", "Enhancement cancelled.");
 }
 
-async function runTextOnlyEnhancement(node, prompt, enhancementText, seed) {
-  const controller = new AbortController();
-  node.__promptEnhancerRequestController = controller;
-  try {
-    const data = await postJSON(
-      "/local_llm_prompt_enhancer/run",
-      { prompt, enhancement_text: enhancementText, seed },
-      { signal: controller.signal },
-    );
-    if (node.__promptEnhancerCancelRequested) return;
-    const revised = String(data?.prompt ?? "");
-    if (!revised.trim()) throw new Error("The Local LLM returned an empty prompt.");
-    applyGeneratedPrompt(node, revised, node.__promptEnhancerOverwriteAtStart);
-    finishSeedControlCycle(node);
-    clearEnhancePending(node);
-    notify("success", "Local LLM Prompt Enhancer", "Enhancement complete.");
-  } catch (error) {
-    if (node.__promptEnhancerCancelRequested || error?.name === "AbortError") return;
-    clearEnhancePending(node);
-    notify("error", "Local LLM Prompt Enhancer", error?.message || String(error));
+function prunePromptDataToEnhancer(promptData, targetNodeId) {
+  // Safety invariant: the queue item used by the manual Enhancer must be
+  // incapable of executing unrelated workflow branches even if a ComfyUI
+  // frontend/runtime drops or ignores partial_execution_targets.
+  const output = promptData?.output;
+  if (!output || typeof output !== "object") {
+    throw new Error("ComfyUI did not provide an executable prompt graph for Prompt Enhancer.");
   }
+
+  const target = String(targetNodeId ?? "");
+  const nodeIds = new Set(Object.keys(output).map(String));
+  if (!target || !nodeIds.has(target)) {
+    throw new Error(`Prompt Enhancer node ${target || "?"} was not present in the serialized prompt.`);
+  }
+
+  const keep = new Set();
+  const visit = (id) => {
+    const key = String(id);
+    if (keep.has(key) || !nodeIds.has(key)) return;
+    keep.add(key);
+    const record = output[key];
+
+    const scanValue = (value) => {
+      if (Array.isArray(value)) {
+        // API links are [source_node_execution_id, output_slot]. Only treat the
+        // array as a link when the source actually exists in this prompt graph;
+        // otherwise it is just a literal list widget value.
+        if (
+          value.length === 2 &&
+          (typeof value[0] === "string" || typeof value[0] === "number") &&
+          nodeIds.has(String(value[0])) &&
+          Number.isInteger(Number(value[1]))
+        ) {
+          visit(String(value[0]));
+          return;
+        }
+        for (const item of value) scanValue(item);
+        return;
+      }
+      if (value && typeof value === "object") {
+        for (const item of Object.values(value)) scanValue(item);
+      }
+    };
+
+    scanValue(record?.inputs);
+  };
+
+  visit(target);
+
+  const prunedOutput = {};
+  // Preserve graphToPrompt insertion order for deterministic execution/debugging.
+  for (const [id, record] of Object.entries(output)) {
+    if (keep.has(String(id))) prunedOutput[id] = record;
+  }
+
+  return { ...promptData, output: prunedOutput };
 }
 
-async function runMediaEnhancement(node, prompt, enhancementText, seed) {
+async function runTargetedEnhancementBatch(node, prompt, enhancementText, seeds, batchId = "") {
   let token = "";
   try {
     const controller = new AbortController();
@@ -768,7 +1183,14 @@ async function runMediaEnhancement(node, prompt, enhancementText, seed) {
         node_id: String(node.id),
         prompt,
         enhancement_text: enhancementText,
-        seed,
+        seed: Number(seeds?.[0] ?? 0),
+        seeds: Array.isArray(seeds) ? seeds : [Number(seeds ?? 0)],
+        batch_count: Array.isArray(seeds) ? seeds.length : 1,
+        batch_id: batchId,
+        prompt_history_json: String(widget(node, "prompt_history_json")?.value ?? "[]"),
+        prompt_history_index: Number(widget(node, "prompt_history_index")?.value ?? 0),
+        enhanced_prompt: String(widget(node, "enhanced_prompt")?.value ?? ""),
+        overwrite_enhanced: !!node.__promptEnhancerOverwriteAtStart,
       },
       { signal: controller.signal },
     );
@@ -776,7 +1198,7 @@ async function runMediaEnhancement(node, prompt, enhancementText, seed) {
     if (!token) throw new Error("Prompt Enhancer could not arm the request.");
     if (node.__promptEnhancerCancelRequested) {
       await cancelArmed(node, token);
-      return;
+      throw new DOMException("Enhancement cancelled.", "AbortError");
     }
 
     node.__promptEnhancerPendingToken = token;
@@ -786,14 +1208,25 @@ async function runMediaEnhancement(node, prompt, enhancementText, seed) {
       throw new Error("This ComfyUI frontend does not support targeted execution required for connected media/settings enhancement.");
     }
 
+    const executionResult = new Promise((resolve, reject) => {
+      node.__promptEnhancerExecutionWaiter = { token, resolve, reject };
+    });
+
     // Queue directly through the stable API so we receive the actual prompt/job
-    // id. That lets the same button cancel exactly this enhancer run instead of
-    // globally interrupting an unrelated workflow.
-    const promptData = await app.graphToPrompt();
+    // id. The execution waiter above is installed first so even a very fast local
+    // partial run cannot finish before the browser is ready to consume it.
+    const fullPromptData = await app.graphToPrompt();
     if (node.__promptEnhancerCancelRequested) {
       await cancelArmed(node, token);
-      return;
+      throw new DOMException("Enhancement cancelled.", "AbortError");
     }
+
+    // Do not trust partial-execution metadata as the sole safety boundary.
+    // Some ComfyUI frontend versions/custom wrappers can silently drop that
+    // option. Physically remove every node except the enhancer and its upstream
+    // dependencies before queueing. The partial target remains as a second
+    // layer of protection on runtimes that support it.
+    const promptData = prunePromptDataToEnhancer(fullPromptData, String(node.id));
     const queued = await api.queuePrompt(0, promptData, {
       partialExecutionTargets: [String(node.id)],
     });
@@ -804,17 +1237,14 @@ async function runMediaEnhancement(node, prompt, enhancementText, seed) {
     }
     node.__promptEnhancerJobId = jobId;
     node.__promptEnhancerRequestController = null;
-    // The request is now accepted, matching the point where normal ComfyUI runs
-    // invoke control_after_generate. The queued payload already contains the seed
-    // captured above, so changing the visible seed here affects only the next run.
-    finishSeedControlCycle(node);
 
     if (node.__promptEnhancerCancelRequested) {
       try { await api?.cancelJob?.(jobId); } catch (_) { try { await api?.interrupt?.(jobId); } catch (_) {} }
       await cancelArmed(node, token);
-      return;
+      throw new DOMException("Enhancement cancelled.", "AbortError");
     }
 
+    const batchSize = Math.max(1, Array.isArray(seeds) ? seeds.length : 1);
     node.__promptEnhancerTimeout = setTimeout(async () => {
       if (String(node.__promptEnhancerPendingToken || "") !== token) return;
       const timedOutJob = String(node.__promptEnhancerJobId || "");
@@ -822,14 +1252,24 @@ async function runMediaEnhancement(node, prompt, enhancementText, seed) {
       if (timedOutJob) {
         try { await api?.cancelJob?.(timedOutJob); } catch (_) { try { await api?.interrupt?.(timedOutJob); } catch (_) {} }
       }
-      clearEnhancePending(node);
-      notify("error", "Local LLM Prompt Enhancer", "Enhancement did not complete before the request timeout.");
-    }, ENHANCE_TIMEOUT_MS);
+      clearEnhanceTransport(node);
+      settleEnhanceExecution(node, new Error("Enhancement did not complete before the request timeout."));
+    }, ENHANCE_TIMEOUT_MS * batchSize);
+
+    return await executionResult;
   } catch (error) {
-    if (node.__promptEnhancerCancelRequested || error?.name === "AbortError") return;
     if (token) await cancelArmed(node, token);
-    clearEnhancePending(node);
-    notify("error", "Local LLM Prompt Enhancer", error?.message || String(error));
+    clearEnhanceTransport(node);
+    // If the failure occurred after the waiter was installed, settle it so no
+    // promise remains pending while the batch runner handles the same exception.
+    if (node.__promptEnhancerExecutionWaiter) {
+      const waiter = node.__promptEnhancerExecutionWaiter;
+      node.__promptEnhancerExecutionWaiter = null;
+      // Resolve the internal waiter defensively; the thrown error below is the
+      // authoritative failure path for this function.
+      waiter.resolve(null);
+    }
+    throw error;
   }
 }
 
@@ -849,20 +1289,86 @@ async function enhance(node) {
     return;
   }
 
+  const count = enhanceBatchCount(node);
+  if (count > 1) enforceBatchAddNew(node);
+
   node.__promptEnhancerCancelRequested = false;
-  node.__promptEnhancerOverwriteAtStart = !!widget(node, "overwrite_enhanced")?.value;
-  const seed = beginSeedControlCycle(node);
+  node.__promptEnhancerOverwriteAtStart = count > 1 ? false : !!widget(node, "overwrite_enhanced")?.value;
+  node.__promptEnhancerBatchProgress = { current: 0, total: count };
   setBusy(node, true, "enhance");
 
-  // Pure text with no Settings link can call the service directly. A connected
-  // Settings object, like connected media, only exists on the backend during
-  // graph execution, so it intentionally uses the targeted partial-run path.
-  if (!hasConnectedMedia(node) && !hasConnectedSettings(node)) {
-    await runTextOnlyEnhancement(node, prompt, enhancementText, seed);
-    return;
-  }
+  const hasMedia = hasConnectedMedia(node);
+  let completed = 0;
+  let mediaSummary = "";
+  let batchId = "";
 
-  await runMediaEnhancement(node, prompt, enhancementText, seed);
+  try {
+    // Every manual Enhance operation owns an explicit batch lease, including a
+    // one-item run. The whole batch is one ComfyUI queue item; a normal Run
+    // clicked during it is queued normally behind this item. This batch item itself
+    // does not return until all enhancements finish and the backend has yielded LLM VRAM.
+    batchId = await beginEnhancementBatch(count);
+
+    node.__promptEnhancerProgressApplied = new Set();
+    node.__promptEnhancerBatchProgress = { current: 0, total: count };
+    scheduleDomPanelSync(node);
+
+    // Capture all per-iteration seeds first, then submit exactly ONE targeted
+    // ComfyUI partial execution. The backend performs the whole LLM loop and
+    // suspends llama.cpp before this single queue item completes.
+    const seeds = captureEnhancementBatchSeeds(node, count);
+    const data = await runTargetedEnhancementBatch(node, prompt, enhancementText, seeds, batchId);
+
+    if (!node.__promptEnhancerCancelRequested) {
+      const prompts = Array.isArray(data?.prompts)
+        ? data.prompts.map((value) => String(value ?? ""))
+        : [String(data?.prompt ?? "")];
+      const applied = node.__promptEnhancerProgressApplied instanceof Set
+        ? node.__promptEnhancerProgressApplied
+        : new Set();
+
+      for (let index = 0; index < prompts.length; index += 1) {
+        const revised = prompts[index];
+        if (!revised.trim()) throw new Error("The Local LLM returned an empty prompt.");
+        // Progress events normally insert each result as it finishes. If the
+        // browser missed one (background throttling, reconnect, etc.), catch it
+        // up from the authoritative final payload without duplicating entries.
+        if (!applied.has(index)) {
+          applyGeneratedPrompt(node, revised, node.__promptEnhancerOverwriteAtStart);
+          applied.add(index);
+        }
+      }
+      completed = prompts.length;
+      node.__promptEnhancerBatchProgress = { current: completed, total: count };
+      scheduleDomPanelSync(node);
+
+      if (hasMedia && !mediaSummary) {
+        const media = [];
+        if (data?.used_images) media.push("image(s)");
+        if (data?.used_video) media.push("video");
+        mediaSummary = media.length ? ` using ${media.join(" + ")}` : "";
+      }
+    }
+
+    if (!node.__promptEnhancerCancelRequested && completed > 0) {
+      const noun = completed === 1 ? "Enhancement" : `${completed} enhancements`;
+      notify("success", "Local LLM Prompt Enhancer", `${noun} complete${mediaSummary}.`);
+    }
+  } catch (error) {
+    if (!node.__promptEnhancerCancelRequested && error?.name !== "AbortError") {
+      notify("error", "Local LLM Prompt Enhancer", error?.message || String(error));
+    }
+  } finally {
+    await endEnhancementBatch(batchId);
+    clearEnhanceTransport(node);
+    node.__promptEnhancerExecutionWaiter = null;
+    node.__promptEnhancerCancelRequested = false;
+    node.__promptEnhancerOverwriteAtStart = null;
+    node.__promptEnhancerBatchProgress = null;
+    node.__promptEnhancerProgressApplied = null;
+    if (node.__promptEnhancerManualSeedSource) node.__promptEnhancerManualSeedSource = null;
+    setBusy(node, false);
+  }
 }
 
 function toggleEnhance(node) {
@@ -1061,6 +1567,7 @@ function enhancementStateSnapshot(node) {
   return {
     version: PERSISTENCE_STATE_VERSION,
     prompt: String(widget(node, "prompt")?.value ?? ""),
+    promptPreset: String(widget(node, "prompt_preset")?.value ?? "Custom"),
     enhancedPrompt: normalized.enhanced,
     promptSet: String(widget(node, "prompt_set")?.value ?? PROMPT_SET_NONE),
     promptHistory: normalized.history,
@@ -1068,6 +1575,7 @@ function enhancementStateSnapshot(node) {
     promptShuffle: normalized.shuffle,
     promptCycle: String(widget(node, "prompt_cycle")?.value ?? "fixed"),
     overwriteEnhanced: !!widget(node, "overwrite_enhanced")?.value,
+    batchCount: enhanceBatchCount(node),
     enhancementPreset: String(widget(node, "enhancement_preset")?.value ?? ""),
     enhancementText: String(widget(node, "enhancement_text")?.value ?? ""),
     seed,
@@ -1081,6 +1589,7 @@ function clonePersistenceState(state) {
   return {
     version: Number(state?.version ?? PERSISTENCE_STATE_VERSION),
     prompt: String(state?.prompt ?? ""),
+    promptPreset: String(state?.promptPreset ?? "Custom"),
     enhancedPrompt: String(state?.enhancedPrompt ?? ""),
     promptSet: String(state?.promptSet ?? PROMPT_SET_NONE),
     promptHistory: Array.isArray(state?.promptHistory) ? state.promptHistory.map((v) => String(v ?? "")) : [],
@@ -1088,6 +1597,7 @@ function clonePersistenceState(state) {
     promptShuffle: Array.isArray(state?.promptShuffle) ? state.promptShuffle.map((v) => Number(v)) : [],
     promptCycle: String(state?.promptCycle ?? "fixed"),
     overwriteEnhanced: !!state?.overwriteEnhanced,
+    batchCount: normalizeEnhanceBatchCount(state?.batchCount ?? ENHANCE_BATCH_MIN),
     enhancementPreset: String(state?.enhancementPreset ?? ""),
     enhancementText: String(state?.enhancementText ?? ""),
     seed: Number(state?.seed ?? 0),
@@ -1142,14 +1652,16 @@ function restoreEnhancementState(node) {
   node.__promptEnhancerRestoringState = true;
   node.__promptEnhancerSyncingHistory = true;
   try {
+    setWidgetValue(widget(node, "prompt_preset"), state.promptPreset || "Custom", false);
     setWidgetValue(widget(node, "prompt"), state.prompt, false);
     setWidgetValue(widget(node, "prompt_set"), state.promptSet || PROMPT_SET_NONE, false);
     setWidgetValue(widget(node, "prompt_cycle"), state.promptCycle || "fixed", false);
-    setWidgetValue(widget(node, "overwrite_enhanced"), state.overwriteEnhanced, false);
+    node.__promptEnhancerBatchCount = normalizeEnhanceBatchCount(state.batchCount ?? ENHANCE_BATCH_MIN);
+    setWidgetValue(widget(node, "overwrite_enhanced"), node.__promptEnhancerBatchCount > 1 ? false : state.overwriteEnhanced, false);
     setWidgetValue(widget(node, "enhancement_preset"), state.enhancementPreset, false);
     setWidgetValue(widget(node, "enhancement_text"), state.enhancementText, false);
     setWidgetValue(widget(node, "seed"), Math.max(0, Math.trunc(Number(state.seed) || 0)), false);
-    setWidgetValue(widget(node, "enhance_with_workflow"), state.enhanceWithWorkflow, false);
+    setWidgetValue(widget(node, "enhance_with_workflow"), node.__promptEnhancerBatchCount > 1 ? false : state.enhanceWithWorkflow, false);
 
     const history = state.promptHistory;
     const index = history.length
@@ -1297,6 +1809,42 @@ function wrapPresetCallback(node) {
   };
 }
 
+function wrapPromptPresetCallbacks(node) {
+  const selector = widget(node, "prompt_preset");
+  if (selector && !selector.__promptEnhancerPromptPresetWrapped) {
+    selector.__promptEnhancerPromptPresetWrapped = true;
+    const original = selector.callback;
+    selector.callback = function (...args) {
+      const result = original?.apply(this, args);
+      const value = String(this?.value ?? args?.[0] ?? "Custom");
+      if (!node.__promptEnhancerApplyingPromptPreset && !node.__promptEnhancerRestoringState) {
+        void applyPromptPresetSelection(node, value);
+        markWorkflowChanged(node);
+      }
+      persistEnhancementState(node);
+      scheduleDomPanelSync(node);
+      return result;
+    };
+  }
+
+  const promptWidget = widget(node, "prompt");
+  if (promptWidget && !promptWidget.__promptEnhancerPromptPresetTextWrapped) {
+    promptWidget.__promptEnhancerPromptPresetTextWrapped = true;
+    const original = promptWidget.callback;
+    promptWidget.callback = function (...args) {
+      const result = original?.apply(this, args);
+      if (!node.__promptEnhancerApplyingPromptPreset && !node.__promptEnhancerRestoringState) {
+        const preset = widget(node, "prompt_preset");
+        if (preset && String(preset.value ?? "Custom") !== "Custom") setWidgetValue(preset, "Custom", false);
+        persistEnhancementState(node);
+        markWorkflowChanged(node);
+      }
+      scheduleDomPanelSync(node);
+      return result;
+    };
+  }
+}
+
 function wrapPromptSetCallback(node) {
   const setWidget = widget(node, "prompt_set");
   if (!setWidget || setWidget.__promptEnhancerPromptSetWrapped) return;
@@ -1343,6 +1891,94 @@ function panelElement(tag, className = "") {
   return el;
 }
 
+function panelHasScrollableOverflow(el) {
+  if (!(el instanceof HTMLElement)) return false;
+  try {
+    const style = getComputedStyle(el);
+    const scrollY = /^(auto|scroll|overlay)$/.test(style.overflowY) && el.scrollHeight > el.clientHeight + 1;
+    const scrollX = /^(auto|scroll|overlay)$/.test(style.overflowX) && el.scrollWidth > el.clientWidth + 1;
+    return scrollY || scrollX;
+  } catch (_) {
+    return false;
+  }
+}
+
+// Current ComfyUI Nodes 2.0 lets a DOM subtree opt out of canvas wheel handling
+// with data-capture-wheel="true". Mark only genuinely overflowing controls;
+// ordinary DOM regions continue to forward wheel input to the workspace canvas.
+function panelWrapScrollableControl(scrollEl) {
+  const shell = panelElement("div", "pe-wheel-capture");
+  shell.tabIndex = -1;
+  shell.__promptEnhancerWheelScrollElement = scrollEl;
+  shell.appendChild(scrollEl);
+
+  const syncCapture = () => {
+    if (panelHasScrollableOverflow(scrollEl)) shell.dataset.captureWheel = "true";
+    else shell.removeAttribute("data-capture-wheel");
+  };
+  scrollEl.__promptEnhancerSyncWheelCapture = syncCapture;
+
+  // Hovering a scrollable field is enough for that field to own the wheel.
+  // Do not move keyboard focus just to make scrolling work: native textarea/
+  // scroll-container wheel behavior does not require focus, and focus stealing
+  // was the reason some fields still leaked wheel input back to the workspace.
+  shell.addEventListener("pointerenter", syncCapture);
+  scrollEl.addEventListener("input", () => requestAnimationFrame(syncCapture));
+  requestAnimationFrame(syncCapture);
+  return shell;
+}
+
+function panelShouldCaptureWheel(event, root) {
+  const target = event.target instanceof Element ? event.target : null;
+  const capture = target?.closest?.(".pe-wheel-capture");
+  if (!capture || !root.contains(capture)) return false;
+  const scrollEl = capture.__promptEnhancerWheelScrollElement;
+  const scrollable = !!scrollEl && panelHasScrollableOverflow(scrollEl);
+  if (scrollable) capture.dataset.captureWheel = "true";
+  else capture.removeAttribute("data-capture-wheel");
+  return scrollable;
+}
+
+// DOM widgets are separate browser hit targets from LiteGraph's <canvas> in
+// Classic mode. Merely allowing a wheel event to bubble therefore cannot make
+// the canvas see it. Current ComfyUI uses the same forwarding pattern for Vue
+// UI surfaces: consume the original event and dispatch an equivalent wheel
+// event directly at the real canvas element. This also works as a fallback when
+// a Nodes 2.0 host does not forward a particular custom DOM subtree itself.
+function panelForwardWheelToCanvas(event) {
+  const canvasEl = app?.canvas?.canvas;
+  if (!(canvasEl instanceof HTMLCanvasElement)) return false;
+  event.preventDefault();
+  event.stopPropagation();
+  canvasEl.dispatchEvent(new WheelEvent("wheel", {
+    clientX: event.clientX,
+    clientY: event.clientY,
+    screenX: event.screenX,
+    screenY: event.screenY,
+    deltaX: event.deltaX,
+    deltaY: event.deltaY,
+    deltaZ: event.deltaZ,
+    deltaMode: event.deltaMode,
+    ctrlKey: event.ctrlKey,
+    metaKey: event.metaKey,
+    shiftKey: event.shiftKey,
+    altKey: event.altKey,
+    bubbles: false,
+    cancelable: true,
+  }));
+  return true;
+}
+
+function panelHandleWheel(event, root) {
+  // Any genuinely overflowing DOM field owns wheel input while hovered. Only
+  // non-scrollable overlay regions are forwarded to the ComfyUI workspace.
+  if (panelShouldCaptureWheel(event, root)) {
+    event.stopPropagation();
+    return;
+  }
+  panelForwardWheelToCanvas(event);
+}
+
 function hideNativeWidgetForPanel(w) {
   if (!w || w.__promptEnhancerDomHidden) return;
   w.__promptEnhancerDomHidden = true;
@@ -1358,6 +1994,7 @@ function hideNativeWidgetForPanel(w) {
 function hideNativeWidgetsForPanel(node) {
   if (!node?.__promptEnhancerDomPanelWidget) return;
   for (const name of [
+    "prompt_preset",
     "prompt",
     "enhanced_prompt",
     "prompt_set",
@@ -1408,9 +2045,12 @@ function setPanelSelectOptions(select, values, selected) {
 function setPanelNativeValue(node, name, value) {
   const w = widget(node, name);
   if (!w) return;
-  setWidgetValue(w, value, true);
+  const batchLocked = enhanceBatchCount(node) > 1;
+  const next = batchLocked && (name === "overwrite_enhanced" || name === "enhance_with_workflow") ? false : value;
+  setWidgetValue(w, next, true);
   persistEnhancementState(node);
   markWorkflowChanged(node);
+  if (name === "prompt_cycle" || name === "enhance_with_workflow") resetBackendPromptCycle(node);
   scheduleDomPanelSync(node);
 }
 
@@ -1643,6 +2283,126 @@ function createPanelNumberControl(node, name, labelText) {
   return { shell, input };
 }
 
+
+function createEnhanceBatchNumberControl(node) {
+  const shell = panelElement("div", "pe-number pe-batch-number");
+  shell.title = `Number of enhanced prompts to generate (${ENHANCE_BATCH_MIN}-${ENHANCE_BATCH_MAX})`;
+  const fill = panelElement("div", "pe-number-fill");
+  const dec = panelElement("button", "pe-number-step pe-number-dec");
+  dec.type = "button";
+  dec.setAttribute("aria-label", "Decrease enhancement batch count");
+  dec.appendChild(panelNumberStepIcon("minus"));
+  const center = panelElement("div", "pe-number-center");
+  const input = panelElement("input", "pe-number-input");
+  input.type = "text";
+  input.inputMode = "numeric";
+  input.autocomplete = "off";
+  input.spellcheck = false;
+  input.setAttribute("role", "spinbutton");
+  input.setAttribute("aria-label", "Enhancement batch count");
+  input.setAttribute("aria-valuemin", String(ENHANCE_BATCH_MIN));
+  input.setAttribute("aria-valuemax", String(ENHANCE_BATCH_MAX));
+  const scrub = panelElement("div", "pe-number-scrub");
+  scrub.setAttribute("aria-hidden", "true");
+  const inc = panelElement("button", "pe-number-step pe-number-inc");
+  inc.type = "button";
+  inc.setAttribute("aria-label", "Increase enhancement batch count");
+  inc.appendChild(panelNumberStepIcon("plus"));
+  center.append(input, scrub);
+  shell.append(fill, dec, center, inc);
+
+  const sync = () => {
+    const count = enhanceBatchCount(node);
+    if (!(shell.classList.contains("pe-number-editing") && document.activeElement === input)) {
+      input.value = String(count);
+    }
+    input.setAttribute("aria-valuenow", String(count));
+    fill.style.display = "block";
+    fill.style.width = `${((count - ENHANCE_BATCH_MIN) / (ENHANCE_BATCH_MAX - ENHANCE_BATCH_MIN)) * 100}%`;
+    const disabled = !!node.__promptEnhancerBusy;
+    input.disabled = disabled;
+    shell.classList.toggle("pe-number-disabled", disabled);
+    dec.disabled = disabled || count <= ENHANCE_BATCH_MIN;
+    inc.disabled = disabled || count >= ENHANCE_BATCH_MAX;
+  };
+
+  const nudge = (direction, multiplier = 1) => {
+    if (input.disabled) return;
+    setEnhanceBatchCount(node, enhanceBatchCount(node) + direction * multiplier);
+    sync();
+  };
+  dec.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); nudge(-1); });
+  inc.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); nudge(1); });
+
+  const startEditing = () => {
+    if (input.disabled) return;
+    shell.classList.add("pe-number-editing");
+    input.value = String(enhanceBatchCount(node));
+    requestAnimationFrame(() => {
+      try { input.focus({ preventScroll: true }); input.select(); } catch (_) {}
+    });
+  };
+  const commit = () => {
+    if (!shell.classList.contains("pe-number-editing")) return;
+    setEnhanceBatchCount(node, input.value);
+    shell.classList.remove("pe-number-editing");
+    sync();
+  };
+  input.addEventListener("blur", commit);
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") { event.preventDefault(); commit(); input.blur(); }
+    else if (event.key === "Escape") { event.preventDefault(); shell.classList.remove("pe-number-editing"); sync(); input.blur(); }
+    else if (event.key === "ArrowUp") { event.preventDefault(); nudge(1); }
+    else if (event.key === "ArrowDown") { event.preventDefault(); nudge(-1); }
+    else if (event.key === "PageUp") { event.preventDefault(); nudge(1, 10); }
+    else if (event.key === "PageDown") { event.preventDefault(); nudge(-1, 10); }
+  });
+
+  scrub.addEventListener("pointerdown", (event) => {
+    if (input.disabled || event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const pointerId = event.pointerId;
+    const startX = event.clientX;
+    const startValue = enhanceBatchCount(node);
+    let appliedSteps = 0;
+    let moved = false;
+    shell.classList.add("pe-number-scrubbing");
+    try { scrub.setPointerCapture(pointerId); } catch (_) {}
+    const move = (ev) => {
+      if (ev.pointerId !== pointerId) return;
+      // New number controls use the same fast scrub feel as the Local LLM panel:
+      // approximately one configured step per horizontal pixel.
+      const totalSteps = Math.trunc(ev.clientX - startX);
+      if (totalSteps !== 0) moved = true;
+      if (totalSteps === appliedSteps) return;
+      appliedSteps = totalSteps;
+      setEnhanceBatchCount(node, startValue + totalSteps);
+      sync();
+      ev.preventDefault();
+      ev.stopPropagation();
+    };
+    const finish = (ev, cancelled = false) => {
+      if (ev.pointerId !== pointerId) return;
+      scrub.removeEventListener("pointermove", move);
+      scrub.removeEventListener("pointerup", up);
+      scrub.removeEventListener("pointercancel", cancel);
+      shell.classList.remove("pe-number-scrubbing");
+      try { scrub.releasePointerCapture(pointerId); } catch (_) {}
+      if (!cancelled && !moved && Math.abs(ev.clientX - startX) < 4) startEditing();
+      ev.preventDefault();
+      ev.stopPropagation();
+    };
+    const up = (ev) => finish(ev, false);
+    const cancel = (ev) => finish(ev, true);
+    scrub.addEventListener("pointermove", move);
+    scrub.addEventListener("pointerup", up);
+    scrub.addEventListener("pointercancel", cancel);
+  });
+
+  sync();
+  return { shell, input, sync };
+}
 
 function createHistoryIndexNumberControl(node) {
   const shell = panelElement("div", "pe-number pe-history-number");
@@ -1913,7 +2673,10 @@ function createPromptEnhancerDomPanel(node) {
   for (const eventName of ["pointerdown", "mousedown", "touchstart", "click", "dblclick", "contextmenu"]) {
     root.addEventListener(eventName, (event) => event.stopPropagation());
   }
-  root.addEventListener("wheel", (event) => event.stopPropagation(), { passive: true });
+  // Wheel events targeted at a DOM widget do not naturally reach LiteGraph's
+  // canvas in Classic mode. Forward all non-scrollable wheel input explicitly;
+  // overflowing textareas remain native scroll surfaces.
+  root.addEventListener("wheel", (event) => panelHandleWheel(event, root), { passive: false });
 
   const css = panelElement("style");
   css.textContent = `
@@ -1926,6 +2689,7 @@ function createPromptEnhancerDomPanel(node) {
     .local-llm-prompt-enhancer-panel .pe-seed-grid,
     .local-llm-prompt-enhancer-panel .pe-boolean-field,
     .local-llm-prompt-enhancer-panel .pe-toggle-group { min-width: 0; max-width: 100%; }
+    .local-llm-prompt-enhancer-panel .pe-wheel-capture { display: block; width: 100%; min-width: 0; max-width: 100%; outline: none; }
     .local-llm-prompt-enhancer-panel .pe-textarea {
       width: 100%; min-width: 0; max-width: 100%; color: inherit; font: inherit;
       background: rgba(127,127,127,.12);
@@ -1967,6 +2731,8 @@ function createPromptEnhancerDomPanel(node) {
     .local-llm-prompt-enhancer-panel .pe-button:active:not(:disabled) { transform: translateY(1px); }
     .local-llm-prompt-enhancer-panel .pe-button:disabled { opacity: .42; cursor: default; }
     .local-llm-prompt-enhancer-panel .pe-enhance { flex: 1 1 150px; color: white; }
+    .local-llm-prompt-enhancer-panel .pe-batch-number { flex: 0 0 112px; width: 112px; min-width: 104px; }
+    .local-llm-prompt-enhancer-panel .pe-batch-number .pe-number-step { flex-basis: 32px; width: 32px; }
     .local-llm-prompt-enhancer-panel .pe-grow { flex: 1 1 135px; }
     .local-llm-prompt-enhancer-panel .pe-select { min-height: 38px; padding: 5px 8px; }
     .local-llm-prompt-enhancer-panel .pe-selector-actions {
@@ -1985,7 +2751,7 @@ function createPromptEnhancerDomPanel(node) {
     .local-llm-prompt-enhancer-panel .pe-icon-button.pe-delete:not(:disabled) { color: #ffb4b4; }
     .local-llm-prompt-enhancer-panel .pe-number {
       position: relative; display: flex; align-items: stretch; width: 100%; min-width: 0;
-      height: 38px; overflow: hidden; border: 1px solid rgba(127,127,127,.38);
+      height: 30px; overflow: hidden; border: 1px solid rgba(127,127,127,.38);
       border-radius: 10px; background: rgba(127,127,127,.14); color: inherit;
       font-variant-numeric: tabular-nums; isolation: isolate; user-select: none;
     }
@@ -1994,7 +2760,7 @@ function createPromptEnhancerDomPanel(node) {
       background: rgba(71,133,181,.38); transition: width .06s linear;
     }
     .local-llm-prompt-enhancer-panel .pe-number-step {
-      position: relative; z-index: 2; flex: 0 0 38px; width: 38px; height: 100%; padding: 0;
+      position: relative; z-index: 2; flex: 0 0 32px; width: 32px; height: 100%; padding: 0;
       border: 0; border-radius: 0; background: transparent; color: rgba(235,235,235,.6);
       display: flex; align-items: center; justify-content: center; cursor: pointer; touch-action: manipulation;
     }
@@ -2002,7 +2768,7 @@ function createPromptEnhancerDomPanel(node) {
     .local-llm-prompt-enhancer-panel .pe-number-step:active:not(:disabled) { background: rgba(255,255,255,.11); }
     .local-llm-prompt-enhancer-panel .pe-number-step:disabled { opacity: .28; cursor: default; }
     .local-llm-prompt-enhancer-panel .pe-number-step svg {
-      width: 22px; height: 22px; stroke: currentColor; fill: none; stroke-width: 2;
+      width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2;
       stroke-linecap: round; stroke-linejoin: round; pointer-events: none;
     }
     .local-llm-prompt-enhancer-panel .pe-number-center { position: relative; z-index: 2; min-width: 4ch; flex: 1 1 auto; height: 100%; }
@@ -2019,9 +2785,9 @@ function createPromptEnhancerDomPanel(node) {
     .local-llm-prompt-enhancer-panel .pe-number-scrubbing .pe-number-fill { transition: none; }
     .local-llm-prompt-enhancer-panel .pe-number-disabled { opacity: .48; }
     .local-llm-prompt-enhancer-panel .pe-number-disabled .pe-number-scrub { cursor: default; }
-    .local-llm-prompt-enhancer-panel .pe-field { display: grid; grid-template-columns: minmax(118px, 38%) 1fr; gap: 8px; align-items: center; }
-    .local-llm-prompt-enhancer-panel .pe-field-label { font-weight: 600; opacity: .9; min-width: 0; }
-    .local-llm-prompt-enhancer-panel .pe-boolean-field { display: grid; gap: 4px; width: 100%; }
+    .local-llm-prompt-enhancer-panel .pe-field { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px; align-items: center; width: 100%; }
+    .local-llm-prompt-enhancer-panel .pe-field-label { font-weight: 600; opacity: .9; min-width: 0; white-space: nowrap; }
+    .local-llm-prompt-enhancer-panel .pe-boolean-field { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px; align-items: center; width: 100%; }
     .local-llm-prompt-enhancer-panel .pe-toggle-group {
       display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 2px;
       width: 100%; padding: 2px; border-radius: 7px;
@@ -2052,20 +2818,23 @@ function createPromptEnhancerDomPanel(node) {
       pointer-events: none; font-weight: 500; user-select: none;
     }
     .local-llm-prompt-enhancer-panel .pe-seed-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 7px; }
-    .local-llm-prompt-enhancer-panel .pe-mini-label { display: block; font-size: 11px; font-weight: 600; opacity: .75; margin: 0 0 3px 2px; }
+    .local-llm-prompt-enhancer-panel .pe-mini-label { display: block; font-size: 11px; font-weight: 600; opacity: .75; margin: 0 0 3px 2px; white-space: nowrap; }
     .local-llm-prompt-enhancer-panel .pe-seed-disabled { opacity: .48; }
     .local-llm-prompt-enhancer-panel .pe-badge { font-size: 11px; opacity: .75; margin-left: auto; }
     .local-llm-prompt-enhancer-panel .pe-count { min-width: 42px; text-align: center; opacity: .72; font-variant-numeric: tabular-nums; }
     @media (max-width: 520px) {
       .local-llm-prompt-enhancer-panel .pe-button { min-height: 42px; }
       .local-llm-prompt-enhancer-panel .pe-toggle-option { min-height: 40px; }
-      .local-llm-prompt-enhancer-panel .pe-history-number { height: 44px; }
+      .local-llm-prompt-enhancer-panel .pe-history-number { height: 34px; }
       .local-llm-prompt-enhancer-panel .pe-selector-actions { grid-template-columns: 44px minmax(0, 1fr) 44px; }
       .local-llm-prompt-enhancer-panel .pe-icon-button { width: 44px; min-width: 44px; }
       .local-llm-prompt-enhancer-panel .pe-select { min-height: 42px; }
-      .local-llm-prompt-enhancer-panel .pe-number { height: 44px; }
-      .local-llm-prompt-enhancer-panel .pe-number-step { flex-basis: 44px; width: 44px; }
-      .local-llm-prompt-enhancer-panel .pe-field { grid-template-columns: 1fr; gap: 4px; }
+      .local-llm-prompt-enhancer-panel .pe-number { height: 34px; }
+      .local-llm-prompt-enhancer-panel .pe-number-step { flex-basis: 36px; width: 36px; }
+      .local-llm-prompt-enhancer-panel .pe-batch-number { flex: 0 0 132px; width: 132px; min-width: 132px; }
+      .local-llm-prompt-enhancer-panel .pe-batch-number .pe-number-step { flex-basis: 36px; width: 36px; }
+      .local-llm-prompt-enhancer-panel .pe-field,
+      .local-llm-prompt-enhancer-panel .pe-boolean-field { grid-template-columns: 1fr; gap: 4px; }
       .local-llm-prompt-enhancer-panel .pe-seed-grid { grid-template-columns: 1fr; }
       .local-llm-prompt-enhancer-panel .pe-textarea { min-height: 120px; }
     }
@@ -2074,27 +2843,54 @@ function createPromptEnhancerDomPanel(node) {
 
   const controls = {};
 
+  const promptPresetField = panelElement("div", "pe-field");
+  promptPresetField.appendChild(panelFieldLabel("Prompt Preset"));
+  const promptPresetSelector = panelElement("div", "pe-selector-actions");
+  controls.savePromptPreset = panelIconButton("save", "Save Prompt Preset", () => void savePromptPreset(node));
+  controls.promptPreset = panelElement("select", "pe-select");
+  controls.promptPreset.addEventListener("change", () => setPanelNativeValue(node, "prompt_preset", controls.promptPreset.value));
+  controls.deletePromptPreset = panelIconButton("delete", "Delete selected Prompt Preset", () => void deletePromptPreset(node));
+  promptPresetSelector.append(controls.savePromptPreset, controls.promptPreset, controls.deletePromptPreset);
+  promptPresetField.appendChild(promptPresetSelector);
+  root.appendChild(promptPresetField);
+
   controls.prompt = panelElement("textarea", "pe-textarea");
   controls.prompt.placeholder = "prompt";
   controls.prompt.spellcheck = true;
   controls.prompt.title = widget(node, "prompt")?.options?.tooltip || "Prompt";
   controls.prompt.addEventListener("input", () => setPanelNativeValue(node, "prompt", controls.prompt.value));
-  root.appendChild(controls.prompt);
+  root.appendChild(panelWrapScrollableControl(controls.prompt));
 
   const enhanceRow = panelElement("div", "pe-row");
   controls.enhance = panelButton("Enhance Prompt", "Enhance the current prompt", () => toggleEnhance(node));
   controls.enhance.classList.add("pe-enhance");
+  controls.batch = createEnhanceBatchNumberControl(node);
   controls.promote = panelButton("↑", "Use Enhanced Prompt as Prompt", () => useEnhancedAsPrompt(node));
   controls.undoPromotion = panelButton("Undo", "Undo Prompt replacement", () => undoPromptPromotion(node));
-  enhanceRow.append(controls.enhance, controls.promote, controls.undoPromotion);
+  enhanceRow.append(controls.enhance);
+  if (controls.batch?.shell) enhanceRow.append(controls.batch.shell);
+  enhanceRow.append(controls.promote, controls.undoPromotion);
   root.appendChild(enhanceRow);
+
+  const overwriteField = panelElement("div", "pe-boolean-field");
+  overwriteField.appendChild(panelFieldLabel("Overwrite Enhanced"));
+  const overwriteToggle = panelElement("div", "pe-toggle-group");
+  overwriteToggle.setAttribute("role", "group");
+  overwriteToggle.setAttribute("aria-label", "Overwrite Enhanced");
+  controls.overwriteOff = panelButton("add new", "Append a new enhanced prompt", () => setPanelNativeValue(node, "overwrite_enhanced", false));
+  controls.overwriteOn = panelButton("overwrite active", "Replace the active enhanced prompt", () => setPanelNativeValue(node, "overwrite_enhanced", true));
+  controls.overwriteOff.classList.add("pe-toggle-option");
+  controls.overwriteOn.classList.add("pe-toggle-option");
+  overwriteToggle.append(controls.overwriteOff, controls.overwriteOn);
+  overwriteField.appendChild(overwriteToggle);
+  root.appendChild(overwriteField);
 
   controls.enhanced = panelElement("textarea", "pe-textarea");
   controls.enhanced.placeholder = "enhanced_prompt";
   controls.enhanced.spellcheck = true;
   controls.enhanced.title = widget(node, "enhanced_prompt")?.options?.tooltip || "Enhanced Prompt";
   controls.enhanced.addEventListener("input", () => setPanelNativeValue(node, "enhanced_prompt", controls.enhanced.value));
-  root.appendChild(controls.enhanced);
+  root.appendChild(panelWrapScrollableControl(controls.enhanced));
 
   const historyRow = panelElement("div", "pe-row");
   const historyNumber = createHistoryIndexNumberControl(node);
@@ -2127,19 +2923,6 @@ function createPromptEnhancerDomPanel(node) {
   cycleField.appendChild(controls.promptCycle);
   root.appendChild(cycleField);
 
-  const overwriteField = panelElement("div", "pe-boolean-field");
-  overwriteField.appendChild(panelFieldLabel("Overwrite Enhanced"));
-  const overwriteToggle = panelElement("div", "pe-toggle-group");
-  overwriteToggle.setAttribute("role", "group");
-  overwriteToggle.setAttribute("aria-label", "Overwrite Enhanced");
-  controls.overwriteOff = panelButton("add new", "Append a new enhanced prompt", () => setPanelNativeValue(node, "overwrite_enhanced", false));
-  controls.overwriteOn = panelButton("overwrite active", "Replace the active enhanced prompt", () => setPanelNativeValue(node, "overwrite_enhanced", true));
-  controls.overwriteOff.classList.add("pe-toggle-option");
-  controls.overwriteOn.classList.add("pe-toggle-option");
-  overwriteToggle.append(controls.overwriteOff, controls.overwriteOn);
-  overwriteField.appendChild(overwriteToggle);
-  root.appendChild(overwriteField);
-
   const presetField = panelElement("div", "pe-field");
   presetField.appendChild(panelFieldLabel("Enhancement Preset"));
   const presetSelector = panelElement("div", "pe-selector-actions");
@@ -2156,13 +2939,9 @@ function createPromptEnhancerDomPanel(node) {
   controls.instructions.spellcheck = true;
   controls.instructions.title = widget(node, "enhancement_text")?.options?.tooltip || "Enhancement Instructions";
   controls.instructions.addEventListener("input", () => setPanelNativeValue(node, "enhancement_text", controls.instructions.value));
-  root.appendChild(controls.instructions);
+  root.appendChild(panelWrapScrollableControl(controls.instructions));
 
   controls.seedWrap = panelElement("div");
-  const seedHeader = panelElement("div", "pe-row");
-  controls.settingsBadge = panelElement("span", "pe-badge");
-  seedHeader.appendChild(controls.settingsBadge);
-  controls.seedWrap.appendChild(seedHeader);
   const seedGrid = panelElement("div", "pe-seed-grid");
   const seedValueBox = panelElement("div");
   const seedValueLabel = panelElement("label", "pe-mini-label");
@@ -2258,7 +3037,12 @@ function createPromptEnhancerDomPanel(node) {
     observer.observe(content);
     node.__promptEnhancerPanelResizeObserver = observer;
 
-    const textareaObserver = new ResizeObserver(() => captureTextareaHeights(node));
+    const textareaObserver = new ResizeObserver(() => {
+      captureTextareaHeights(node);
+      controls.prompt.__promptEnhancerSyncWheelCapture?.();
+      controls.enhanced.__promptEnhancerSyncWheelCapture?.();
+      controls.instructions.__promptEnhancerSyncWheelCapture?.();
+    });
     textareaObserver.observe(controls.prompt);
     textareaObserver.observe(controls.enhanced);
     textareaObserver.observe(controls.instructions);
@@ -2354,11 +3138,16 @@ function syncDomPanel(node) {
   if (!c) return;
 
   const prompt = String(widget(node, "prompt")?.value ?? "");
+  const promptPresetWidget = widget(node, "prompt_preset");
+  setPanelSelectOptions(c.promptPreset, panelComboValues(promptPresetWidget), promptPresetWidget?.value ?? "Custom");
   const enhanced = String(widget(node, "enhanced_prompt")?.value ?? "");
   const instructions = String(widget(node, "enhancement_text")?.value ?? "");
   if (c.prompt.value !== prompt) c.prompt.value = prompt;
   if (c.enhanced.value !== enhanced) c.enhanced.value = enhanced;
   if (c.instructions.value !== instructions) c.instructions.value = instructions;
+  c.prompt.__promptEnhancerSyncWheelCapture?.();
+  c.enhanced.__promptEnhancerSyncWheelCapture?.();
+  c.instructions.__promptEnhancerSyncWheelCapture?.();
 
   const promptSetWidget = widget(node, "prompt_set");
   setPanelSelectOptions(c.promptSet, panelComboValues(promptSetWidget), promptSetWidget?.value ?? PROMPT_SET_NONE);
@@ -2367,6 +3156,14 @@ function syncDomPanel(node) {
   const presetWidget = widget(node, "enhancement_preset");
   setPanelSelectOptions(c.preset, panelComboValues(presetWidget), presetWidget?.value ?? DEFAULT_PRESET);
 
+  const batchCount = enhanceBatchCount(node);
+  if (batchCount > 1) {
+    enforceBatchAddNew(node, { mark: false });
+    enforceBatchWorkflowDisabled(node, { mark: false });
+  }
+  c.batch?.sync?.();
+  const overwriteLocked = batchCount > 1;
+  const workflowLocked = batchCount > 1;
   const overwriteEnabled = !!widget(node, "overwrite_enhanced")?.value;
   c.overwriteOff.classList.toggle("pe-active", !overwriteEnabled);
   c.overwriteOn.classList.toggle("pe-active", overwriteEnabled);
@@ -2384,12 +3181,9 @@ function syncDomPanel(node) {
   const controlValues = panelComboValues(seedControl);
   setPanelSelectOptions(c.seedControl, controlValues.length ? controlValues : ["fixed", "increment", "decrement", "randomize"], seedControl?.value ?? "fixed");
 
-  const settingsConnected = hasConnectedSettings(node);
-  setPanelNumberDisabled(c.seed, settingsConnected);
-  c.seedControl.disabled = settingsConnected;
-  c.seedWrap.classList.toggle("pe-seed-disabled", settingsConnected);
-  c.settingsBadge.textContent = settingsConnected ? "Local LLM Settings connected" : "";
-  c.seedWrap.title = settingsConnected ? "Seed and Control After Generate are controlled by the connected Local LLM Settings node." : "";
+  setPanelNumberDisabled(c.seed, false);
+  c.seedControl.disabled = false;
+  c.seedWrap.classList.toggle("pe-seed-disabled", false);
 
   const busy = !!node.__promptEnhancerBusy;
   const enhancing = busy && node.__promptEnhancerActiveAction === "enhance";
@@ -2397,11 +3191,18 @@ function syncDomPanel(node) {
   const hasHistory = history.length > 0 || !!enhanced.trim();
   c.historyNumber?.sync?.();
 
-  c.enhance.textContent = enhancing ? "Cancel" : "Enhance Prompt";
+  const batchProgress = node.__promptEnhancerBatchProgress;
+  c.enhance.textContent = enhancing
+    ? (batchProgress?.total > 1 ? `Cancel ${batchProgress.current}/${batchProgress.total}` : "Cancel")
+    : "Enhance Prompt";
   c.enhance.style.background = enhancing ? "#e0b33f" : "#2f9e44";
   c.enhance.style.color = enhancing ? "#201a00" : "#ffffff";
   c.enhance.disabled = busy && !enhancing;
 
+  c.promptPreset.disabled = busy;
+  c.savePromptPreset.disabled = busy;
+  const promptPresetName = String(promptPresetWidget?.value ?? "Custom");
+  c.deletePromptPreset.disabled = busy || promptPresetName === "Custom" || !node.__promptEnhancerPromptPresetCatalog?.deletable?.has(promptPresetName);
   c.promote.disabled = busy || !hasHistory;
   c.undoPromotion.disabled = busy || !(node.__promptEnhancerPromptHistory || []).length;
   c.deletePrompt.disabled = busy || !hasHistory;
@@ -2414,12 +3215,18 @@ function syncDomPanel(node) {
   c.deletePromptSet.disabled = busy || !promptSetName || promptSetName === PROMPT_SET_NONE;
   c.promptSet.disabled = busy;
   c.promptCycle.disabled = busy;
-  c.overwriteOff.disabled = busy;
-  c.overwriteOn.disabled = busy;
+  c.overwriteOff.disabled = busy || overwriteLocked;
+  c.overwriteOn.disabled = busy || overwriteLocked;
+  const overwriteLockHint = overwriteLocked ? "Batch count above 1 requires Add New. Set the batch count back to 1 to unlock this control." : "";
+  c.overwriteOff.title = overwriteLockHint || "Append a new enhanced prompt";
+  c.overwriteOn.title = overwriteLockHint || "Replace the active enhanced prompt";
   c.preset.disabled = busy;
   c.instructions.disabled = busy;
-  c.enhanceWorkflowOff.disabled = busy;
-  c.enhanceWorkflowOn.disabled = busy;
+  c.enhanceWorkflowOff.disabled = busy || workflowLocked;
+  c.enhanceWorkflowOn.disabled = busy || workflowLocked;
+  const workflowLockHint = workflowLocked ? "Batch count above 1 disables Enhance with Workflow. Set the batch count back to 1 to unlock this control." : "";
+  c.enhanceWorkflowOff.title = workflowLockHint || "Use the stored enhanced-prompt array during workflow execution";
+  c.enhanceWorkflowOn.title = workflowLockHint || "Generate a fresh enhanced prompt during workflow execution";
   c.saveTemplate.disabled = busy;
 
   const selected = selectedTemplate(node);
@@ -2431,7 +3238,7 @@ function wrapDomPanelSyncCallbacks(node) {
   if (!node || node.__promptEnhancerDomSyncWrapped) return;
   node.__promptEnhancerDomSyncWrapped = true;
   const widgets = [
-    "prompt", "enhanced_prompt", "prompt_set", "prompt_cycle", "overwrite_enhanced",
+    "prompt_preset", "prompt", "enhanced_prompt", "prompt_set", "prompt_cycle", "overwrite_enhanced",
     "enhancement_preset", "enhancement_text", "seed", "enhance_with_workflow",
     "prompt_history_json", "prompt_history_index", "prompt_shuffle_json",
   ].map((name) => widget(node, name)).filter(Boolean);
@@ -2450,14 +3257,83 @@ function wrapDomPanelSyncCallbacks(node) {
 }
 
 function wrapNodeExecuted(node) {
+  // Prompt Enhancer execution mirroring is intentionally handled by the global
+  // API `executed` listener below. Tying state changes to node.onExecuted made
+  // Prompt Cycle depend on renderer lifecycle/mount state in some Nodes 2.0
+  // situations (most visibly when the node was not selected). Keep this helper
+  // as a no-op marker for hot-reload/backward compatibility.
   if (!node || node.__promptEnhancerExecutedWrapped) return;
   node.__promptEnhancerExecutedWrapped = true;
-  const original = node.onExecuted;
-  node.onExecuted = function (output) {
-    try { original?.call(this, output); } catch (error) { console.error(error); }
-    try { handleEnhanceExecuted(this, output); }
-    catch (error) { console.error("[Local LLM Prompt Enhancer] execution sync failed", error); }
-  };
+}
+
+function executionGraphNodeById(graph, rawId, seen = new Set()) {
+  if (!graph || rawId == null || seen.has(graph)) return null;
+  seen.add(graph);
+  const ids = [rawId, String(rawId)];
+  const numeric = Number(rawId);
+  if (Number.isFinite(numeric)) ids.push(numeric);
+  for (const id of ids) {
+    try {
+      const direct = graph.getNodeById?.(id);
+      if (direct) return direct;
+    } catch (_) {}
+  }
+  for (const candidate of graph._nodes || []) {
+    if (!candidate) continue;
+    if (String(candidate.id) === String(rawId)) return candidate;
+    const subgraph = candidate.subgraph || candidate.graph?.subgraph;
+    const nested = executionGraphNodeById(subgraph, rawId, seen);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function promptEnhancerNodeForExecutedDetail(detail) {
+  const ids = [detail?.display_node, detail?.node].filter((value) => value != null);
+  const roots = [app?.rootGraph, app?.graph].filter(Boolean);
+  for (const id of ids) {
+    for (const graph of roots) {
+      const node = executionGraphNodeById(graph, id);
+      if (node?.comfyClass === NODE_CLASS) return node;
+    }
+  }
+  return null;
+}
+
+function handlePromptEnhancerExecutedEvent(detail) {
+  const node = promptEnhancerNodeForExecutedDetail(detail);
+  if (!node) return;
+  try {
+    handleEnhanceExecuted(node, detail?.output);
+  } catch (error) {
+    console.error("[Local LLM Prompt Enhancer] global execution sync failed", error);
+  }
+}
+
+function moveSettingsInputToTop(node) {
+  const inputs = node?.inputs;
+  if (!Array.isArray(inputs)) return;
+  const index = inputs.findIndex((input) => input?.name === "settings");
+  if (index < 0) return;
+  if (index > 0) {
+    const [settingsInput] = inputs.splice(index, 1);
+    inputs.unshift(settingsInput);
+  }
+
+  // LiteGraph links target numeric input slots. Keep every existing link aimed
+  // at the same named input after changing only the visible socket order.
+  const graph = node?.graph || app?.graph;
+  inputs.forEach((input, slot) => {
+    const linkIds = [];
+    if (input?.link != null) linkIds.push(input.link);
+    if (Array.isArray(input?.links)) linkIds.push(...input.links);
+    for (const id of new Set(linkIds)) {
+      const link = graph?.links?.[id] || graph?.links?.get?.(id);
+      if (!link) continue;
+      link.target_slot = slot;
+      if ("targetSlot" in link) link.targetSlot = slot;
+    }
+  });
 }
 
 function installControls(node, isNew = false, preservedSize = null) {
@@ -2466,12 +3342,17 @@ function installControls(node, isNew = false, preservedSize = null) {
     return;
   }
   node.__promptEnhancerInstalled = true;
+  moveSettingsInputToTop(node);
   node.__promptEnhancerPromptHistory ||= [];
   node.__promptEnhancerArrayUndo ||= [];
+  node.__promptEnhancerBatchCount = normalizeEnhanceBatchCount(
+    node?.properties?.[PERSISTENCE_STATE_KEY]?.batchCount ?? node.__promptEnhancerBatchCount ?? ENHANCE_BATCH_MIN
+  );
 
   const promptSetWidget = widget(node, "prompt_set");
   const presetWidget = widget(node, "enhancement_preset");
 
+  setWidgetDisplayLabel(widget(node, "prompt_preset"), "Prompt Preset");
   setWidgetDisplayLabel(promptSetWidget, "Prompt Set");
   setWidgetDisplayLabel(widget(node, "prompt_cycle"), "Prompt Cycle");
   setWidgetDisplayLabel(widget(node, "overwrite_enhanced"), "Overwrite Enhanced");
@@ -2491,10 +3372,10 @@ function installControls(node, isNew = false, preservedSize = null) {
   wrapNodeSerialization(node);
   wrapPromptSetCallback(node);
   wrapPresetCallback(node);
+  wrapPromptPresetCallbacks(node);
   wrapEnhancementTextPersistence(node);
   wrapEnhancedPromptHistory(node);
   for (const name of [
-    "prompt",
     "prompt_cycle",
     "overwrite_enhanced",
     "seed",
@@ -2620,6 +3501,7 @@ function promptEnhancerMenuItems(node) {
 
 async function initializeNode(node, loaded = false, serializedSize = null) {
   const preservedSize = loaded ? (serializedSize || copySize(node)) : null;
+  applyPromptEnhancerInputLabels(node);
   installControls(node, !loaded, preservedSize);
 
   // Restore explicit node state for both loaded workflows and copied/pasted or
@@ -2633,12 +3515,16 @@ async function initializeNode(node, loaded = false, serializedSize = null) {
   // Prompt Set during initialization, because that would overwrite the exact
   // serialized working values after a tab change, paste, duplicate, or refresh.
   await refreshTemplates(node, { loadSelected: shouldLoad });
+  await refreshPromptPresets(node);
   await refreshPromptSets(node);
   initializePromptHistory(node);
+  enforceBatchAddNew(node, { mark: false });
   persistEnhancementState(node);
   setSeedOverrideUI(node);
   scheduleDomPanelSync(node);
+  void syncPromptCycleFromBackend(node, { force: true });
   requestAnimationFrame(() => {
+    moveSettingsInputToTop(node);
     setSeedOverrideUI(node);
     hideNativeWidgetsForPanel(node);
     wrapDomPanelSyncCallbacks(node);
@@ -2662,14 +3548,33 @@ function failPendingNodes(detail) {
 app.registerExtension({
   name: EXTENSION_NAME,
   setup() {
+    api.addEventListener?.("executed", ({ detail }) => handlePromptEnhancerExecutedEvent(detail));
+    api.addEventListener?.("local_llm_prompt_enhancer_batch_progress", ({ detail }) => handleEnhanceBatchProgressEvent(detail));
     api.addEventListener?.("execution_error", ({ detail }) => failPendingNodes(detail));
     api.addEventListener?.("execution_interrupted", ({ detail }) => failPendingNodes(detail));
+
+    // Browser focus/visibility recovery is still useful when the whole browser
+    // tab was backgrounded. Internal ComfyUI workflow tabs are handled by the
+    // official afterConfigureGraph lifecycle hook below, after app.graph is
+    // actually the selected workflow.
+    const reconcileBrowserActivation = () => reconcilePromptCyclesAfterGraphActivation();
+    window.addEventListener("focus", reconcileBrowserActivation, { passive: true });
+    window.addEventListener("pageshow", reconcileBrowserActivation, { passive: true });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") reconcileBrowserActivation();
+    }, { passive: true });
   },
   beforeConfigureGraph() {
     graphConfigureDepth += 1;
   },
   afterConfigureGraph() {
     graphConfigureDepth = Math.max(0, graphConfigureDepth - 1);
+    if (graphConfigureDepth === 0) {
+      // This fires after ComfyUI has loaded/switched the workflow graph. Sync
+      // immediately from the backend cursor so X / Y is correct on return,
+      // without waiting for another generation to finish.
+      reconcilePromptCyclesAfterGraphActivation();
+    }
   },
   nodeCreated(node) {
     if (node?.comfyClass !== NODE_CLASS) return;

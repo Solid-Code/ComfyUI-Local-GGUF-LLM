@@ -6,7 +6,7 @@ from pathlib import Path
 _js_dir = Path(__file__).resolve().parent / "web" / "js"
 _FRONTENDS = {
     "local_llm_server": "local_llm_server_v099.js",
-    "prompt_enhancer": "prompt_enhancer_dom_v0624.js",
+    "prompt_enhancer": "prompt_enhancer_dom_v0625.js",
 }
 if _js_dir.is_dir():
     for _candidate in _js_dir.glob("*.js"):

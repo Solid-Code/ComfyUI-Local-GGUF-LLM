@@ -18,7 +18,7 @@ import folder_paths
 
 log = logging.getLogger(__name__)
 
-NODE_VERSION = "0.6.24-alpha"
+NODE_VERSION = "0.6.25-alpha"
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_DIR = PACKAGE_DIR / "templates" / "default"
 USER_TEMPLATE_DIR = Path(folder_paths.models_dir) / "LLM" / "local_LLM_presets" / "prompt_enhancer"
@@ -1698,7 +1698,7 @@ try:
         except Exception as exc:
             return _json_error(exc, 500)
 
-    # v0.18.50 keeps the old text-only direct HTTP execution path retired because it
+    # v0.18.51 keeps the old text-only direct HTTP execution path retired because it
     # ran llama.cpp outside ComfyUI's prompt queue and could overlap a newly
     # started diffusion workflow. The frontend now uses the same arm + targeted
     # partial-execution transport for text, image, video, and Settings requests.
