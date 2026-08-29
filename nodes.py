@@ -296,7 +296,7 @@ def _install_comfy_llm_yield_hook(mm):
         if not callable(current):
             return False
         if getattr(current, "_local_gguf_llm_yield_hook", False):
-            if getattr(current, "_local_gguf_llm_hook_version", None) == 5:
+            if getattr(current, "_local_gguf_llm_hook_version", None) == 6:
                 return True
             # Replace an older wrapper instead of stacking wrappers. This matters
             # during development/hot reloads where model_management can outlive
@@ -362,16 +362,24 @@ def _install_comfy_llm_yield_hook(mm):
                 _LOGGER.warning("[Local GGUF LLM] Auto Yield pre-eviction hook failed: %s", e)
             original_started = time.perf_counter()
             result = original(memory_required, device, *args, **kwargs)
+            original_seconds = time.perf_counter() - original_started
             if log_original_timing:
+                # This hook is the native->ComfyUI ownership transition. After
+                # ComfyUI has reclaimed memory, wait for its CUDA-side work too
+                # before control returns to the model/VBAR path that requested it.
+                post_comfy_sync_started = time.perf_counter()
+                _sync_cuda_device(target_device)
+                post_comfy_sync_seconds = time.perf_counter() - post_comfy_sync_started
                 _perf_log(
                     "ComfyUI free_memory complete after native LLM yield",
-                    original_s=time.perf_counter() - original_started,
+                    original_s=original_seconds,
+                    post_comfy_sync_s=post_comfy_sync_seconds,
                     total_hook_s=time.perf_counter() - hook_started,
                 )
             return result
 
         free_memory_with_llm_yield._local_gguf_llm_yield_hook = True
-        free_memory_with_llm_yield._local_gguf_llm_hook_version = 5
+        free_memory_with_llm_yield._local_gguf_llm_hook_version = 6
         free_memory_with_llm_yield._local_gguf_llm_original = original
         mm.free_memory = free_memory_with_llm_yield
         return True
@@ -382,8 +390,11 @@ def _request_comfyui_room(mm, required_bytes, device):
     The fast path only calls ``soft_empty_cache()`` when ComfyUI reports enough
     reclaimable allocator cache to cover the *entire* raw-driver shortfall. If
     cache cannot possibly solve it, skip that synchronized flush and go directly
-    to model eviction. AIMDO full-unloads only the target GPU via ``free_memory``
-    with an intentionally huge target instead of globally unloading every device.
+    to model eviction. AIMDO receives the same bounded free-memory target as the
+    normal ComfyUI path; we no longer force a target-GPU full unload with an
+    effectively infinite request. Synchronization brackets residency ownership
+    changes so AIMDO/VBAR never follows immediately behind unfinished native CUDA
+    teardown or ComfyUI release work.
     """
     required = max(0, int(required_bytes or 0))
     result = {
@@ -483,16 +494,23 @@ def _request_comfyui_room(mm, required_bytes, device):
 
     release_started = time.perf_counter()
     if result["aimdo"]:
-        # Full unload semantics, target GPU only. This avoids VBAR being walked
-        # toward watermark 0 while also avoiding unload_all_models() on unrelated
-        # accelerators. The free_memory hook is safe here because the LLM is not
-        # resident during its own pre-load handoff.
-        result["strategy"] = "aimdo-target-gpu-full-unload"
-        mm.free_memory(1e30, device)
+        # Conservative AIMDO handoff: request only the actual driver-visible
+        # target needed by llama.cpp. The old 1e30 request forced the target GPU
+        # toward a complete VBAR unload, creating much larger residency churn than
+        # necessary and increasing the chance of colliding with async VBAR work.
+        result["strategy"] = "aimdo-bounded-free-memory"
     else:
         result["strategy"] = "targeted-free-memory"
-        mm.free_memory(required, device)
+    mm.free_memory(required, device)
     result["release_seconds"] = time.perf_counter() - release_started
+
+    # free_memory()/AIMDO may finish bookkeeping before every CUDA-side residency
+    # transition is globally quiescent. Do not let llama.cpp begin native CUDA
+    # allocation until that work is complete. This synchronization is deliberately
+    # only on the load/reload transition, not on resident request reuse.
+    post_release_sync_started = time.perf_counter()
+    _sync_cuda_device(device)
+    result["post_release_sync_seconds"] = time.perf_counter() - post_release_sync_started
 
     after_release = _comfy_memory_breakdown(mm, device)
     raw_after_release = after_release["raw_free_bytes"]
@@ -512,7 +530,14 @@ def _request_comfyui_room(mm, required_bytes, device):
             pass
         post_cache_seconds = time.perf_counter() - cache_started
     result["soft_empty_cache_seconds"] = post_cache_seconds
-    result["post_release_sync_seconds"] = 0.0
+    if post_cache_seconds > 0.0:
+        # soft_empty_cache() can itself participate in allocator/device cleanup.
+        # Re-establish the same quiescent boundary before native allocation.
+        post_cache_sync_started = time.perf_counter()
+        _sync_cuda_device(device)
+        result["post_cache_sync_seconds"] = time.perf_counter() - post_cache_sync_started
+    else:
+        result["post_cache_sync_seconds"] = 0.0
 
     final = _comfy_memory_breakdown(mm, device)
     result["free_after_bytes"] = final["comfy_free_bytes"]
@@ -533,7 +558,9 @@ def _request_comfyui_room(mm, required_bytes, device):
         cache_skipped=result.get("cache_probe_skipped"),
         pre_sync_s=result.get("pre_release_sync_seconds"),
         release_s=result.get("release_seconds"),
+        post_release_sync_s=result.get("post_release_sync_seconds"),
         cache_s=result.get("soft_empty_cache_seconds"),
+        post_cache_sync_s=result.get("post_cache_sync_seconds"),
         total_s=result.get("total_seconds"),
     )
     return result
@@ -2063,6 +2090,16 @@ class _NativeLLMResident:
             close_seconds = time.perf_counter() - close_started
             del llm
 
+            # llama.cpp teardown can release CUDA allocations from native code.
+            # Establish a hard ownership boundary before ComfyUI/AIMDO is allowed
+            # to touch the same device's virtual-memory residency. Without this,
+            # AIMDO may enter cuMemSetAccess while native teardown is still pending.
+            post_close_sync_seconds = 0.0
+            if self.load_device.type == "cuda":
+                post_close_sync_started = time.perf_counter()
+                _sync_cuda_device(self.load_device)
+                post_close_sync_seconds = time.perf_counter() - post_close_sync_started
+
             free_after_close = _raw_cuda_free_bytes(self.load_device) if self.load_device.type == "cuda" else None
             cache_seconds = 0.0
             fallback_cache_used = False
@@ -2098,6 +2135,15 @@ class _NativeLLMResident:
                     except Exception:
                         pass
 
+            # If the unload path also touched PyTorch's allocator cache, bracket
+            # that cleanup as well. A second sync is normally near-zero when no
+            # extra work was queued, but gives AIMDO a deterministic handoff point.
+            post_cleanup_sync_seconds = 0.0
+            if self.load_device.type == "cuda":
+                post_cleanup_sync_started = time.perf_counter()
+                _sync_cuda_device(self.load_device)
+                post_cleanup_sync_seconds = time.perf_counter() - post_cleanup_sync_started
+
             free_after = _raw_cuda_free_bytes(self.load_device) if self.load_device.type == "cuda" else None
             self._unload_count += 1
             total_seconds = time.perf_counter() - total_started
@@ -2107,6 +2153,8 @@ class _NativeLLMResident:
                 "unload_count": self._unload_count,
                 "released_accounted_bytes": before,
                 "close_seconds": round(close_seconds, 4),
+                "post_close_sync_seconds": round(post_close_sync_seconds, 4),
+                "post_cleanup_sync_seconds": round(post_cleanup_sync_seconds, 4),
                 "gc_seconds": 0.0,
                 "soft_empty_cache_seconds": round(cache_seconds, 4),
                 "heavy_cleanup": bool(heavy_cleanup),
@@ -2128,6 +2176,8 @@ class _NativeLLMResident:
                 reason=reason,
                 unload_count=self._unload_count,
                 close_s=close_seconds,
+                post_close_sync_s=post_close_sync_seconds,
+                post_cleanup_sync_s=post_cleanup_sync_seconds,
                 gc_s=0.0,
                 cache_s=cache_seconds,
                 fallback_gc=False,
@@ -2188,6 +2238,67 @@ def _cleanup_llm():
         total_s=time.perf_counter() - total_started,
     )
 
+
+def _is_fatal_decode_error(exc):
+    """Identify native llama.cpp decode failures that poison the live context.
+
+    These errors have already exhausted llama-cpp-python's internal batch-size
+    fallback, so retrying against the same native context cannot recover.
+    """
+    message = str(exc or "").lower()
+    if "llama.eval(decode)" not in message:
+        return False
+    return (
+        "failed completely" in message
+        or "fatal decode error" in message
+        or "batch size 1" in message
+    )
+
+
+def _discard_failed_native_context(llm, reason="fatal-decode"):
+    """Discard only the failed native context while preserving reload metadata.
+
+    Managed/Auto-Yield residency keeps its verified controller so the next call
+    can use the normal direct fast-reload path. Driver-managed residency drops
+    only the poisoned Llama instance while retaining the allocation signature.
+    """
+    with _MODEL_LOCK:
+        resident_ctl = _MODEL_CACHE.get("managed_adapter")
+        if resident_ctl is not None and getattr(resident_ctl, "llm", None) is llm:
+            resident_ctl._unload_native(reason=reason, heavy_cleanup=False)
+            return True, "managed-fast-reload"
+
+        if _MODEL_CACHE.get("llm") is llm:
+            # Break shared cache references before closing the failed context.
+            _MODEL_CACHE["llm"] = None
+            _MODEL_CACHE["base_chat_handler"] = None
+            _close_llama_object(llm)
+            return True, "driver-managed-reload"
+
+    return False, "unowned"
+
+
+def _mark_decode_context_invalid(exc, llm):
+    """Invalidate a poisoned context and annotate the exception for callers.
+
+    The annotation lets buffered service/API callers safely retry once without
+    matching brittle exception text a second time.
+    """
+    if not _is_fatal_decode_error(exc):
+        return False
+    invalidated, recovery_path = _discard_failed_native_context(llm, reason="fatal-decode")
+    try:
+        exc.local_gguf_decode_context_invalidated = bool(invalidated)
+        exc.local_gguf_decode_recovery_path = str(recovery_path)
+    except Exception:
+        pass
+    _LOGGER.error(
+        "[Local GGUF LLM] Native decode failure invalidated resident context; recovery_path=%s; error=%s",
+        recovery_path, exc,
+    )
+    return bool(invalidated)
+
+
 def _tensor_batch(image):
     if image is None:
         return None
@@ -2224,27 +2335,38 @@ def _encode_image_samples(arr, indices, max_edge=1536):
 
 
 def _image_to_data_uris(image, max_images=4, max_edge=1536):
-    """Encode the first N images of a ComfyUI IMAGE batch in stable input order."""
-    arr = _tensor_batch(image)
-    if arr is None:
-        return []
+    """Encode still images in stable input order.
+
+    Besides the long-standing single IMAGE/BHWC batch input, accept a list/tuple
+    of IMAGE tensors.  This lets orchestration nodes preserve different source
+    aspect ratios without destructively resizing them into one rectangular batch.
+    """
     limit = int(max_images)
     if limit <= 0:
+        return []
+    if isinstance(image, (list, tuple)):
+        out = []
+        for item in image:
+            if len(out) >= limit:
+                break
+            arr = _tensor_batch(item)
+            if arr is None or len(arr) == 0:
+                continue
+            take = min(len(arr), limit - len(out))
+            out.extend(_encode_image_samples(arr, range(take), max_edge))
+        return out
+    arr = _tensor_batch(image)
+    if arr is None:
         return []
     count = min(len(arr), limit)
     return _encode_image_samples(arr, range(count), max_edge)
 
 
-def _video_frames_to_data_uris(video_frames, max_frames=24, max_edge=1536):
-    """Evenly sample a ComfyUI IMAGE batch interpreted as ordered video frames."""
-    arr = _tensor_batch(video_frames)
-    if arr is None or len(arr) == 0:
+def _sample_video_batch(arr, take, max_edge):
+    if arr is None or len(arr) == 0 or take <= 0:
         return []
     n = len(arr)
-    limit = int(max_frames)
-    if limit <= 0:
-        return []
-    take = min(n, limit)
+    take = min(n, int(take))
     if take == 1:
         indices = [0]
     else:
@@ -2254,6 +2376,39 @@ def _video_frames_to_data_uris(video_frames, max_frames=24, max_edge=1536):
             if not indices or idx != indices[-1]:
                 indices.append(idx)
     return _encode_image_samples(arr, indices, max_edge)
+
+
+def _video_frames_to_data_uris(video_frames, max_frames=24, max_edge=1536):
+    """Evenly sample one or more ordered video-frame IMAGE batches.
+
+    For a list/tuple, divide the frame budget across clips while preserving clip
+    order. This is intended for multimodal planner/analysis requests; it does not
+    change normal Local LLM Generate behavior for a single IMAGE batch.
+    """
+    limit = int(max_frames)
+    if limit <= 0:
+        return []
+    if isinstance(video_frames, (list, tuple)):
+        arrays = []
+        for item in video_frames:
+            arr = _tensor_batch(item)
+            if arr is not None and len(arr):
+                arrays.append(arr)
+        if not arrays:
+            return []
+        out = []
+        remaining = limit
+        for i, arr in enumerate(arrays):
+            clips_left = len(arrays) - i
+            budget = max(1, remaining // clips_left) if remaining > 0 else 0
+            encoded = _sample_video_batch(arr, budget, max_edge)
+            out.extend(encoded)
+            remaining = max(0, limit - len(out))
+            if remaining <= 0:
+                break
+        return out[:limit]
+    arr = _tensor_batch(video_frames)
+    return _sample_video_batch(arr, limit, max_edge)
 
 
 def _fallback_template_strftime_now(format_string="%Y-%m-%d %H:%M:%S"):
@@ -3261,7 +3416,15 @@ class LocalGGUFLLMAPI:
         # Local lock gives a clear single-service call contract for linked nodes;
         # the global model lock additionally serializes access across all facades.
         with self._call_lock:
-            response, thinking, info_json, tokens, _api = LocalGGUFLLM().generate(**args)
+            try:
+                response, thinking, info_json, tokens, _api = LocalGGUFLLM().generate(**args)
+            except Exception as first_exc:
+                # This facade is buffered: no partial response has escaped to the
+                # caller. If llama.cpp exhausted its decode fallback and the failed
+                # context was discarded, one fresh-context replay is safe.
+                if not getattr(first_exc, "local_gguf_decode_context_invalidated", False):
+                    raise
+                response, thinking, info_json, tokens, _api = LocalGGUFLLM().generate(**args)
         try:
             info = json.loads(info_json)
         except Exception:
@@ -3881,7 +4044,7 @@ class LocalGGUFLLM:
                 was_resident = resident_ctl.llm is not None
 
             managed_preload_memory = {
-                "policy": "thin-native-auto-yield-v5",
+                "policy": "thin-native-auto-yield-v6-conservative-sync",
                 "signature_id": resident_ctl.signature_id,
                 "requested_release_bytes": 0,
                 "free_before_bytes": None,
@@ -3954,7 +4117,7 @@ class LocalGGUFLLM:
             load_diagnostics["preload_memory"] = managed_preload_memory
             load_diagnostics["comfy_load_models_gpu_seconds"] = 0.0
             load_diagnostics["comfyui_loaded_model_registration"] = False
-            load_diagnostics["coordination_mode"] = "thin-free-memory-hook-v5"
+            load_diagnostics["coordination_mode"] = "thin-free-memory-hook-v6-conservative-sync"
             load_diagnostics["last_unload"] = copy.deepcopy(resident_ctl._last_unload_diagnostics)
         else:
             with _MODEL_LOCK:
@@ -4186,7 +4349,11 @@ class LocalGGUFLLM:
                 pass
 
             if progress_callback is None:
-                result = llm.create_chat_completion(**completion_kwargs)
+                try:
+                    result = llm.create_chat_completion(**completion_kwargs)
+                except Exception as exc:
+                    _mark_decode_context_invalid(exc, llm)
+                    raise
             else:
                 # The global service consumes llama.cpp's streaming iterator even
                 # when the external client requested a buffered response.  This
@@ -4337,17 +4504,35 @@ class LocalGGUFLLM:
                                 except Exception:
                                     pass
 
-                try:
-                    streamed = llm.create_chat_completion(**stream_kwargs)
-                    streamed_map = _as_mapping(streamed)
-                    if streamed_map and "choices" in streamed_map:
-                        result = streamed_map
-                    else:
-                        consume_stream(streamed)
+                def collect_stream(call_kwargs):
+                    stream_obj = None
+                    try:
+                        stream_obj = llm.create_chat_completion(**call_kwargs)
+                        streamed_map = _as_mapping(stream_obj)
+                        if streamed_map and "choices" in streamed_map:
+                            return streamed_map
+                        consume_stream(stream_obj)
                         msg = {"role": "assistant", "content": "".join(parts)}
                         if reasoning_parts:
                             msg["reasoning_content"] = "".join(reasoning_parts)
-                        result = {"choices": [{"index": 0, "message": msg, "finish_reason": "stop"}], "usage": usage}
+                        return {"choices": [{"index": 0, "message": msg, "finish_reason": "stop"}], "usage": usage}
+                    except Exception as exc:
+                        # Streaming failures may be raised while iterating rather
+                        # than when create_chat_completion() returns. Close the
+                        # iterator first, then discard a native context that has
+                        # exhausted llama.cpp's own decode fallback.
+                        if stream_obj is not None:
+                            try:
+                                close_stream = getattr(stream_obj, "close", None)
+                                if callable(close_stream):
+                                    close_stream()
+                            except Exception:
+                                pass
+                        _mark_decode_context_invalid(exc, llm)
+                        raise
+
+                try:
+                    result = collect_stream(stream_kwargs)
                 except TypeError as exc:
                     # Some bindings advertise **kwargs but still reject
                     # stream_options internally. Retry only that exact compatibility
@@ -4361,16 +4546,7 @@ class LocalGGUFLLM:
                     if emitted_any or not unsupported_stream_options:
                         raise
                     stream_kwargs.pop("stream_options", None)
-                    streamed = llm.create_chat_completion(**stream_kwargs)
-                    streamed_map = _as_mapping(streamed)
-                    if streamed_map and "choices" in streamed_map:
-                        result = streamed_map
-                    else:
-                        consume_stream(streamed)
-                        msg = {"role": "assistant", "content": "".join(parts)}
-                        if reasoning_parts:
-                            msg["reasoning_content"] = "".join(reasoning_parts)
-                        result = {"choices": [{"index": 0, "message": msg, "finish_reason": "stop"}], "usage": usage}
+                    result = collect_stream(stream_kwargs)
 
                 # Some binding versions do not return usage in streaming mode.
                 # Recover an exact-ish completion count with the model tokenizer

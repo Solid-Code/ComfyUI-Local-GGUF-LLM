@@ -1006,8 +1006,15 @@ class LocalLLMServiceManager:
                 self._config["api_key"] = "sk-local-" + secrets.token_urlsafe(24)
             _write_config_file(self._config)
             if self._state in {STATE_READY, STATE_PROCESSING, STATE_GENERATING, STATE_WAITING_COMFY}:
-                self._restart_required = any(before.get(k) != self._config.get(k) for k in LOAD_FIELDS)
-        self._log("Configuration saved" + ("; model reload required" if self._restart_required else ""))
+                # Autosave can issue several small/full configuration updates in
+                # succession. Once load-affecting settings make the resident
+                # native context stale, a later sampler/UI-only update must not
+                # clear that pending reload. It is cleared only after Start/Reload
+                # successfully constructs a context from the current config.
+                self._restart_required = self._restart_required or any(
+                    before.get(k) != self._config.get(k) for k in LOAD_FIELDS
+                )
+        self._log("Configuration updated" + ("; new load settings will apply on next request" if self._restart_required else ""))
         self._emit()
         return self.public_config()
 
@@ -1099,38 +1106,41 @@ class LocalLLMServiceManager:
         self._last_result = {"response": response, "thinking": thinking, "info": info, "tokens": int(tokens)}
 
     def start(self, wait_for_comfy=True):
-        with self._state_lock:
-            if self._state in {STATE_LOADING, STATE_RELOADING, STATE_PROCESSING, STATE_GENERATING, STATE_WAITING_COMFY, STATE_TUNING}:
-                return self.status()
-            if self._state == STATE_READY and self._api is not None and not self._restart_required and self._resident_snapshot():
-                return self.status()
-            self._state = STATE_LOADING
-            self._error = None
-        self._emit()
-        self._log("Loading persistent GGUF service")
-        try:
-            if wait_for_comfy:
-                self._wait_for_comfy_idle("loading the LLM")
+        # Lifecycle changes and generation must never manipulate the same native
+        # llama.cpp context concurrently. External starts wait for ComfyUI to go
+        # idle *before* taking the generation lock so an active workflow cannot
+        # deadlock waiting for this service later in the same prompt.
+        if wait_for_comfy:
+            self._wait_for_comfy_idle("loading the LLM")
+        with self._generation_lock:
             with self._state_lock:
+                if self._state in {STATE_RELOADING, STATE_PROCESSING, STATE_GENERATING, STATE_STOPPING, STATE_TUNING}:
+                    return self.status()
+                if self._state == STATE_READY and self._api is not None and not self._restart_required and self._resident_snapshot():
+                    return self.status()
                 self._state = STATE_LOADING
-            self._emit()
-            self._warm_load()
-            with self._state_lock:
-                self._state = STATE_READY
-                self._model_loaded = True
-                self._restart_required = False
                 self._error = None
-            self._log("Model loaded; service ready")
-        except Exception as e:
-            with self._state_lock:
-                self._state = STATE_ERROR
-                self._model_loaded = False
-                self._error = f"{type(e).__name__}: {e}"
-                self._api = None
-            self._log(self._error, "error")
-            raise
-        finally:
             self._emit()
+            self._log("Loading persistent GGUF service")
+            try:
+                self._warm_load()
+                with self._state_lock:
+                    self._state = STATE_READY
+                    self._model_loaded = True
+                    self._restart_required = False
+                    self._error = None
+                self._log("Model loaded; service ready")
+            except Exception as e:
+                with self._state_lock:
+                    self._state = STATE_ERROR
+                    self._model_loaded = False
+                    self._error = f"{type(e).__name__}: {e}"
+                    self._api = None
+                self._log(self._error, "error")
+                log.exception("[Local LLM Server] Service start failed")
+                raise
+            finally:
+                self._emit()
         return self.status()
 
     def suspend(self):
@@ -1192,56 +1202,62 @@ class LocalLLMServiceManager:
     def stop(self):
         if self.tuner_status().get("running"):
             raise RuntimeError("Cancel the performance tuner before stopping the service")
-        with self._state_lock:
-            if self._state == STATE_STOPPED:
-                return self.status()
-            self._state = STATE_STOPPING
-        self._emit()
-        self._log("Stopping service and unloading persistent GGUF")
-        try:
-            _cleanup_llm()
-        finally:
+        # Serialize teardown behind any active request. This closes the race where
+        # Stop/Reload could clear Llama internals while a request was still using
+        # the chat formatter/tokenizer or collecting post-generation metrics.
+        with self._generation_lock:
             with self._state_lock:
-                self._api = None
-                self._model_loaded = False
-                self._state = STATE_STOPPED
-                self._error = None
-                self._restart_required = False
-                self._clear_current_request_locked()
+                if self._state == STATE_STOPPED:
+                    return self.status()
+                self._state = STATE_STOPPING
             self._emit()
+            self._log("Stopping service and unloading persistent GGUF")
+            try:
+                _cleanup_llm()
+            finally:
+                with self._state_lock:
+                    self._api = None
+                    self._model_loaded = False
+                    self._state = STATE_STOPPED
+                    self._error = None
+                    self._restart_required = False
+                    self._clear_current_request_locked()
+                self._emit()
         return self.status()
 
     def reload(self, wait_for_comfy=True):
         if self.tuner_status().get("running"):
             raise RuntimeError("Cancel the performance tuner before reloading the service")
-        with self._state_lock:
-            self._state = STATE_RELOADING
-            self._error = None
-        self._emit()
-        try:
-            if wait_for_comfy:
-                self._wait_for_comfy_idle("reloading the LLM")
+        # Wait for an external ComfyUI workflow before taking the generation lock;
+        # otherwise that workflow could later block on this same lock at its LLM
+        # node while Reload is waiting for the workflow to finish.
+        if wait_for_comfy:
+            self._wait_for_comfy_idle("reloading the LLM")
+        with self._generation_lock:
             with self._state_lock:
                 self._state = STATE_RELOADING
+                self._error = None
             self._emit()
-            _cleanup_llm()
-            self._api = None
-            self._warm_load()
-            with self._state_lock:
-                self._state = STATE_READY
-                self._model_loaded = True
-                self._restart_required = False
-            self._log("Model reloaded")
-        except Exception as e:
-            with self._state_lock:
-                self._state = STATE_ERROR
-                self._model_loaded = False
-                self._error = f"{type(e).__name__}: {e}"
+            try:
+                _cleanup_llm()
                 self._api = None
-            self._log(self._error, "error")
-            raise
-        finally:
-            self._emit()
+                self._warm_load()
+                with self._state_lock:
+                    self._state = STATE_READY
+                    self._model_loaded = True
+                    self._restart_required = False
+                self._log("Model reloaded")
+            except Exception as e:
+                with self._state_lock:
+                    self._state = STATE_ERROR
+                    self._model_loaded = False
+                    self._error = f"{type(e).__name__}: {e}"
+                    self._api = None
+                self._log(self._error, "error")
+                log.exception("[Local LLM Server] Service reload failed")
+                raise
+            finally:
+                self._emit()
         return self.status()
 
     def _resident_snapshot(self):
@@ -1279,7 +1295,7 @@ class LocalLLMServiceManager:
             # A READY service with an evicted/yielded model is reloaded on demand.
             self.start(wait_for_comfy=not workflow_owned)
 
-    def generate_messages(self, messages, image=None, video_frames=None, client="unknown", overrides=None, token_callback=None, runtime_config=None):
+    def generate_messages(self, messages, image=None, video_frames=None, client="unknown", overrides=None, token_callback=None, runtime_config=None, config_snapshot=None):
         messages = _normalized_messages(messages)
         overrides = dict(overrides or {})
         # API/client request fields may not change persistent allocation settings.
@@ -1290,7 +1306,12 @@ class LocalLLMServiceManager:
             raise ValueError("Request cannot override server load/memory setting(s): " + ", ".join(forbidden))
 
         persistent_cfg = self.get_config()
-        effective_cfg = copy.deepcopy(persistent_cfg)
+        # Internal callers such as Prompt Enhancer batches may pin the complete
+        # runtime configuration that existed when a multi-request operation
+        # began.  This is request-local: autosaved modal settings remain the
+        # authoritative persistent config and become active after the batch.
+        snapshot_clean = copy.deepcopy(config_snapshot) if isinstance(config_snapshot, dict) and config_snapshot else None
+        effective_cfg = copy.deepcopy(snapshot_clean if snapshot_clean is not None else persistent_cfg)
         runtime_clean = {}
         if isinstance(runtime_config, dict) and runtime_config:
             runtime_clean = _validate_complete_settings(runtime_config)
@@ -1305,8 +1326,9 @@ class LocalLLMServiceManager:
                 "ComfyUI Managed" if effective_cfg.get("vram_policy") == "Auto Yield to ComfyUI"
                 else "Persistent (Driver Managed)"
             )
-        temporary_load_change = bool(runtime_clean) and any(
-            key in runtime_clean and persistent_cfg.get(key) != effective_cfg.get(key)
+        request_local_config = snapshot_clean is not None or bool(runtime_clean)
+        temporary_load_change = bool(request_local_config) and any(
+            persistent_cfg.get(key) != effective_cfg.get(key)
             for key in LOAD_FIELDS
         )
 
@@ -1329,11 +1351,13 @@ class LocalLLMServiceManager:
                 if not workflow_owned:
                     comfy_wait_seconds = float(self._wait_for_comfy_idle("servicing the LLM request") or 0.0)
                 ensure_started_at = time.perf_counter()
-                if temporary_load_change:
-                    # A Settings-node model/memory selection is temporary. Do not
-                    # rewrite/reload the authoritative modal configuration merely
-                    # to prepare this request. LocalGGUFLLM will switch native
-                    # residency by its normal load signature for this call only.
+                if temporary_load_change or snapshot_clean is not None:
+                    # Request-local Settings and Prompt Enhancer batch snapshots
+                    # must not consume the persistent modal's pending-reload flag.
+                    # A batch therefore keeps using its pinned native signature
+                    # even if the user autosaves a different model midway through
+                    # it; LocalGGUFLLM switches/reloads only when this pinned
+                    # request itself actually needs native residency.
                     with self._state_lock:
                         request_state = self._state
                     if request_state == STATE_STOPPED and persistent_cfg.get("startup_mode", "On Demand") == "Off":
@@ -1399,7 +1423,34 @@ class LocalLLMServiceManager:
                 args["progress_callback"] = self._progress
                 args["token_callback"] = token_callback
                 node_call_started = time.perf_counter()
-                response, thinking, info_json, tokens, api = LocalGGUFLLM().generate(**args)
+                try:
+                    response, thinking, info_json, tokens, api = LocalGGUFLLM().generate(**args)
+                except Exception as first_exc:
+                    with self._state_lock:
+                        emitted_tokens = int(self._current_completion_tokens or 0)
+                    recoverable_decode = bool(
+                        getattr(first_exc, "local_gguf_decode_context_invalidated", False)
+                    )
+                    if not recoverable_decode or emitted_tokens > 0:
+                        raise
+
+                    recovery_path = str(
+                        getattr(first_exc, "local_gguf_decode_recovery_path", "fresh-context")
+                    )
+                    self._log(
+                        "Native llama.cpp decode context failed before output; "
+                        f"discarded poisoned context via {recovery_path} and retrying request once.",
+                        "warning",
+                    )
+                    with self._state_lock:
+                        self._state = STATE_LOADING
+                        self._current_phase_started = time.time()
+                        self._current_completion_tokens = 0
+                        self._current_tokens_per_second = 0.0
+                        self._current_prompt_tokens = 0
+                        self._current_prompt_tokens_per_second = 0.0
+                    self._emit()
+                    response, thinking, info_json, tokens, api = LocalGGUFLLM().generate(**args)
                 node_call_seconds = time.perf_counter() - node_call_started
                 self._api = api
                 try:
@@ -1516,6 +1567,7 @@ class LocalLLMServiceManager:
                 self._error = f"{type(e).__name__}: {e}"
                 self._clear_current_request_locked(metrics=True)
             self._log(self._error, "error")
+            log.exception("[Local LLM Server] Request failed")
             raise
         finally:
             self._emit()
@@ -2584,19 +2636,18 @@ class LocalLLMSettings:
                 required[key] = (["Auto Yield to ComfyUI", "Keep Resident"], {"default": "Auto Yield to ComfyUI"})
             else:
                 required[key] = copy.deepcopy(source[key])
-        required["seed"] = copy.deepcopy(source["seed"])
         return {"required": required}
 
     RETURN_TYPES = ("LOCAL_LLM_SETTINGS",)
     RETURN_NAMES = ("settings",)
     FUNCTION = "build"
     CATEGORY = "LLM/Local Service"
-    DESCRIPTION = "Reusable model, generation, vision, memory/performance, and seed settings for Local LLM Generate."
+    DESCRIPTION = "Reusable model, generation, vision, and memory/performance settings for Local LLM Generate and Prompt Enhancer. Seed remains request-local to the consuming node."
 
     @classmethod
     def IS_CHANGED(cls, settings_preset="Current Server", **kwargs):
         name = str(settings_preset or "Current Server")
-        payload = {"settings_preset": name, "values": {k: kwargs.get(k) for k in (*cls.EXPOSED_FIELDS, "seed") if k in kwargs}}
+        payload = {"settings_preset": name, "values": {k: kwargs.get(k) for k in cls.EXPOSED_FIELDS if k in kwargs}}
         if name == "Current Server":
             current = SERVICE.get_config()
             payload["current_server_settings"] = {k: copy.deepcopy(current.get(k)) for k in cls.EXPOSED_FIELDS if k in current}
@@ -2621,7 +2672,7 @@ class LocalLLMSettings:
         clean = _validate_complete_settings(values)
         return ({
             "schema": "local_llm_complete_request_settings",
-            "schema_version": 2,
+            "schema_version": 3,
             "settings_preset": name,
             "sampling_mode": "Custom",
             "server_config": clean,
@@ -2629,7 +2680,6 @@ class LocalLLMSettings:
             "vision_max_images": int(clean.get("vision_max_images", kwargs.get("vision_max_images", 4))),
             "vision_max_frames": int(clean.get("vision_max_frames", kwargs.get("vision_max_frames", 24))),
             "vision_max_edge": int(clean.get("vision_max_edge", kwargs.get("vision_max_edge", 1536))),
-            "seed": int(kwargs.get("seed", 0)),
         },)
 
 
@@ -2642,55 +2692,38 @@ class LocalLLMGenerate:
                 "system_prompt": ("STRING", {"default": "You are a helpful assistant.", "multiline": True, "dynamicPrompts": False}),
                 "prompt_preset": (["Custom", *text_preset_names("prompts")], {"default": "Custom", "tooltip": "Reusable prompts from models/LLM/local_LLM_presets/prompts. Editing the text switches this selector to Custom."}),
                 "prompt": ("STRING", {"default": "", "multiline": True, "dynamicPrompts": False}),
-                "sampling_mode": (["Default", "Custom", *sampler_preset_names()], {"default": "Default", "tooltip": "Default mirrors the current global server generation defaults. Editing a sampler setting switches this selector to Custom. Saved samplers are loaded from models/LLM/local_LLM_presets/sampler."}),
-                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 5.0, "step": 0.01}),
-                "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "top_k": ("INT", {"default": 40, "min": 0, "max": 10000}),
-                "min_p": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "repeat_penalty": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.01}),
-                "presence_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01}),
-                "frequency_penalty": ("FLOAT", {"default": 0.0, "min": -2.0, "max": 2.0, "step": 0.01}),
-                "max_tokens": ("INT", {"default": 2048, "min": 1, "max": 262144}),
-                "vision_max_images": ("INT", {"default": 4, "min": 0, "max": 32, "tooltip": "Maximum still images accepted from the IMAGE batch. Set 0 to ignore still-image input for this request."}),
-                "vision_max_frames": ("INT", {"default": 24, "min": 0, "max": 1024, "tooltip": "Evenly sampled frames from the Video Frames IMAGE batch. Set 0 to ignore video-frame input for this request."}),
-                "vision_max_edge": ("INT", {"default": 1536, "min": 256, "max": 4096, "step": 64}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "control_after_generate": True}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF, "control_after_generate": True, "tooltip": "Standard ComfyUI seed for this Generate node. Control After Generate supports fixed, increment, decrement, or randomize. Seed is request-local and is never supplied or overridden by Local LLM Settings."}),
             },
             "optional": {
-                "settings": ("LOCAL_LLM_SETTINGS", {"tooltip": "Optional Local LLM Settings node. When connected, its sampler, vision-limit, and seed values override the matching widgets on this Generate node."}),
+                "settings": ("LOCAL_LLM_SETTINGS", {"tooltip": "Optional Local LLM Settings node. When connected, it supplies model/runtime, sampler, and vision configuration. Seed remains owned by this Generate node. When disconnected, the current Local LLM server configuration is used."}),
                 "image": ("IMAGE", {"tooltip": "One still image or an IMAGE batch."}),
-                "video_frames": ("IMAGE", {"tooltip": "Ordered video frames as an IMAGE batch; sampled evenly."}),
+                "video_frames": ("IMAGE", {"tooltip": "Ordered video frames as an IMAGE batch; sampled evenly according to the active Local LLM settings."}),
             },
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "INT")
-    RETURN_NAMES = ("response", "thinking", "info", "tokens")
+    RETURN_TYPES = ("STRING", "STRING", "STRING")
+    RETURN_NAMES = ("response", "thinking", "info")
     FUNCTION = "generate"
     CATEGORY = "LLM/Local Service"
-    DESCRIPTION = "Generate through the global persistent Local LLM Server with independent sampler, system-prompt, and prompt presets."
+    DESCRIPTION = "Generate through the persistent Local LLM Server. LLM/runtime settings come from an optional Local LLM Settings node (or the current server configuration); seed remains a per-Generate-node control."
 
     @classmethod
-    def IS_CHANGED(cls, sampling_mode="Default", system_prompt_preset="Custom", prompt_preset="Custom", **kwargs):
-        # This node depends on global server state and preset files that are not
-        # fully represented by its serialized widget values. Include the effective
-        # default/preset contents so changes on disk invalidate cached responses.
+    def IS_CHANGED(cls, system_prompt_preset="Custom", prompt_preset="Custom", **kwargs):
+        # Generation has no local model/sampler widgets, but it deliberately owns
+        # its per-request seed. Cache invalidation follows the connected Settings
+        # payload (or live server config) plus this node's seed.
         linked_settings = kwargs.get("settings") if isinstance(kwargs.get("settings"), dict) else None
-        mode = str((linked_settings or {}).get("sampling_mode", sampling_mode) or "Default")
-        payload = {"sampler_mode": mode, "settings_node": bool(linked_settings)}
+        payload = {"settings_node": bool(linked_settings), "seed": int(kwargs.get("seed", 0))}
         if linked_settings:
-            for key in (*SAMPLER_PRESET_FIELDS, "vision_max_images", "vision_max_frames", "vision_max_edge", "seed"):
-                if key in linked_settings:
-                    payload[key] = linked_settings.get(key)
+            payload["settings"] = copy.deepcopy(linked_settings)
         else:
-            for key in (*SAMPLER_PRESET_FIELDS, "vision_max_images", "vision_max_frames", "vision_max_edge", "seed"):
-                if key in kwargs:
-                    payload[key] = kwargs.get(key)
-        if mode == "Default":
-            payload["sampler"] = SERVICE.request_generation_defaults()
-        elif mode != "Custom":
-            preset = sampler_presets().get(mode)
-            payload["sampler"] = copy.deepcopy((preset or {}).get("settings"))
-            payload["sampler_mtime_ns"] = (preset or {}).get("mtime_ns")
+            cfg = SERVICE.get_config()
+            payload["server"] = {
+                key: copy.deepcopy(cfg.get(key))
+                for key in LocalLLMSettings.EXPOSED_FIELDS
+                if key in cfg
+            }
+            payload["generation_defaults"] = SERVICE.request_generation_defaults()
 
         for kind, selected in (("system_prompts", system_prompt_preset), ("prompts", prompt_preset)):
             name = str(selected or "Custom")
@@ -2700,58 +2733,33 @@ class LocalLLMGenerate:
                 payload[kind]["text"] = None if item is None else item.get("text", "")
                 payload[kind]["mtime_ns"] = None if item is None else item.get("mtime_ns")
 
-        # Model/template configuration affects output even when request-level
-        # sampler and prompt fields are custom.  A connected Settings node owns
-        # that runtime configuration for this workflow request.
-        if linked_settings and isinstance(linked_settings.get("server_config"), dict):
-            payload["server"] = copy.deepcopy(linked_settings.get("server_config"))
-            payload["complete_settings_preset"] = linked_settings.get("settings_preset", "Custom")
-        else:
-            cfg = SERVICE.get_config()
-            payload["server"] = {
-                "model": cfg.get("model"),
-                "vision_model": cfg.get("vision_model"),
-                "model_preset": cfg.get("model_preset"),
-                "thinking_mode": cfg.get("thinking_mode"),
-                "reasoning_effort": cfg.get("reasoning_effort"),
-                "preserve_thinking": cfg.get("preserve_thinking"),
-                "chat_format": cfg.get("chat_format"),
-                "custom_chat_format": cfg.get("custom_chat_format"),
-            }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
-    def generate(self, system_prompt_preset, system_prompt, prompt_preset, prompt,
-                 sampling_mode, temperature, top_p, top_k, min_p, repeat_penalty,
-                 presence_penalty, frequency_penalty, max_tokens, vision_max_images, vision_max_frames,
-                 vision_max_edge, seed, image=None, video_frames=None, settings=None):
+    def generate(self, system_prompt_preset, system_prompt, prompt_preset, prompt, seed,
+                 image=None, video_frames=None, settings=None):
         linked_settings = settings if isinstance(settings, dict) else None
         runtime_config = None
+        overrides = {}
+
         if linked_settings:
             server_patch = linked_settings.get("server_config")
-            # The modal/server configuration is authoritative. A Settings node
-            # selecting Custom or a saved preset supplies a temporary runtime
-            # configuration for this request only; Current Server uses the live
-            # authoritative configuration directly.
+            # Current Server follows the live modal/service configuration. Custom
+            # and named Settings presets provide a request-local runtime snapshot.
             if (
                 str(linked_settings.get("settings_preset") or "Current Server") != "Current Server"
                 and isinstance(server_patch, dict)
                 and server_patch
             ):
                 runtime_config = copy.deepcopy(server_patch)
-            sampling_mode = linked_settings.get("sampling_mode", sampling_mode)
-            temperature = linked_settings.get("temperature", temperature)
-            top_p = linked_settings.get("top_p", top_p)
-            top_k = linked_settings.get("top_k", top_k)
-            min_p = linked_settings.get("min_p", min_p)
-            repeat_penalty = linked_settings.get("repeat_penalty", repeat_penalty)
-            presence_penalty = linked_settings.get("presence_penalty", presence_penalty)
-            frequency_penalty = linked_settings.get("frequency_penalty", frequency_penalty)
-            max_tokens = linked_settings.get("max_tokens", max_tokens)
-            vision_max_images = linked_settings.get("vision_max_images", vision_max_images)
-            vision_max_frames = linked_settings.get("vision_max_frames", vision_max_frames)
-            vision_max_edge = linked_settings.get("vision_max_edge", vision_max_edge)
-            seed = linked_settings.get("seed", seed)
-        mode = str(sampling_mode or "Default")
+
+            for key in (*SAMPLER_PRESET_FIELDS, "vision_max_images", "vision_max_frames", "vision_max_edge"):
+                if key in linked_settings:
+                    overrides[key] = copy.deepcopy(linked_settings.get(key))
+
+        # Seed is intentionally request-local to Generate. This keeps standard
+        # ComfyUI Control After Generate behavior available even when a Settings
+        # node owns the LLM/runtime configuration.
+        overrides["seed"] = int(seed)
 
         effective_system_prompt = system_prompt
         if str(system_prompt_preset or "Custom") != "Custom":
@@ -2765,45 +2773,11 @@ class LocalLLMGenerate:
             if saved is not None:
                 effective_prompt = saved
 
-        # The standard ComfyUI seed is always request-local. It is intentionally
-        # not part of a sampler preset.
-        overrides = {
-            "seed": seed,
-            "vision_max_images": vision_max_images,
-            "vision_max_frames": vision_max_frames,
-            "vision_max_edge": vision_max_edge,
-        }
-        if mode == "Default":
-            # Send no sampler overrides: the global server remains authoritative.
-            pass
-        elif mode == "Custom":
-            overrides.update({
-                "temperature": temperature,
-                "top_p": top_p,
-                "top_k": top_k,
-                "min_p": min_p,
-                "repeat_penalty": repeat_penalty,
-                "presence_penalty": presence_penalty,
-                "frequency_penalty": frequency_penalty,
-                "max_tokens": max_tokens,
-            })
-        else:
-            saved = load_sampler_preset(mode)
-            if saved is None:
-                # A workflow can outlive a deleted preset. Fall back to the
-                # workflow's serialized visible sampler values.
-                saved = {
-                    "temperature": temperature, "top_p": top_p, "top_k": top_k,
-                    "min_p": min_p, "repeat_penalty": repeat_penalty,
-                    "presence_penalty": presence_penalty, "frequency_penalty": frequency_penalty,
-                    "max_tokens": max_tokens,
-                }
-            overrides.update(saved)
-
         messages = []
         if effective_system_prompt:
             messages.append({"role": "system", "content": str(effective_system_prompt)})
         messages.append({"role": "user", "content": "" if effective_prompt is None else str(effective_prompt)})
+
         result = SERVICE.generate_messages(
             messages,
             image=image,
@@ -2814,17 +2788,15 @@ class LocalLLMGenerate:
         )
         info = copy.deepcopy(result.get("info") or {})
         info["request_presets"] = {
-            "sampler": mode,
             "system_prompt": str(system_prompt_preset or "Custom"),
             "prompt": str(prompt_preset or "Custom"),
-            "complete_settings": str((linked_settings or {}).get("settings_preset") or "Custom") if linked_settings else None,
+            "complete_settings": str((linked_settings or {}).get("settings_preset") or "Current Server"),
             "settings_node": bool(linked_settings),
         }
         return (
             result.get("response", ""),
             result.get("thinking", ""),
             json.dumps(info, indent=2),
-            int(result.get("tokens") or 0),
         )
 
 

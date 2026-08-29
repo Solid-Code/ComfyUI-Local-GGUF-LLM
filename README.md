@@ -1,3 +1,7 @@
+# Local GGUF LLM — v0.18.44 alpha
+
+This package contains the reusable Local LLM service, settings/generation nodes, OpenAI-compatible API, and Prompt Enhancer. The H3 Shot Generator is distributed separately and uses this package through a small in-process bridge.
+
 # ComfyUI Local GGUF LLM
 
 A single ComfyUI custom-node package for running a persistent local GGUF LLM and using it directly from workflows.
@@ -6,7 +10,7 @@ This package includes:
 
 - **Local LLM Generate** — send prompts, images, and sampled video frames to the persistent local LLM.
 - **Local LLM Settings** — reusable model/generation settings with loadable Complete Settings Presets. Memory/performance tuning remains in the Local LLM service panel rather than crowding the workflow node.
-- **Local LLM Prompt Enhancer** — bundled **v0.6.12-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
+- **Local LLM Prompt Enhancer** — bundled **v0.6.15-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
 - **Local LLM Server panel** — model loading, presets, memory/VRAM controls, status, performance information, and the optional OpenAI-compatible API.
 
 
@@ -35,7 +39,7 @@ ComfyUI/custom_nodes/ComfyUI-Local-GGUF-LLM/
 
 Restart ComfyUI, then hard-refresh the browser if an older frontend is still cached.
 
-Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.12 is already bundled here.
+Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.15 is already bundled here.
 
 ## GGUF model folders
 
@@ -85,17 +89,6 @@ The node provides:
 
 - System Prompt preset and editable System Prompt
 - Prompt preset and editable Prompt
-- Temperature
-- Top P
-- Top K
-- Min P
-- Repeat Penalty
-- Presence Penalty
-- Frequency Penalty
-- Max Tokens
-- vision image/frame limits
-- vision maximum edge size
-- Seed with standard ComfyUI Control After Generate behavior
 - optional `LOCAL_LLM_SETTINGS`
 - optional `IMAGE`
 - optional video frames as an `IMAGE` batch
@@ -105,9 +98,8 @@ Outputs:
 - `response`
 - `thinking`
 - `info`
-- `tokens`
 
-When a **Local LLM Settings** node is connected, its complete model/runtime settings, sampler values, vision limits, and seed become authoritative for that workflow request. Prompt text and media still come from Local LLM Generate.
+Local LLM Generate no longer duplicates model, sampler, or vision-limit controls. Connect **Local LLM Settings** when the workflow should own those values. **Seed + Control After Generate remain on Generate** as per-request controls. Local LLM Settings no longer contains or overrides seed. If `settings` is left disconnected, Generate uses the current Local LLM server/modal configuration. Prompt text, media, and seed remain owned by Local LLM Generate.
 
 ### Number controls
 
@@ -134,11 +126,76 @@ It outputs:
 LOCAL_LLM_SETTINGS
 ```
 
-Connect that output to the `settings` input on **Local LLM Generate** or **Local LLM Prompt Enhancer**. When connected, the Settings node is authoritative for model/runtime settings, sampler values, vision limits, and seed.
+
+
+
+The node is a planning/orchestration layer. Enter the complete video idea in plain English and click **Generate Shots**. The Local LLM returns a validated, versioned plan and the node renders the result as horizontally scrollable shot cards.
+
+### Sequence settings
+
+- **Max Shot** — hard maximum for one H3 generation segment, up to 15 seconds.
+- **Target Length** — `0` means Auto. Set a value when the complete sequence needs a requested total duration.
+- **Width / Height** — explicit output geometry.
+- **Start Frame Ratio / MP** — preserves the designated starting-image aspect ratio (or the first connected image as a fallback) and derives width/height from the target megapixel count.
+- **Seed** — request-local seed used only when planning/regenerating shots.
+
+### Dynamic H3 references
+
+The frontend starts with one socket each for IMAGE, VIDEO, and AUDIO. As the final slot of a media type is connected or configured, the next slot appears automatically, up to the supported H3 planner limits:
+
+- 9 images
+- 3 videos
+- 3 audio clips
+
+Every visible reference gets a small **Role** selector and **Label** field. Labels tell the Local LLM what a connected asset represents; roles provide stronger routing hints such as first frame, last frame, subject identity, motion/camera reference, voice, music, paired video soundtrack, or source timeline audio.
+
+`first_frame`, `last_frame`, and `source_timeline` are sequence-global roles and may each be assigned to only one connected asset. **Source audio timeline** is carried in the sequence separately so a downstream continuation chain can receive it once and preserve/slice it across shots; it is not automatically treated as a per-shot `<Audio N>` reference.
+
+Audio references can also be marked as the soundtrack paired to Video 1/2/3 so Node Expansion can route them to H3's paired video-audio input rather than treating them as standalone audio.
+
+The planner uses stable workflow asset IDs such as `image_1` and creates **shot-local** H3 bindings such as `<Picture 1>`, `<Video 1>`, and `<Audio 1>`. This matters because each shot may use a different subset of connected assets while still keeping valid contiguous H3 reference numbers.
+
+### Shot cards
+
+Each generated card supports:
+
+- drag to reorder
+- direct script editing
+- direct duration editing
+- per-shot guidance text
+- **per-shot reference editing**: swap a bound asset in place, or add/remove Ref2VA bindings without an LLM call
+- **reference pins**: pin any connected asset so the Local LLM must keep it bound when that shot is regenerated or when the full plan is regenerated; endpoint-conditioned modes can accept a new reference as a regen pin without corrupting their fixed input shape
+- **shot lock**: locked shots are immutable anchors during Generate Shots replanning and their card controls/regeneration remain disabled until unlocked
+- **STALE indicator**: a generated card is marked stale when the master description, sequence settings, connected-reference topology, or asset label/role changes after that shot was generated
+- ↻ regenerate only that shot while sending the original request and complete current sequence as continuity context
+- duplicate
+- delete
+
+Regeneration preserves the card's stable workflow ID. Pinned assets are enforced again by backend validation, and locked shots are restored verbatim even if the Local LLM attempts to rewrite them. The Local LLM returns a tolerant tagged transport format rather than embedding long H3 scripts inside JSON strings. The backend parses `<shot>`, `<seconds>`, `<model_mode>`, `<binding>`, and `<h3_script>` blocks into the same normalized internal plan, then validates durations, media bindings, model mode, reference limits, label numbering, and local timing. `plan_json` and `H3_SEQUENCE` remain structured JSON/Python workflow state; only the LLM response boundary uses tags. A compact tag-format repair request is attempted if wrapper structure is malformed.
+
+### Output contract
+
+The node outputs:
+
+```text
+H3_SEQUENCE  (displayed as "H3 Sequence")
+```
+
+`H3_SEQUENCE` is deliberately a **planned sequence**, not the live continuation `H3_CHAIN`. It contains the original request, validated shot plan, geometry, connected media objects plus metadata, reference limits, and optional source-audio asset ID. A downstream H3 Node Expansion/generation node should consume this sequence, build the first H3 conditioning/generation, and then create/advance the runtime `H3_CHAIN` as actual latent/audio history exists.
+
+Each shot also stores the requested `seconds`, canonical H3 `frame_count`, and resulting `actual_seconds`. H3 uses 24 fps and the `17n+5` temporal frame grid; Node Expansion should use `frame_count` as authoritative.
+
+This keeps planning state separate from generated AV state and avoids pretending a pre-generation object already contains continuation history.
+
+### Local LLM media visibility
+
+Still images and sampled video frames are sent to a compatible multimodal Local LLM. If a connected **Local LLM Settings** node sets vision limits below the number of connected references, the Shot Generator errors rather than silently hiding references from the planner.
+
+Audio objects are preserved in `H3_SEQUENCE`, but the current GGUF vision path does not audition the waveform. The planner receives the audio's label, role, and duration metadata and is explicitly told not to invent unheard content.
 
 ## Local LLM Prompt Enhancer
 
-The bundled **Local LLM Prompt Enhancer v0.6.12-alpha** uses the same persistent Local GGUF service. No second LLM server or second model load is required.
+The bundled **Local LLM Prompt Enhancer v0.6.15-alpha** uses the same persistent Local GGUF service. No second LLM server or second model load is required.
 
 ### Main workflow
 
@@ -155,7 +212,7 @@ The original `prompt` output is also available unchanged.
 
 Prompt Enhancer accepts:
 
-- `images` — still image or IMAGE batch
+- `image(s)` — still image or IMAGE batch
 - `video` — native ComfyUI VIDEO input
 - `settings` — Local LLM Settings
 
@@ -218,6 +275,8 @@ When **Enhance with Workflow** is disabled, Prompt Cycle controls how the stored
 
 Shuffle and Random use fresh internal randomness and do not use the LLM generation seed.
 
+Prompt Cycle execution state is mirrored from ComfyUI's global `executed` event, so cycling does not depend on the Prompt Enhancer node being selected or mounted by the renderer.
+
 ### Enhance with Workflow
 
 Enable **Enhance with Workflow** when every normal workflow execution should generate a fresh enhancement before sending text downstream.
@@ -249,8 +308,13 @@ For **Local LLM Generate**:
 
 For **Local LLM Prompt Enhancer**:
 
-- `images` accepts still IMAGE references.
+- `image(s)` accepts still IMAGE references.
 - `video` accepts native ComfyUI VIDEO.
+
+
+- dynamic `image_N` sockets provide still H3 references.
+- dynamic `video_N` sockets provide native VIDEO references sampled for Local LLM planning.
+- dynamic `audio_N` sockets are preserved for downstream H3 use; only label/role/duration metadata is available to the current Local LLM planner.
 
 Vision input requires a compatible multimodal model and mmproj/projector configuration. A text-only GGUF cannot use image/video input simply because the node socket is connected.
 
@@ -295,4 +359,93 @@ When updating this package:
 2. Restart ComfyUI.
 3. Hard-refresh the browser if necessary.
 
-The package removes stale versioned Local LLM and Prompt Enhancer frontend modules at import time so an old JS file left by an overwrite-style update is not loaded alongside the current one.
+
+
+
+### v0.18.40 alpha
+
+- H3 sequential planning now performs one visual-reference analysis pass before generating unlocked shots. Connected image/video references are inspected once and condensed into a reusable `reference_context`; normal later shot calls are text-only and reuse that context instead of reprocessing every image/video.
+- The reference context is stored in the internal plan/H3 Sequence so the accepted sequence retains the visual facts that informed planning. Audio is still not auditioned by the Local LLM; audio labels/roles remain metadata guidance.
+- Added targeted fresh-vision fallback: a next-shot response may return `<vision_request>image_2,video_1</vision_request>` when a genuinely necessary visual fact is absent/ambiguous. The backend then repeats only that shot request with only those requested visual assets attached. Audio and unknown assets are rejected, and a shot may request fresh vision only once.
+- Added detailed H3 planner performance logging. Console output now reports the one-time reference-analysis wall/prompt/decode/load time, each shot's primary LLM time, targeted fresh-vision time, tag-format repair time/count, H3 semantic-repair time, and total shot time. Formatting and semantic validation failures are explicitly logged when they trigger a repair.
+- Existing per-card Regenerate remains a direct visual one-shot request; `plan_json` and downstream `H3_SEQUENCE` remain structured JSON/Python data.
+
+
+### v0.18.39 alpha
+
+- Progressive updates contain the already parsed, H3-validated, duration-snapped plan, so the card shown in the UI is the same normalized shot used as context for the next Local LLM request.
+- The status line advances from `Shot N ready` to `Generating Shot N+1` and the shot strip follows the newest arriving card.
+- The progressive partial plan is written to `plan_json`, so cancelling or failing after several successful shots preserves the shots that already completed.
+- The frontend planning timeout is refreshed after every accepted shot, making the timeout per-shot/progress rather than a five-minute cap on an entire multi-shot sequence.
+- Final node execution still returns the complete structured `H3_SEQUENCE`; the websocket progress path is UI-only and cannot make backend generation fail if no browser is connected.
+
+### v0.18.37 alpha
+
+- Every next-shot request receives the complete original video request, all connected references, and the full set of already accepted/normalized shots as continuity context.
+- Added `<sequence_complete>true|false</sequence_complete>` to the LLM transport so the model decides after each accepted shot whether another outer shot is needed. A completion-only response with no `<shot>` is supported when the accepted sequence is already finished.
+- Each generated shot is parsed, H3-validated, duration-snapped, and endpoint-normalized before it becomes context for the following request. A malformed response therefore affects only one shot request rather than the complete sequence.
+- Locked shots are inserted directly as authoritative history without asking the LLM to reproduce them; pinned current/future positions remain hard sequential-planning constraints.
+- Per-card regeneration remains a single Local LLM request. Internal `plan_json` and `H3_SEQUENCE` remain unchanged structured data.
+
+### v0.18.36 alpha
+
+- `generate_all` now returns `<h3_sequence>` with `<shot>` blocks; single-shot regeneration returns `<h3_regeneration>` with one `<shot>`.
+- Each shot uses simple `<title>`, `<seconds>`, `<model_mode>`, `<input_bindings>`, and `<h3_script>` wrappers; bindings use child tags and plain labels such as `Picture 1`, which the backend normalizes to `<Picture 1>`.
+- H3 tags such as `<Subject 1>`, `<Picture 1>`, `<Audio 1>`, and `<d>...</d>` remain verbatim inside `<h3_script>` and are not treated as transport markup.
+- Added tolerant tagged-response parsing plus one deterministic tag-format repair pass. H3 semantic validation/repair remains separate from transport repair.
+- Internal `plan_json`, shot-card state, and `H3_SEQUENCE` remain structured JSON/Python data, so the UI and downstream sequence contract are unchanged.
+
+### v0.18.35 alpha
+
+- Added balanced-object extraction plus deterministic cleanup for common preambles/fences, trailing commas, and literal control characters inside JSON strings.
+- Split JSON syntax recovery from H3 semantic validation: syntax failures now use a compact deterministic repair request at temperature 0 without re-sending vision media.
+- Syntax repair receives the exact parser line, column, character offset, and nearby text and may retry twice before returning a clean node error.
+- H3 semantic repair now starts from parseable JSON; if the semantic repair introduces malformed JSON, syntax recovery is applied again before final validation.
+- Planner instructions now explicitly require proper escaping of long `script` values, commas, line breaks, quotes, and backslashes.
+
+### v0.18.34 alpha
+
+- Intermediate local time marks are now driven by the Local LLM's understanding of meaningful action, camera, dialogue, audio, reference, and state-change boundaries rather than a fixed cadence.
+- Planner instructions explicitly treat timestamps as a semantic temporal storyboard and discourage start/end-only scripts when a shot contains multiple phases.
+- Backend keeps only structural timeline checks: local `00:00.000` start, chronological unique timing cues, in-range intermediate marks, and exact snapped H3 terminal timing/alignment.
+
+### v0.18.33 alpha
+
+- Planner instructions target one meaningful local `At MM:SS.mmm,` action beat about every 2.0–2.5 seconds, with intermediate beats required for shots longer than 2.5 seconds.
+- Backend validation computes a minimum marker count from each shot's snapped H3 `actual_seconds`, so sparse timelines trigger the existing LLM repair pass.
+- Backend also rejects clustered timing when any untimed interval exceeds approximately 3.25 seconds, preventing a model from satisfying the count with meaningless early/late marker clusters.
+- Exact terminal timestamp and FL2VA/L2VA endpoint snapping remain unchanged.
+
+### v0.18.32 alpha
+
+- The planner then chooses the shortest realistic requested `seconds` value within `MAX_SHOT_SECONDS` and writes the final localized H3 timeline against that duration.
+- JSON still emits `seconds` before `script` as a schema requirement; this no longer dictates the model's internal planning order.
+- Single-shot regeneration now preserves the existing duration by default but may change it when guidance or materially revised action genuinely requires a different runtime.
+- Existing backend H3 frame-grid snapping and exact terminal timestamp/alignment normalization remain the final timing authority.
+
+### v0.18.31 alpha
+
+- Every outer shot now treats its own `seconds` field as its authoritative requested local runtime and must write explicit `At MM:SS.mmm,` action beats beginning at local `00:00.000`.
+- Regeneration explicitly supplies the current requested shot duration and current snapped H3 duration to the Local LLM.
+- Backend validation requires a localized start and terminal time mark, rejects cumulative/out-of-range timelines, and rewrites the terminal action beat to the exact snapped H3 `actual_seconds`.
+- FL2VA/L2VA endpoint alignment is normalized after frame snapping to the official two-decimal `S.SS-second mark`.
+
+### v0.18.30 alpha
+- H3 References now shows only media sockets that are actually connected. Autogrow placeholder sockets remain available on the node edge but no longer appear as `(+)` rows in the internal reference panel.
+
+### v0.18.28 alpha
+- Added per-shot reference editing: swap bindings directly and add/remove Ref2VA references without regenerating the script.
+- Added persistent per-shot reference pins enforced as hard constraints during single-shot regeneration and full Generate Shots replanning.
+- Added persistent shot locking; locked shots cannot be edited/regenerated in the card UI and are preserved as immutable positional anchors during replanning.
+- Added per-shot **STALE** tracking for changes to the master request, sequence settings, asset labels/roles, and connected media topology.
+
+### v0.18.27 alpha
+- Added explicit first-frame, last-frame, and source-audio-timeline roles for downstream H3 expansion/continuation routing.
+- Local LLM multimodal helpers now accept lists of still-image batches and video-frame batches so the H3 planner can inspect multiple independent connected references.
+
+### v0.18.26 alpha
+- Removed the redundant Local LLM Settings-connected seed status text from the Prompt Enhancer UI. Seed behavior is unchanged.
+
+### v0.18.25 alpha
+- Removed Seed / Control After Generate from Local LLM Settings.
+- Generate and Prompt Enhancer now own their seeds independently. Connecting Settings no longer disables or overrides Prompt Enhancer seed controls.

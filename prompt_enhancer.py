@@ -18,7 +18,7 @@ import folder_paths
 
 log = logging.getLogger(__name__)
 
-NODE_VERSION = "0.6.13-alpha"
+NODE_VERSION = "0.6.18-alpha"
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_DIR = PACKAGE_DIR / "templates" / "default"
 USER_TEMPLATE_DIR = Path(folder_paths.models_dir) / "LLM" / "local_LLM_presets" / "prompt_enhancer"
@@ -48,6 +48,24 @@ LOCAL_LLM_VISION_FIELDS = ("vision_max_images", "vision_max_frames", "vision_max
 _PENDING_LOCK = threading.Lock()
 _PENDING_REQUESTS: dict[str, dict[str, Any]] = {}
 _PENDING_TTL_SECONDS = 300.0
+
+# A manual Enhance batch pins the complete Local LLM runtime configuration that
+# existed when the user pressed Enhance.  Modal autosaves are still accepted
+# while the batch runs, but they are deliberately not observed by later items in
+# that batch.  Sessions are backend-only and expire defensively if a browser is
+# closed/reloaded before it can send the normal batch_end request.
+_BATCH_LOCK = threading.Lock()
+_BATCH_SESSIONS: dict[str, dict[str, Any]] = {}
+_BATCH_TTL_SECONDS = 2 * 60 * 60.0
+
+# Prompt Cycle used to advance only when the browser processed ComfyUI's
+# `executed` event. Background tabs can throttle/delay that JavaScript, causing
+# repeated workflow runs to serialize the same active index. Keep the live
+# workflow cursor in the backend instead; the frontend now mirrors this state
+# for display but is not part of the correctness path.
+_PROMPT_CYCLE_LOCK = threading.Lock()
+_PROMPT_CYCLE_STATES: dict[str, dict[str, Any]] = {}
+_PROMPT_CYCLE_TTL_SECONDS = 24 * 60 * 60.0
 
 
 def _display_name_from_path(path: Path) -> str:
@@ -311,14 +329,11 @@ def _settings_runtime_config(settings: Any) -> dict[str, Any] | None:
 
 
 def _settings_overrides(settings: Any, fallback_seed: Any = 0) -> dict[str, Any]:
-    """Translate LOCAL_LLM_SETTINGS into the same request overrides used by Local LLM Generate."""
+    """Translate LOCAL_LLM_SETTINGS into request overrides while keeping seed request-local."""
     linked = settings if isinstance(settings, dict) else None
+    overrides: dict[str, Any] = {"seed": _normalize_seed(fallback_seed)}
     if not linked:
-        return {"seed": _normalize_seed(fallback_seed)}
-
-    overrides: dict[str, Any] = {
-        "seed": _normalize_seed(linked.get("seed", fallback_seed)),
-    }
+        return overrides
     for key in LOCAL_LLM_VISION_FIELDS:
         if key in linked:
             try:
@@ -357,8 +372,7 @@ def _settings_overrides(settings: Any, fallback_seed: Any = 0) -> dict[str, Any]
 
 
 def _effective_seed(settings: Any, fallback_seed: Any = 0) -> int:
-    if isinstance(settings, dict) and "seed" in settings:
-        return _normalize_seed(settings.get("seed"))
+    # Seed is owned by Prompt Enhancer itself. Local LLM Settings never overrides it.
     return _normalize_seed(fallback_seed)
 
 
@@ -473,6 +487,81 @@ def _prune_pending_locked(now: float | None = None) -> None:
         _PENDING_REQUESTS.pop(node_id, None)
 
 
+def _prune_batches_locked(now: float | None = None) -> None:
+    now = time.monotonic() if now is None else now
+    stale = [
+        batch_id for batch_id, item in _BATCH_SESSIONS.items()
+        if now - float(item.get("created", 0.0)) > _BATCH_TTL_SECONDS
+    ]
+    for batch_id in stale:
+        _BATCH_SESSIONS.pop(batch_id, None)
+
+
+def _begin_batch() -> str:
+    service = _find_local_llm_service()
+    get_config = getattr(service, "get_config", None)
+    if not callable(get_config):
+        raise RuntimeError("Local LLM service does not expose a configuration snapshot API.")
+    server_config = copy.deepcopy(get_config())
+    batch_id = uuid.uuid4().hex
+    with _BATCH_LOCK:
+        _prune_batches_locked()
+        _BATCH_SESSIONS[batch_id] = {
+            "created": time.monotonic(),
+            "server_config": server_config,
+            # Connected Local LLM Settings is captured lazily on the first
+            # partial execution because its serialized value exists only inside
+            # the ComfyUI node execution path.
+            "settings_captured": False,
+            "settings_runtime_config": None,
+            "settings_overrides": {},
+        }
+    return batch_id
+
+
+def _end_batch(batch_id: Any) -> bool:
+    batch_id = str(batch_id or "").strip()
+    if not batch_id:
+        return False
+    with _BATCH_LOCK:
+        return _BATCH_SESSIONS.pop(batch_id, None) is not None
+
+
+def _batch_request_snapshot(batch_id: Any, settings: Any, seed: Any) -> tuple[dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]:
+    """Resolve immutable batch settings while allowing the seed to advance.
+
+    The modal/server configuration is captured at batch_begin.  If a Settings
+    node is connected, its request-local runtime/sampler values are captured on
+    the first item and reused for the rest of the batch.  Seed remains per-item
+    because ComfyUI's standard control_after_generate lifecycle intentionally
+    advances it between batch entries.
+    """
+    batch_id = str(batch_id or "").strip()
+    if not batch_id:
+        return _settings_overrides(settings, seed), _settings_runtime_config(settings), None
+
+    with _BATCH_LOCK:
+        _prune_batches_locked()
+        session = _BATCH_SESSIONS.get(batch_id)
+        if session is None:
+            raise RuntimeError("Prompt Enhancer batch configuration expired. Start the batch again.")
+
+        if not bool(session.get("settings_captured")):
+            runtime = _settings_runtime_config(settings)
+            first_overrides = _settings_overrides(settings, seed)
+            first_overrides.pop("seed", None)
+            session["settings_runtime_config"] = copy.deepcopy(runtime) if runtime is not None else None
+            session["settings_overrides"] = copy.deepcopy(first_overrides)
+            session["settings_captured"] = True
+
+        server_snapshot = copy.deepcopy(session.get("server_config") or {})
+        runtime_snapshot = copy.deepcopy(session.get("settings_runtime_config"))
+        overrides = copy.deepcopy(session.get("settings_overrides") or {})
+
+    overrides["seed"] = _normalize_seed(seed)
+    return overrides, runtime_snapshot, server_snapshot
+
+
 def _normalize_seed(seed: Any) -> int:
     try:
         value = int(seed)
@@ -483,7 +572,7 @@ def _normalize_seed(seed: Any) -> int:
     return value
 
 
-def _arm_request(node_id: str, prompt: str, enhancement_text: str, seed: Any = 0) -> str:
+def _arm_request(node_id: str, prompt: str, enhancement_text: str, seed: Any = 0, batch_id: Any = "") -> str:
     node_id = str(node_id or "").strip()
     if not node_id:
         raise ValueError("Missing Prompt Enhancer node id.")
@@ -497,6 +586,7 @@ def _arm_request(node_id: str, prompt: str, enhancement_text: str, seed: Any = 0
             "prompt": str(prompt or ""),
             "enhancement_text": str(enhancement_text or ""),
             "seed": _normalize_seed(seed),
+            "batch_id": str(batch_id or "").strip(),
             "created": time.monotonic(),
         }
     return token
@@ -538,6 +628,7 @@ def _run_enhancement(
     workflow_owned: bool = False,
     seed: Any = 0,
     settings: Any = None,
+    batch_id: Any = "",
 ) -> dict[str, Any]:
     frames = _video_frames(video) if video is not None else None
     messages = _messages_for(
@@ -551,13 +642,15 @@ def _run_enhancement(
     # button, use the service's workflow-client prefix so VRAM arbitration does
     # not wait on the very workflow that is currently executing this node.
     client = "ComfyUI Local LLM Generate - Prompt Enhancer" if workflow_owned else "Prompt Enhancer"
+    overrides, runtime_config, config_snapshot = _batch_request_snapshot(batch_id, settings, seed)
     result = service.generate_messages(
         messages,
         image=images,
         video_frames=frames,
         client=client,
-        overrides=_settings_overrides(settings, seed),
-        runtime_config=_settings_runtime_config(settings),
+        overrides=overrides,
+        runtime_config=runtime_config,
+        config_snapshot=config_snapshot,
     )
     revised = _clean_response((result or {}).get("response", ""))
     if not revised:
@@ -660,6 +753,116 @@ def _prompt_preset_names() -> list[str]:
     except Exception as exc:
         log.warning("[Local LLM Prompt Enhancer] Could not enumerate shared prompt presets: %s", exc)
         return []
+
+
+def _prompt_cycle_signature(mode: str, history: list[str]) -> tuple[str, tuple[str, ...]]:
+    return (str(mode or "fixed").strip().lower(), tuple(str(item) for item in history))
+
+
+def _clear_prompt_cycle_state(unique_id: Any) -> None:
+    key = str(unique_id or "").strip()
+    if not key:
+        return
+    with _PROMPT_CYCLE_LOCK:
+        _PROMPT_CYCLE_STATES.pop(key, None)
+
+
+def _prune_prompt_cycle_states_locked(now: float) -> None:
+    stale = [
+        key for key, state in _PROMPT_CYCLE_STATES.items()
+        if now - float(state.get("updated_at") or 0.0) > _PROMPT_CYCLE_TTL_SECONDS
+    ]
+    for key in stale:
+        _PROMPT_CYCLE_STATES.pop(key, None)
+
+
+def _prompt_cycle_state_snapshot(
+    unique_id: Any,
+    mode: str,
+    history: list[str],
+) -> dict[str, Any]:
+    """Read the authoritative live cycle cursor without advancing it.
+
+    A ComfyUI workflow-tab switch can make the browser miss the execution UI
+    payload for a node that is no longer in the currently mounted graph.  The
+    frontend uses this snapshot when the node becomes visible again.  State is
+    returned only when the caller's mode/history exactly matches the signature
+    that produced the backend cursor, so an old cursor can never overwrite a
+    newly edited prompt array.
+    """
+    key = str(unique_id or "").strip()
+    count = len(history)
+    if not key or count <= 0:
+        return {"valid": False}
+
+    signature = _prompt_cycle_signature(mode, history)
+    now = time.monotonic()
+    with _PROMPT_CYCLE_LOCK:
+        _prune_prompt_cycle_states_locked(now)
+        state = _PROMPT_CYCLE_STATES.get(key)
+        if not state or state.get("signature") != signature:
+            return {"valid": False}
+        next_index = _normalize_history_index(state.get("next_index", 0), count)
+        shuffle = [
+            int(value) for value in (state.get("shuffle") or [])
+            if isinstance(value, int) and 0 <= value < count and value != next_index
+        ]
+        return {
+            "valid": True,
+            "next_index": next_index,
+            "shuffle": shuffle,
+        }
+
+
+def _advance_prompt_cycle_backend(
+    unique_id: Any,
+    mode: str,
+    history: list[str],
+    requested_index: int,
+    shuffle_state: Any,
+) -> tuple[int, int, list[int]]:
+    """Return (index used now, index for next run, next shuffle bag).
+
+    The serialized UI index is authoritative when the history/mode changes or
+    after an explicit frontend reset. Otherwise the backend cursor is
+    authoritative, which makes rapid/auto-queued runs independent of browser
+    focus and `executed` event timing.
+    """
+    count = len(history)
+    requested = _normalize_history_index(requested_index, count)
+    if count <= 0:
+        _clear_prompt_cycle_state(unique_id)
+        return 0, 0, []
+
+    key = str(unique_id or "").strip()
+    # UNIQUE_ID should always be present in ComfyUI. Keep a stateless fallback
+    # for unusual direct/test invocations rather than sharing a global key.
+    if not key:
+        next_index, next_shuffle = _next_prompt_index(mode, count, requested, shuffle_state)
+        return requested, next_index, next_shuffle
+
+    signature = _prompt_cycle_signature(mode, history)
+    now = time.monotonic()
+    with _PROMPT_CYCLE_LOCK:
+        _prune_prompt_cycle_states_locked(now)
+        state = _PROMPT_CYCLE_STATES.get(key)
+        if not state or state.get("signature") != signature:
+            current_index = requested
+            current_shuffle: Any = shuffle_state
+        else:
+            current_index = _normalize_history_index(state.get("next_index", requested), count)
+            current_shuffle = state.get("shuffle", [])
+
+        next_index, next_shuffle = _next_prompt_index(
+            mode, count, current_index, current_shuffle
+        )
+        _PROMPT_CYCLE_STATES[key] = {
+            "signature": signature,
+            "next_index": next_index,
+            "shuffle": list(next_shuffle),
+            "updated_at": now,
+        }
+    return current_index, next_index, list(next_shuffle)
 
 
 def _effective_prompt_text(prompt_preset: Any, prompt: Any) -> str:
@@ -861,8 +1064,8 @@ class LocalLLMPromptEnhancer:
                     "LOCAL_LLM_SETTINGS",
                     {
                         "tooltip": (
-                            "Optional Local LLM Settings node. When connected, its sampler, vision-limit, and seed values "
-                            "are authoritative for enhancement. The local Seed controls are then disabled in the UI."
+                            "Optional Local LLM Settings node. When connected, it supplies sampler, vision-limit, and runtime values. "
+                            "Seed remains owned by this Prompt Enhancer node and its local Seed controls stay active."
                         ),
                     },
                 ),
@@ -917,16 +1120,13 @@ class LocalLLMPromptEnhancer:
     ):
         source = _effective_prompt_text(prompt_preset, prompt)
         history = _parse_prompt_history(prompt_history_json, enhanced_prompt)
-        active_index = _normalize_history_index(prompt_history_index, len(history))
+        ui_active_index = _normalize_history_index(prompt_history_index, len(history))
         visible_enhanced = str(enhanced_prompt or "")
         if history:
-            # Enhanced Prompt is the editable view of the active array entry, so
-            # the visible widget is authoritative for that entry at execution time.
-            history[active_index] = visible_enhanced
-            active_enhanced = visible_enhanced
-        else:
-            active_enhanced = visible_enhanced
-        effective = active_enhanced if active_enhanced.strip() else source
+            # Enhanced Prompt is the editable view of the browser's active array
+            # entry. Preserve that edit in the history even when the backend is
+            # already ahead because the tab was backgrounded.
+            history[ui_active_index] = visible_enhanced
         effective_seed = _effective_seed(settings, seed)
 
         # A manual media/settings-aware Enhance request always takes priority. The
@@ -934,6 +1134,7 @@ class LocalLLMPromptEnhancer:
         # can reach the Local GGUF service.
         pending = _pop_request(unique_id)
         if pending is not None:
+            _clear_prompt_cycle_state(unique_id)
             token = str(pending.get("token") or "")
             result = _run_enhancement(
                 source,
@@ -943,6 +1144,7 @@ class LocalLLMPromptEnhancer:
                 workflow_owned=True,
                 seed=pending.get("seed", effective_seed),
                 settings=settings,
+                batch_id=pending.get("batch_id", ""),
             )
             payload = {
                 "mode": "manual",
@@ -955,10 +1157,11 @@ class LocalLLMPromptEnhancer:
             }
             return {
                 "ui": {"prompt_enhancer": [json.dumps(payload, ensure_ascii=False)]},
-                "result": (effective, source),
+                "result": ((visible_enhanced if visible_enhanced.strip() else source), source),
             }
 
         if bool(enhance_with_workflow):
+            _clear_prompt_cycle_state(unique_id)
             result = _run_enhancement(
                 source,
                 str(enhancement_text or ""),
@@ -983,18 +1186,22 @@ class LocalLLMPromptEnhancer:
                 "result": (revised, source),
             }
 
-        next_index, next_shuffle = _next_prompt_index(
+        active_index, next_index, next_shuffle = _advance_prompt_cycle_backend(
+            unique_id,
             prompt_cycle,
-            len(history),
-            active_index,
+            history,
+            ui_active_index,
             prompt_shuffle_json,
         )
+        active_enhanced = history[active_index] if history else visible_enhanced
+        effective = active_enhanced if active_enhanced.strip() else source
         payload = {
             "mode": "cycle",
             "active_index": active_index,
             "next_index": next_index,
             "shuffle": next_shuffle,
             "used_settings": isinstance(settings, dict),
+            "backend_owned": True,
         }
         return {
             "ui": {"prompt_enhancer": [json.dumps(payload, ensure_ascii=False)]},
@@ -1133,6 +1340,24 @@ try:
             log.exception("[Local LLM Prompt Enhancer] Prompt set load failed")
             return _json_error(exc, 500)
 
+    @routes.post("/local_llm_prompt_enhancer/batch_begin")
+    async def local_llm_prompt_enhancer_batch_begin(_request):
+        try:
+            batch_id = await asyncio.to_thread(_begin_batch)
+            return web.json_response({"batch_id": batch_id})
+        except Exception as exc:
+            log.exception("[Local LLM Prompt Enhancer] Batch snapshot failed")
+            return _json_error(exc, 500)
+
+    @routes.post("/local_llm_prompt_enhancer/batch_end")
+    async def local_llm_prompt_enhancer_batch_end(request):
+        try:
+            body = await request.json()
+            ended = _end_batch((body or {}).get("batch_id", ""))
+            return web.json_response({"ended": bool(ended)})
+        except Exception as exc:
+            return _json_error(exc, 500)
+
     @routes.post("/local_llm_prompt_enhancer/arm")
     async def local_llm_prompt_enhancer_arm(request):
         try:
@@ -1144,12 +1369,47 @@ try:
                 str(body.get("prompt") or ""),
                 str(body.get("enhancement_text") or ""),
                 body.get("seed", 0),
+                body.get("batch_id", ""),
             )
             return web.json_response({"token": token})
         except ValueError as exc:
             return _json_error(exc, 400)
         except Exception as exc:
             log.exception("[Local LLM Prompt Enhancer] Arm request failed")
+            return _json_error(exc, 500)
+
+    @routes.post("/local_llm_prompt_enhancer/cycle_reset")
+    async def local_llm_prompt_enhancer_cycle_reset(request):
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise TypeError("Request body must be an object")
+            _clear_prompt_cycle_state(body.get("node_id"))
+            return web.json_response({"ok": True})
+        except Exception as exc:
+            log.exception("[Local LLM Prompt Enhancer] Prompt-cycle reset failed")
+            return _json_error(exc, 500)
+
+    @routes.post("/local_llm_prompt_enhancer/cycle_state")
+    async def local_llm_prompt_enhancer_cycle_state(request):
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise TypeError("Request body must be an object")
+            history_raw = body.get("history", [])
+            if not isinstance(history_raw, list):
+                raise TypeError("history must be an array")
+            history = [str(item) for item in history_raw]
+            snapshot = _prompt_cycle_state_snapshot(
+                body.get("node_id"),
+                str(body.get("mode") or "fixed"),
+                history,
+            )
+            return web.json_response(snapshot)
+        except (TypeError, ValueError) as exc:
+            return _json_error(exc, 400)
+        except Exception as exc:
+            log.exception("[Local LLM Prompt Enhancer] Prompt-cycle state read failed")
             return _json_error(exc, 500)
 
     @routes.post("/local_llm_prompt_enhancer/cancel")
@@ -1186,6 +1446,7 @@ try:
                 video=None,
                 workflow_owned=False,
                 seed=body.get("seed", 0),
+                batch_id=body.get("batch_id", ""),
             )
             return web.json_response({"prompt": result["prompt"]})
         except ValueError as exc:
