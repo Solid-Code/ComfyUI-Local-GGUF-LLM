@@ -1,4 +1,16 @@
-# Local GGUF LLM — v0.18.52 alpha
+# Local GGUF LLM — v0.18.54 alpha
+
+
+## v0.18.54 alpha
+
+- Adds a process-global native llama.cpp ownership gate shared through a stable `sys.modules` coordinator. Separate service calls, linked API facades, direct engine callers, hot-reload aliases, native loads, generation, suspend/yield, decode recovery, and cleanup can no longer create/use/destroy top-level llama.cpp contexts concurrently.
+- Fixes the persistent-mode check/load/publish race that could let two callers both observe an empty cache and construct duplicate `Llama(...)` contexts before either published its result.
+- Native ownership acquisition is cancellation-aware, preserving v0.18.53 Stop/Unload behavior for service requests waiting behind another native caller.
+- Adds native operation/context epochs and live ownership diagnostics to service/request status. The two actual `Llama(...)` constructor paths assert that the process-global ownership gate is held, turning future bypasses into explicit errors instead of silent double-load races.
+- Adds bridge/service API v2 with a blocking `gpu_handoff()` contract. It waits for service and non-service native work, then guarantees no top-level GGUF context remains resident before returning.
+- `Suspend` now uses the same handoff contract in both **Auto Yield to ComfyUI** and **Keep Resident / Persistent (Driver Managed)** modes. Persistent mode no longer reports a successful suspend while leaving its native GGUF allocation resident.
+- Fixes a cross-pack generation-lock deadlock: an external OpenAI/service request waiting for an active ComfyUI workflow no longer holds the service generation lock while it waits. H3/Prompt Enhancer can therefore complete their blocking GPU handoff, after which the external request proceeds. Start/Reload use the same wait-outside-lock/recheck discipline.
+- Prompt Enhancer's completion boundaries now call the v2 `gpu_handoff()` contract directly.
 
 
 ## v0.18.52 alpha

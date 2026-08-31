@@ -17,6 +17,9 @@ import os
 import re
 import threading
 import time
+import sys
+import types
+from contextlib import contextmanager
 from pathlib import Path
 
 import folder_paths
@@ -34,18 +37,149 @@ except Exception:
 
 _NONE = "None"
 _AUTO_VISION = "Auto (matching mmproj)"
-_MODEL_CACHE = {
-    "key": None,
-    "llm": None,
-    "metadata": None,
-    "family": None,
-    "base_chat_handler": None,
-    "managed_adapter": None,
-    "load_diagnostics": None,
-    "mode": None,
-}
-_MODEL_LOCK = threading.RLock()
+# Process-global native coordination.  Store this under a stable sys.modules key
+# instead of only as module globals so development reloads / alternate package
+# import names cannot accidentally create a second independent llama.cpp lock or
+# cache in the same ComfyUI Python process.
+_NATIVE_COORDINATOR_KEY = "_comfyui_local_gguf_llm_native_coordinator_v1"
+_NATIVE_COORDINATOR = sys.modules.get(_NATIVE_COORDINATOR_KEY)
+if _NATIVE_COORDINATOR is None:
+    _NATIVE_COORDINATOR = types.ModuleType(_NATIVE_COORDINATOR_KEY)
+    _NATIVE_COORDINATOR.model_cache = {
+        "key": None,
+        "llm": None,
+        "metadata": None,
+        "family": None,
+        "base_chat_handler": None,
+        "managed_adapter": None,
+        "load_diagnostics": None,
+        "mode": None,
+    }
+    _NATIVE_COORDINATOR.model_lock = threading.RLock()
+    _NATIVE_COORDINATOR.operation_lock = threading.RLock()
+    _NATIVE_COORDINATOR.state_lock = threading.RLock()
+    _NATIVE_COORDINATOR.owner_thread_id = None
+    _NATIVE_COORDINATOR.owner_label = None
+    _NATIVE_COORDINATOR.owner_started = None
+    _NATIVE_COORDINATOR.owner_depth = 0
+    _NATIVE_COORDINATOR.waiters = 0
+    _NATIVE_COORDINATOR.operation_epoch = 0
+    _NATIVE_COORDINATOR.context_epoch = 0
+    sys.modules[_NATIVE_COORDINATOR_KEY] = _NATIVE_COORDINATOR
+else:
+    # Forward-compatible initialization when an older dev reload created the
+    # coordinator before one of these fields existed.
+    if not hasattr(_NATIVE_COORDINATOR, "model_cache"):
+        _NATIVE_COORDINATOR.model_cache = {}
+    defaults = {
+        "key": None, "llm": None, "metadata": None, "family": None,
+        "base_chat_handler": None, "managed_adapter": None,
+        "load_diagnostics": None, "mode": None,
+    }
+    for _k, _v in defaults.items():
+        _NATIVE_COORDINATOR.model_cache.setdefault(_k, _v)
+    if not hasattr(_NATIVE_COORDINATOR, "model_lock"):
+        _NATIVE_COORDINATOR.model_lock = threading.RLock()
+    if not hasattr(_NATIVE_COORDINATOR, "operation_lock"):
+        _NATIVE_COORDINATOR.operation_lock = threading.RLock()
+    if not hasattr(_NATIVE_COORDINATOR, "state_lock"):
+        _NATIVE_COORDINATOR.state_lock = threading.RLock()
+    for _name, _value in {
+        "owner_thread_id": None, "owner_label": None, "owner_started": None,
+        "owner_depth": 0, "waiters": 0, "operation_epoch": 0,
+        "context_epoch": 0,
+    }.items():
+        if not hasattr(_NATIVE_COORDINATOR, _name):
+            setattr(_NATIVE_COORDINATOR, _name, _value)
+
+_MODEL_CACHE = _NATIVE_COORDINATOR.model_cache
+_MODEL_LOCK = _NATIVE_COORDINATOR.model_lock
+_NATIVE_OPERATION_LOCK = _NATIVE_COORDINATOR.operation_lock
 _META_CACHE = {}
+
+
+def _native_operation_snapshot():
+    """Advisory process-global llama.cpp ownership state for diagnostics/UI."""
+    with _NATIVE_COORDINATOR.state_lock:
+        started = _NATIVE_COORDINATOR.owner_started
+        return {
+            "active": _NATIVE_COORDINATOR.owner_thread_id is not None,
+            "owner_thread_id": _NATIVE_COORDINATOR.owner_thread_id,
+            "label": _NATIVE_COORDINATOR.owner_label,
+            "depth": int(_NATIVE_COORDINATOR.owner_depth or 0),
+            "waiters": int(_NATIVE_COORDINATOR.waiters or 0),
+            "operation_epoch": int(_NATIVE_COORDINATOR.operation_epoch or 0),
+            "context_epoch": int(_NATIVE_COORDINATOR.context_epoch or 0),
+            "elapsed": max(0.0, time.perf_counter() - started) if started is not None else 0.0,
+        }
+
+
+def _native_operation_owned_by_current_thread():
+    with _NATIVE_COORDINATOR.state_lock:
+        return _NATIVE_COORDINATOR.owner_thread_id == threading.get_ident() and int(_NATIVE_COORDINATOR.owner_depth or 0) > 0
+
+
+def _assert_native_operation_owned(action):
+    if not _native_operation_owned_by_current_thread():
+        raise RuntimeError(
+            f"Unsafe Local GGUF LLM native operation attempted outside the process-global ownership gate: {action}. "
+            "All llama.cpp create/use/destroy paths must run through _native_operation()."
+        )
+
+
+def _next_native_context_epoch():
+    _assert_native_operation_owned("native context creation")
+    with _NATIVE_COORDINATOR.state_lock:
+        _NATIVE_COORDINATOR.context_epoch = int(_NATIVE_COORDINATOR.context_epoch or 0) + 1
+        return int(_NATIVE_COORDINATOR.context_epoch)
+
+
+@contextmanager
+def _native_operation(label, cancel_event=None):
+    """Serialize every top-level llama.cpp create/use/destroy operation process-wide.
+
+    `_MODEL_LOCK` remains the short cache/reference lock.  This separate gate may
+    be held for slow native work without forcing status/configuration code to use
+    the same synchronization primitive.  Acquisition is cancellation-aware so a
+    queued service request can still unwind promptly when Stop is pressed.
+    """
+    label = str(label or "native-operation")
+    tid = threading.get_ident()
+    with _NATIVE_COORDINATOR.state_lock:
+        reentrant = _NATIVE_COORDINATOR.owner_thread_id == tid and int(_NATIVE_COORDINATOR.owner_depth or 0) > 0
+        if not reentrant:
+            _NATIVE_COORDINATOR.waiters = int(_NATIVE_COORDINATOR.waiters or 0) + 1
+    acquired = False
+    try:
+        while not acquired:
+            if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+                raise LocalLLMInterrupted("Local LLM operation stopped while waiting for native ownership")
+            acquired = _NATIVE_OPERATION_LOCK.acquire(timeout=0.10)
+        with _NATIVE_COORDINATOR.state_lock:
+            if not reentrant:
+                _NATIVE_COORDINATOR.waiters = max(0, int(_NATIVE_COORDINATOR.waiters or 0) - 1)
+            if _NATIVE_COORDINATOR.owner_thread_id == tid:
+                _NATIVE_COORDINATOR.owner_depth = int(_NATIVE_COORDINATOR.owner_depth or 0) + 1
+            else:
+                _NATIVE_COORDINATOR.operation_epoch = int(_NATIVE_COORDINATOR.operation_epoch or 0) + 1
+                _NATIVE_COORDINATOR.owner_thread_id = tid
+                _NATIVE_COORDINATOR.owner_label = label
+                _NATIVE_COORDINATOR.owner_started = time.perf_counter()
+                _NATIVE_COORDINATOR.owner_depth = 1
+        yield int(_NATIVE_COORDINATOR.operation_epoch or 0)
+    finally:
+        if acquired:
+            with _NATIVE_COORDINATOR.state_lock:
+                depth = max(0, int(_NATIVE_COORDINATOR.owner_depth or 0) - 1)
+                _NATIVE_COORDINATOR.owner_depth = depth
+                if depth == 0 and _NATIVE_COORDINATOR.owner_thread_id == tid:
+                    _NATIVE_COORDINATOR.owner_thread_id = None
+                    _NATIVE_COORDINATOR.owner_label = None
+                    _NATIVE_COORDINATOR.owner_started = None
+            _NATIVE_OPERATION_LOCK.release()
+        elif not reentrant:
+            with _NATIVE_COORDINATOR.state_lock:
+                _NATIVE_COORDINATOR.waiters = max(0, int(_NATIVE_COORDINATOR.waiters or 0) - 1)
 
 
 class LocalLLMInterrupted(RuntimeError):
@@ -1106,6 +1240,7 @@ def _close_llama_object(llm):
     """Close llama.cpp, multimodal, and speculative contexts safely."""
     if llm is None:
         return
+    _assert_native_operation_owned("llama.cpp context close")
     # Capture the draft object before closing Llama. Experimental native MTP
     # bridges may own a separate draft context; normal N-gram drafts are cheap
     # Python objects. Cleanup is best-effort and intentionally idempotent.
@@ -1234,6 +1369,8 @@ def _load_llama_verified(llama_cpp, Llama, load_kwargs, gpu_layers):
     snapshot_before_seconds = time.perf_counter() - before_started
     load_mode = _load_mode_name(load_kwargs)
     host_before = _host_load_snapshot()
+    _assert_native_operation_owned("verified Llama load")
+    context_epoch = _next_native_context_epoch()
     started = time.perf_counter()
     llm = Llama(**load_kwargs)
     elapsed = time.perf_counter() - started
@@ -1260,6 +1397,7 @@ def _load_llama_verified(llama_cpp, Llama, load_kwargs, gpu_layers):
         "llama_system_info": system_info,
         "backend_libraries": _llama_backend_libraries(llama_cpp),
         "native_load_seconds": round(elapsed, 3),
+        "native_context_epoch": int(context_epoch),
         "load_path": "verified-first-load",
         "verification_skipped": False,
         "snapshot_before_seconds": round(snapshot_before_seconds, 4),
@@ -1332,6 +1470,8 @@ def _load_llama_fast(Llama, load_kwargs, prior_diagnostics=None, reload_count=0)
 
     load_mode = _load_mode_name(load_kwargs)
     host_before = _host_load_snapshot()
+    _assert_native_operation_owned("fast Llama reload")
+    context_epoch = _next_native_context_epoch()
     started = time.perf_counter()
     llm = Llama(**load_kwargs)
     elapsed = time.perf_counter() - started
@@ -1342,6 +1482,7 @@ def _load_llama_fast(Llama, load_kwargs, prior_diagnostics=None, reload_count=0)
     diagnostics = dict(prior_diagnostics or {})
     diagnostics.update({
         "native_load_seconds": round(elapsed, 3),
+        "native_context_epoch": int(context_epoch),
         "load_path": "fast-reload",
         "verification_skipped": True,
         "reload_count": int(reload_count),
@@ -1580,6 +1721,7 @@ def _build_native_mtp_draft(model_path, family, gpu_layers=-1, n_max=2, p_min=0.
     ``load_mtp=True``.  This is intentionally capability-gated because upstream
     llama-cpp-python does not yet promise this experimental bridge ABI.
     """
+    _assert_native_operation_owned("native MTP draft creation")
     support = _speculative_runtime_support()
     if not support.get("mtp"):
         raise RuntimeError(
@@ -1993,6 +2135,10 @@ class _NativeLLMResident:
         return int(self._estimated_vram), "first-load-estimate"
 
     def _load_native(self):
+        with _native_operation("resident-load"):
+            return self._load_native_locked()
+
+    def _load_native_locked(self):
         with _MODEL_LOCK:
             if self._llm is not None:
                 _perf_log(
@@ -2084,6 +2230,10 @@ class _NativeLLMResident:
             return int(self._accounted_size)
 
     def _unload_native(self, reason="auto-yield", heavy_cleanup=False, required_free_bytes=None):
+        with _native_operation(f"resident-unload:{reason}"):
+            return self._unload_native_locked(reason=reason, heavy_cleanup=heavy_cleanup, required_free_bytes=required_free_bytes)
+
+    def _unload_native_locked(self, reason="auto-yield", heavy_cleanup=False, required_free_bytes=None):
         with _MODEL_LOCK:
             if self._llm is None:
                 _perf_log("native resident unload no-op", signature=self.signature_id, reason=reason)
@@ -2208,7 +2358,14 @@ class _NativeLLMResident:
 
 
 def _cleanup_llm():
-    """Explicitly destroy the native context and clear all cached load state."""
+    """Explicitly destroy native state under the process-global ownership gate."""
+    with _native_operation("explicit-cleanup"):
+        return _cleanup_llm_locked()
+
+
+def _cleanup_llm_locked():
+    """Destroy the native context and clear all cached load state. Gate already held."""
+    _assert_native_operation_owned("explicit cleanup")
     total_started = time.perf_counter()
     _perf_log("explicit cleanup begin", mode=_MODEL_CACHE.get("mode"))
     resident_ctl = _MODEL_CACHE.get("managed_adapter")
@@ -2255,6 +2412,74 @@ def _cleanup_llm():
     )
 
 
+def _suspend_llm_native(reason="manual-suspend", heavy_cleanup=False):
+    """Block until native llama.cpp is idle, then close any resident context.
+
+    Unlike `_cleanup_llm`, this preserves the allocation key/settings metadata and
+    service API compatibility. Managed residency keeps its verified fast-reload
+    controller. Persistent/driver-managed residency drops only the live Llama
+    instance so a later request can reconstruct it from the same configuration.
+    """
+    reason = str(reason or "manual-suspend")
+    with _native_operation(f"suspend:{reason}"):
+        _assert_native_operation_owned("native suspend")
+        with _MODEL_LOCK:
+            resident_ctl = _MODEL_CACHE.get("managed_adapter")
+            driver_llm = None if resident_ctl is not None else _MODEL_CACHE.get("llm")
+            mode = _MODEL_CACHE.get("mode")
+
+        if resident_ctl is not None:
+            released = int(resident_ctl._unload_native(reason=reason, heavy_cleanup=heavy_cleanup) or 0)
+            return {
+                "ok": True, "reason": reason, "mode": mode, "path": "managed-controller",
+                "released_accounted_bytes": released, "resident_after": False,
+                "operation": _native_operation_snapshot(),
+            }
+
+        if driver_llm is None:
+            return {
+                "ok": True, "reason": reason, "mode": mode, "path": "already-yielded",
+                "released_accounted_bytes": 0, "resident_after": False,
+                "operation": _native_operation_snapshot(),
+            }
+
+        # Break shared references before closing. Preserve key/config/diagnostics so
+        # service state and linked APIs remain valid; only native residency is lost.
+        with _MODEL_LOCK:
+            if _MODEL_CACHE.get("llm") is driver_llm:
+                _MODEL_CACHE["llm"] = None
+                _MODEL_CACHE["base_chat_handler"] = None
+
+        before = 0
+        try:
+            before = int(sum((_MODEL_CACHE.get("load_diagnostics") or {}).get("vram_delta_bytes_by_gpu", {}).values()))
+        except Exception:
+            before = 0
+        _close_llama_object(driver_llm)
+        del driver_llm
+        # Native teardown may enqueue CUDA release work. Synchronize every visible
+        # CUDA device because driver-managed split modes may span multiple GPUs.
+        try:
+            import torch
+            if torch.cuda.is_available():
+                for i in range(int(torch.cuda.device_count())):
+                    _sync_cuda_device(torch.device("cuda", i))
+        except Exception:
+            pass
+        if heavy_cleanup:
+            try:
+                gc.collect()
+                import comfy.model_management as mm
+                mm.soft_empty_cache()
+            except Exception:
+                pass
+        return {
+            "ok": True, "reason": reason, "mode": mode, "path": "driver-managed-close",
+            "released_accounted_bytes": int(max(0, before)), "resident_after": False,
+            "operation": _native_operation_snapshot(),
+        }
+
+
 def _is_fatal_decode_error(exc):
     """Identify native llama.cpp decode failures that poison the live context.
 
@@ -2272,25 +2497,22 @@ def _is_fatal_decode_error(exc):
 
 
 def _discard_failed_native_context(llm, reason="fatal-decode"):
-    """Discard only the failed native context while preserving reload metadata.
-
-    Managed/Auto-Yield residency keeps its verified controller so the next call
-    can use the normal direct fast-reload path. Driver-managed residency drops
-    only the poisoned Llama instance while retaining the allocation signature.
-    """
-    with _MODEL_LOCK:
-        resident_ctl = _MODEL_CACHE.get("managed_adapter")
-        if resident_ctl is not None and getattr(resident_ctl, "llm", None) is llm:
+    """Discard only the failed native context while preserving reload metadata."""
+    with _native_operation(f"discard-failed:{reason}"):
+        with _MODEL_LOCK:
+            resident_ctl = _MODEL_CACHE.get("managed_adapter")
+            managed_match = resident_ctl is not None and getattr(resident_ctl, "llm", None) is llm
+            driver_match = _MODEL_CACHE.get("llm") is llm
+        if managed_match:
             resident_ctl._unload_native(reason=reason, heavy_cleanup=False)
             return True, "managed-fast-reload"
-
-        if _MODEL_CACHE.get("llm") is llm:
-            # Break shared cache references before closing the failed context.
-            _MODEL_CACHE["llm"] = None
-            _MODEL_CACHE["base_chat_handler"] = None
+        if driver_match:
+            with _MODEL_LOCK:
+                if _MODEL_CACHE.get("llm") is llm:
+                    _MODEL_CACHE["llm"] = None
+                    _MODEL_CACHE["base_chat_handler"] = None
             _close_llama_object(llm)
             return True, "driver-managed-reload"
-
     return False, "unowned"
 
 
@@ -3300,7 +3522,7 @@ class LocalGGUFLLMAPI:
     """
 
     API_TYPE = "LOCAL_GGUF_LLM_API"
-    API_VERSION = 1
+    API_VERSION = 2
 
     _GENERATION_OVERRIDES = {
         "thinking_mode", "reasoning_effort", "preserve_thinking", "thinking_output",
@@ -3429,8 +3651,10 @@ class LocalGGUFLLMAPI:
                 raise TypeError("messages must be a list of OpenAI-style chat message dictionaries.")
             args["messages_override"] = copy.deepcopy(list(messages))
 
-        # Local lock gives a clear single-service call contract for linked nodes;
-        # the global model lock additionally serializes access across all facades.
+        # The facade lock preserves per-object call ordering. LocalGGUFLLM.generate
+        # additionally enters the process-global native ownership gate, so separate
+        # facades, service calls, and future direct engine callers cannot overlap a
+        # llama.cpp load/use/destroy operation.
         with self._call_lock:
             try:
                 response, thinking, info_json, tokens, _api = LocalGGUFLLM().generate(**args)
@@ -3615,7 +3839,12 @@ class LocalGGUFLLM:
         # hashing still carries every explicit setting and prompt alongside it.
         return "local-gguf-cache-v1|model=" + file_state(model) + "|vision=" + file_state(resolved_vision)
 
-    def generate(self, model, vision_model, model_preset, thinking_mode, reasoning_effort,
+    def generate(self, *args, **kwargs):
+        cancel_event = kwargs.get("cancel_event")
+        with _native_operation("generate", cancel_event=cancel_event):
+            return self._generate_impl(*args, **kwargs)
+
+    def _generate_impl(self, model, vision_model, model_preset, thinking_mode, reasoning_effort,
                  preserve_thinking, thinking_output, chat_format, custom_chat_format,
                  temperature, top_p, top_k, min_p, typical_p, repeat_penalty,
                  presence_penalty, frequency_penalty, max_tokens, seed,
@@ -3630,6 +3859,10 @@ class LocalGGUFLLM:
                  op_offload, swa_full, rope_freq_base, rope_freq_scale, yarn_ext_factor,
                  yarn_attn_factor, yarn_beta_fast, yarn_beta_slow, yarn_orig_ctx,
                  stop_sequences, vision_max_images, vision_max_frames, vision_max_edge, verbose, image=None, video_frames=None, messages_override=None, progress_callback=None, token_callback=None, cancel_event=None):
+        # Defense in depth: this implementation owns/uses the raw llama.cpp
+        # context and must never be invoked by future code that bypasses
+        # ``generate()``, which is the process-global native ownership boundary.
+        _assert_native_operation_owned("generation implementation")
         _check_cancel(cancel_event)
         if model == "No GGUF models found":
             raise FileNotFoundError(f"Put GGUF files in {LLM_DIR}")
@@ -4813,6 +5046,7 @@ class LocalGGUFLLM:
                 "comfyui_managed": model_retention == "ComfyUI Managed",
                 "estimated_native_vram_mib": round(estimated_vram / _MIB, 1),
                 "whole_model_eviction": model_retention == "ComfyUI Managed",
+                "native_operation_gate": _native_operation_snapshot(),
                 "note": (
                     "Persistent mode keeps llama.cpp's native model/context alive outside ComfyUI's eviction list; "
                     "ComfyUI observes the remaining device-wide free VRAM and the OS/GPU driver controls residency."

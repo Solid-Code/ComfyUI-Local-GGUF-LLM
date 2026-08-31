@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,9 @@ from .nodes import (
     _AUTO_VISION,
     _NONE,
     _cleanup_llm,
+    _suspend_llm_native,
+    _native_operation_snapshot,
+    _native_operation_owned_by_current_thread,
     _sync_cuda_device,
     _find_matching_mmproj,
     _validate_mmproj_pair,
@@ -709,7 +713,7 @@ def _normalized_messages(messages):
 
 class LocalLLMServiceAPI:
     API_TYPE = "LOCAL_LLM_SERVICE_API"
-    API_VERSION = 1
+    API_VERSION = 2
 
     def __init__(self, manager: "LocalLLMServiceManager"):
         self._manager = manager
@@ -736,6 +740,10 @@ class LocalLLMServiceAPI:
 
     def generate_text(self, *args, **kwargs):
         return self.generate(*args, **kwargs)["response"]
+
+    def gpu_handoff(self, reason="external-gpu-handoff"):
+        """Wait for all native LLM work, yield residency, and return diagnostics."""
+        return self._manager.gpu_handoff(reason=reason)
 
 
 class _RequestCancelToken:
@@ -1105,6 +1113,56 @@ class LocalLLMServiceManager:
     def _is_workflow_client(client):
         return str(client or "").startswith("ComfyUI Local LLM Generate")
 
+    @contextmanager
+    def _generation_slot(self, *, workflow_owned: bool, cancel_event=None, reason: str = "servicing the LLM request"):
+        """Acquire the service generation lock without deadlocking ComfyUI.
+
+        External requests must wait for ComfyUI to become idle, but they must *not*
+        hold ``_generation_lock`` while doing so: an active H3/Enhancer workflow
+        may need that same lock to perform the blocking Local-LLM GPU handoff before
+        its queue item can finish.  Holding the lock during the idle wait creates a
+        classic cycle (external request waits for ComfyUI; ComfyUI waits for the
+        external request's generation lock).
+
+        We therefore wait outside the lock, acquire it, and re-check ComfyUI. If
+        another workflow became active while we were competing for the lock, release
+        it and repeat. Workflow-owned callers are already serialized by ComfyUI and
+        bypass the idle check.
+        """
+        comfy_wait_seconds = 0.0
+        generation_lock_wait_seconds = 0.0
+        acquired = False
+        try:
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise LocalLLMInterrupted("Local LLM request cancelled while waiting for its generation turn")
+                if not workflow_owned:
+                    comfy_wait_seconds += float(
+                        self._wait_for_comfy_idle(reason, cancel_event=cancel_event) or 0.0
+                    )
+                lock_started = time.perf_counter()
+                while not acquired:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise LocalLLMInterrupted("Local LLM request cancelled while waiting for its generation turn")
+                    acquired = self._generation_lock.acquire(timeout=0.10)
+                generation_lock_wait_seconds += time.perf_counter() - lock_started
+                if cancel_event is not None and cancel_event.is_set():
+                    raise LocalLLMInterrupted("Local LLM request cancelled while waiting for its generation turn")
+                if workflow_owned or not self._comfy_running_jobs():
+                    break
+                # ComfyUI started/restarted while this external caller was waiting
+                # for the generation lock. Never sleep for ComfyUI idle while the
+                # lock is held; release and retry instead.
+                self._generation_lock.release()
+                acquired = False
+            yield {
+                "comfy_wait_seconds": float(comfy_wait_seconds),
+                "generation_lock_wait_seconds": float(generation_lock_wait_seconds),
+            }
+        finally:
+            if acquired:
+                self._generation_lock.release()
+
     def _warm_load(self, cancel_event=None):
         args = self._call_args()
         model = args.get("model")
@@ -1136,9 +1194,11 @@ class LocalLLMServiceManager:
                 return self.status()
             epoch = self._stop_epoch
         cancel_token = _RequestCancelToken(self, epoch)
-        if wait_for_comfy:
-            self._wait_for_comfy_idle("loading the LLM", cancel_event=cancel_token)
-        with self._generation_lock:
+        with self._generation_slot(
+            workflow_owned=not bool(wait_for_comfy),
+            cancel_event=cancel_token,
+            reason="loading the LLM",
+        ):
             if cancel_token.is_set():
                 raise LocalLLMInterrupted("Local LLM start stopped by user")
             with self._state_lock:
@@ -1180,60 +1240,63 @@ class LocalLLMServiceManager:
                 self._emit()
         return self.status()
 
-    def suspend(self, reason="manual-suspend"):
-        """Yield the native llama.cpp context while preserving fast-reload state.
+    def gpu_handoff(self, reason="external-gpu-handoff"):
+        """Establish a blocking native-LLM -> other-GPU-owner handoff boundary.
 
-        Unlike Stop / Unload, Suspend keeps the verified resident controller,
-        exact load signature/kwargs, measured VRAM target, and stable service API
-        facade.  The next request therefore follows the normal Auto-Yield fast
-        restoration path instead of performing a cold service start.
+        The service generation lock serializes service callers. The lower-level
+        process-global native gate additionally waits for facade/direct-engine work
+        that did not enter through this service. When this method returns, no
+        top-level llama.cpp context is resident in either Auto-Yield or Keep
+        Resident mode. The service/API configuration remains ready for on-demand
+        reconstruction after the other GPU owner has finished.
         """
+        reason = str(reason or "external-gpu-handoff")
+        if _native_operation_owned_by_current_thread():
+            raise RuntimeError(
+                "Local LLM GPU handoff cannot be initiated re-entrantly from inside an active native llama.cpp operation. "
+                "Return from generation first, then request the handoff."
+            )
         with self._generation_lock:
-            with self._state_lock:
-                if self._state in {STATE_LOADING, STATE_RELOADING, STATE_PROCESSING, STATE_GENERATING, STATE_STOPPING, STATE_WAITING_COMFY, STATE_TUNING}:
-                    return self.status()
-                if self._state != STATE_READY or self._api is None:
-                    return self.status()
-
-            resident_ctl = _MODEL_CACHE.get("managed_adapter")
-            if resident_ctl is None or getattr(resident_ctl, "llm", None) is None:
-                # Already yielded. Keep READY + API intact.
-                self._log("Suspend requested; native GGUF is already yielded")
-                self._emit()
-                return self.status()
-
-            self._log("Suspending native GGUF; preserving fast-reload state")
+            self._log(f"GPU handoff requested: {reason}; waiting for native LLM ownership barrier")
             started = time.perf_counter()
-            try:
-                load_device = getattr(resident_ctl, "load_device", None)
-                if getattr(load_device, "type", None) == "cuda":
-                    sync_started = time.perf_counter()
-                    _sync_cuda_device(load_device)
-                    sync_seconds = time.perf_counter() - sync_started
-                else:
-                    sync_seconds = 0.0
-                released = resident_ctl._unload_native(
-                    reason=str(reason or "manual-suspend"),
-                    heavy_cleanup=False,
-                )
-                with self._state_lock:
-                    self._state = STATE_READY
-                    self._model_loaded = True
+            native = _suspend_llm_native(reason=reason, heavy_cleanup=False)
+            with self._state_lock:
+                if self._state not in {STATE_STOPPED, STATE_STOPPING, STATE_ERROR}:
+                    self._state = STATE_READY if self._api is not None else STATE_STOPPED
                     self._error = None
-                    self._clear_current_request_locked(phase=True)
-                self._log(
-                    "Native GGUF suspended; service yielded and ready for fast reload "
-                    f"(sync={sync_seconds:.3f}s, total={time.perf_counter() - started:.3f}s, "
-                    f"released_accounted={int(released or 0) / (1024*1024):.1f} MiB)"
-                )
-            except Exception as e:
-                with self._state_lock:
-                    self._state = STATE_ERROR
-                    self._error = f"{type(e).__name__}: {e}"
-                self._log(self._error, "error")
-                raise
-            finally:
-                self._emit()
+                # `_model_loaded` historically means the service has a usable model
+                # configuration/API; live residency is reported separately by
+                # `_resident_snapshot()` / `vram_yielded`.
+                self._model_loaded = bool(self._api is not None and self._state != STATE_STOPPED)
+                self._clear_current_request_locked(phase=True, metrics=True)
+            native_after = self._resident_snapshot()
+            if native_after:
+                raise RuntimeError("Local LLM GPU handoff returned while a native llama.cpp context was still resident.")
+            elapsed = time.perf_counter() - started
+            self._log(
+                "Native GGUF GPU handoff complete "
+                f"(path={native.get('path', 'unknown')}, total={elapsed:.3f}s, "
+                f"released_accounted={int(native.get('released_accounted_bytes') or 0) / (1024*1024):.1f} MiB)"
+            )
+            self._emit()
+            return {
+                "ok": True,
+                "reason": reason,
+                "elapsed": elapsed,
+                "native": copy.deepcopy(native),
+                "native_operation": _native_operation_snapshot(),
+                "status": self.status(),
+            }
+
+    def suspend(self, reason="manual-suspend"):
+        """Yield native residency while keeping the service configured and ready.
+
+        v0.18.54 routes Suspend through the same blocking handoff contract used by
+        sibling GPU-heavy node packs. This now works for both Auto Yield and Keep
+        Resident modes and cannot return early while another native LLM caller is
+        still active.
+        """
+        self.gpu_handoff(reason=str(reason or "manual-suspend"))
         return self.status()
 
     def _stop_worker_main(self):
@@ -1308,9 +1371,11 @@ class LocalLLMServiceManager:
                 return self.status()
             epoch = self._stop_epoch
         cancel_token = _RequestCancelToken(self, epoch)
-        if wait_for_comfy:
-            self._wait_for_comfy_idle("reloading the LLM", cancel_event=cancel_token)
-        with self._generation_lock:
+        with self._generation_slot(
+            workflow_owned=not bool(wait_for_comfy),
+            cancel_event=cancel_token,
+            reason="reloading the LLM",
+        ):
             if cancel_token.is_set():
                 raise LocalLLMInterrupted("Local LLM reload stopped by user")
             with self._state_lock:
@@ -1380,11 +1445,16 @@ class LocalLLMServiceManager:
         startup = self.get_config().get("startup_mode", "On Demand")
         if state == STATE_STOPPED and startup == "Off":
             raise RuntimeError("Local LLM Server is stopped. Start it from the LLM sidebar panel.")
+        # ``_ensure_started`` is called only from ``generate_messages`` after that
+        # caller has already acquired `_generation_slot`. External callers were
+        # therefore checked for ComfyUI idleness *before* taking the generation
+        # lock; do not perform a second idle wait from inside the re-entrant lock,
+        # which could recreate the external-request <-> workflow handoff deadlock.
         if restart_required and state == STATE_READY:
-            self.reload(wait_for_comfy=not workflow_owned)
+            self.reload(wait_for_comfy=False)
         else:
             # A READY service with an evicted/yielded model is reloaded on demand.
-            self.start(wait_for_comfy=not workflow_owned)
+            self.start(wait_for_comfy=False)
 
     def generate_messages(self, messages, image=None, video_frames=None, client="unknown", overrides=None, token_callback=None, runtime_config=None, config_snapshot=None):
         messages = _normalized_messages(messages)
@@ -1431,24 +1501,22 @@ class LocalLLMServiceManager:
         cancel_token = _RequestCancelToken(self, request_epoch)
         self._emit()
         queued_at = time.perf_counter()
+        workflow_owned = self._is_workflow_client(client)
+        queue_registration_pending = True
         try:
-            with self._generation_lock:
+            with self._generation_slot(
+                workflow_owned=workflow_owned,
+                cancel_event=cancel_token,
+                reason="servicing the LLM request",
+            ) as slot:
                 generation_lock_acquired = time.perf_counter()
                 queue_wait_seconds = generation_lock_acquired - queued_at
+                comfy_wait_seconds = float(slot.get("comfy_wait_seconds") or 0.0)
                 with self._state_lock:
                     self._queue_count = max(0, self._queue_count - 1)
+                    queue_registration_pending = False
                 if cancel_token.is_set():
                     raise LocalLLMInterrupted("Queued Local LLM request cancelled by Stop")
-                # External API clients must not run llama.cpp CUDA work concurrently
-                # with an executing ComfyUI workflow.  In particular, a managed
-                # on-demand reload may call mm.free_memory(), which is unsafe while
-                # diffusion kernels are actively using those allocations.
-                workflow_owned = self._is_workflow_client(client)
-                comfy_wait_seconds = 0.0
-                if not workflow_owned:
-                    comfy_wait_seconds = float(self._wait_for_comfy_idle("servicing the LLM request", cancel_event=cancel_token) or 0.0)
-                if cancel_token.is_set():
-                    raise LocalLLMInterrupted("Local LLM request cancelled by Stop")
                 ensure_started_at = time.perf_counter()
                 if temporary_load_change or snapshot_clean is not None:
                     # Request-local Settings and Prompt Enhancer batch snapshots
@@ -1682,6 +1750,9 @@ class LocalLLMServiceManager:
             log.exception("[Local LLM Server] Request failed")
             raise
         finally:
+            if queue_registration_pending:
+                with self._state_lock:
+                    self._queue_count = max(0, self._queue_count - 1)
             self._emit()
 
     def vram_estimate(self, patch=None):
@@ -2229,8 +2300,11 @@ class LocalLLMServiceManager:
             return item
 
         try:
-            self._wait_for_comfy_idle("running the Local LLM performance tuner")
-            with self._generation_lock:
+            with self._generation_slot(
+                workflow_owned=False,
+                cancel_event=self._tuner_cancel,
+                reason="running the Local LLM performance tuner",
+            ):
                 with self._state_lock:
                     self._state = STATE_TUNING
                     self._error = None
@@ -2575,6 +2649,7 @@ class LocalLLMServiceManager:
             # opened/updated during inference.
             "model_loaded": bool(resident_now),
             "vram_yielded": yielded,
+            "native_operation": _native_operation_snapshot(),
             "restart_required": bool(restart_required),
             "error": error,
             "model": model,

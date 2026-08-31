@@ -50,7 +50,7 @@ import types
 _bridge = types.ModuleType("comfyui_local_gguf_llm_bridge")
 _bridge.SERVICE = SERVICE
 _bridge.SAMPLER_PRESET_FIELDS = SAMPLER_PRESET_FIELDS
-_bridge.API_VERSION = 1
+_bridge.API_VERSION = 2
 sys.modules["comfyui_local_gguf_llm_bridge"] = _bridge
 
 # LocalGGUFLLM remains the internal engine behind the persistent service and is

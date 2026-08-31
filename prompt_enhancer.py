@@ -724,18 +724,18 @@ def _run_enhancement(
         }
     finally:
         # Manual Enhance is commonly followed immediately by a GPU-heavy ComfyUI
-        # workflow. With Auto Yield, release the native llama.cpp allocation at a
-        # controlled boundary *before* returning control to the UI rather than
-        # making the next workflow discover and evict it inside mm.free_memory().
-        # Multi-item batches keep the model hot between items and suspend once in
-        # batch_end instead. Driver-managed/Keep Resident configurations are a
-        # no-op here because there is no managed native residency controller.
+        # workflow. Establish the v2 Local-LLM GPU handoff at a controlled
+        # boundary *before* returning control to the UI rather than making the
+        # next workflow discover native llama.cpp residency inside mm.free_memory().
+        # Multi-item batches keep the model hot between items and hand off once in
+        # batch_end instead. The handoff now works for both Auto Yield and
+        # driver-managed/Keep Resident configurations.
         if bool(yield_after):
             try:
-                service.suspend(reason="prompt-enhancer-complete")
+                service.gpu_handoff(reason="prompt-enhancer-complete")
             except Exception as suspend_exc:
                 log.warning(
-                    "[Local LLM Prompt Enhancer] Post-enhance Auto-Yield failed: %s",
+                    "[Local LLM Prompt Enhancer] Post-enhance GPU handoff failed: %s",
                     suspend_exc,
                 )
 
@@ -1422,10 +1422,10 @@ class LocalLLMPromptEnhancer:
                     _end_batch(batch_id)
                 try:
                     service = _find_local_llm_service()
-                    service.suspend(reason="prompt-enhancer-batch-complete")
+                    service.gpu_handoff(reason="prompt-enhancer-batch-complete")
                 except Exception as suspend_exc:
                     log.warning(
-                        "[Local LLM Prompt Enhancer] In-job post-batch Auto-Yield failed: %s",
+                        "[Local LLM Prompt Enhancer] In-job post-batch GPU handoff failed: %s",
                         suspend_exc,
                     )
 
@@ -1652,10 +1652,10 @@ try:
             if ended:
                 try:
                     service = _find_local_llm_service()
-                    await asyncio.to_thread(service.suspend, "prompt-enhancer-batch-complete")
+                    await asyncio.to_thread(service.gpu_handoff, "prompt-enhancer-batch-complete")
                 except Exception as suspend_exc:
                     log.warning(
-                        "[Local LLM Prompt Enhancer] Post-batch Auto-Yield failed: %s",
+                        "[Local LLM Prompt Enhancer] Post-batch GPU handoff failed: %s",
                         suspend_exc,
                     )
             return web.json_response({"ended": bool(ended)})
