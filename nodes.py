@@ -26,6 +26,7 @@ import folder_paths
 
 from .gguf_meta import read_gguf_metadata, detect_family, recommended_model_preset, available_model_presets
 from .presets import MODEL_PRESETS, MEMORY_PRESETS, capabilities_for_family, public_presets
+from .version import VRAM_POLICY_VERSION, VRAM_COORDINATION_MODE
 
 LLM_DIR = os.path.join(folder_paths.models_dir, "llm")
 os.makedirs(LLM_DIR, exist_ok=True)
@@ -396,7 +397,32 @@ def _host_load_delta(before, after, load_mode="unknown"):
     return out
 
 
-_RELOAD_VRAM_MARGIN = 256 * 1024 * 1024
+_OBSERVED_VRAM_RUNTIME_MARGIN = 512 * 1024 * 1024
+_VRAM_HANDOFF_REQUEST_CUSHION = 256 * 1024 * 1024
+_VRAM_HANDOFF_VERIFY_TOLERANCE = 64 * 1024 * 1024
+
+
+def _reload_vram_target_bytes(estimated_bytes, observed_bytes=0):
+    """Return the conservative driver-visible VRAM target for native load/reload.
+
+    This is intentionally shared by both the resident loader and service/tuner
+    diagnostics so the displayed/requested target cannot drift from the actual
+    allocation policy again. Constructor-time observed VRAM is evidence, not a
+    runtime peak measurement, so the estimate remains a hard floor.
+    """
+    estimate = int(max(0, estimated_bytes or 0))
+    observed = int(max(0, observed_bytes or 0))
+    if observed <= 0:
+        return estimate, "first-load-estimate"
+    observed_target = int(observed + _OBSERVED_VRAM_RUNTIME_MARGIN)
+    target = max(estimate, observed_target)
+    if observed_target > estimate:
+        source = "observed+512MiB>estimate"
+    elif estimate > observed_target:
+        source = "estimate>observed+512MiB"
+    else:
+        source = "estimate=observed+512MiB"
+    return int(target), source
 
 
 def _perf_log(event, **fields):
@@ -443,7 +469,7 @@ def _install_comfy_llm_yield_hook(mm):
         if not callable(current):
             return False
         if getattr(current, "_local_gguf_llm_yield_hook", False):
-            if getattr(current, "_local_gguf_llm_hook_version", None) == 6:
+            if getattr(current, "_local_gguf_llm_hook_version", None) == VRAM_POLICY_VERSION:
                 return True
             # Replace an older wrapper instead of stacking wrappers. This matters
             # during development/hot reloads where model_management can outlive
@@ -526,7 +552,7 @@ def _install_comfy_llm_yield_hook(mm):
             return result
 
         free_memory_with_llm_yield._local_gguf_llm_yield_hook = True
-        free_memory_with_llm_yield._local_gguf_llm_hook_version = 6
+        free_memory_with_llm_yield._local_gguf_llm_hook_version = VRAM_POLICY_VERSION
         free_memory_with_llm_yield._local_gguf_llm_original = original
         mm.free_memory = free_memory_with_llm_yield
         return True
@@ -546,11 +572,15 @@ def _request_comfyui_room(mm, required_bytes, device):
     required = max(0, int(required_bytes or 0))
     result = {
         "required_free_bytes": required,
+        "release_request_bytes": int(required + _VRAM_HANDOFF_REQUEST_CUSHION) if required > 0 else 0,
+        "verification_tolerance_bytes": int(_VRAM_HANDOFF_VERIFY_TOLERANCE),
         "free_before_bytes": None,
         "raw_free_before_bytes": None,
         "torch_reclaimable_before_bytes": 0,
         "free_after_bytes": None,
         "raw_free_after_bytes": None,
+        "satisfied": required <= 0,
+        "remaining_shortfall_bytes": 0,
         "strategy": "none",
         "release_called": False,
         "cache_probe_called": False,
@@ -574,6 +604,8 @@ def _request_comfyui_room(mm, required_bytes, device):
     if fit_before >= required:
         result["free_after_bytes"] = free_before
         result["raw_free_after_bytes"] = raw_before
+        result["satisfied"] = True
+        result["remaining_shortfall_bytes"] = 0
         result["total_seconds"] = time.perf_counter() - total_started
         _perf_log(
             "LLM VRAM room check: already fits",
@@ -608,6 +640,8 @@ def _request_comfyui_room(mm, required_bytes, device):
             result["strategy"] = "soft-cache-only"
             result["free_after_bytes"] = comfy_after_cache
             result["raw_free_after_bytes"] = raw_after_cache
+            result["satisfied"] = True
+            result["remaining_shortfall_bytes"] = 0
             result["total_seconds"] = time.perf_counter() - total_started
             _perf_log(
                 "LLM VRAM handoff complete",
@@ -648,7 +682,14 @@ def _request_comfyui_room(mm, required_bytes, device):
         result["strategy"] = "aimdo-bounded-free-memory"
     else:
         result["strategy"] = "targeted-free-memory"
-    mm.free_memory(required, device)
+    # Ask ComfyUI for a little more than the hard runtime target. Model/VBAR
+    # eviction happens in coarse chunks and driver free-memory reporting can
+    # settle a few MiB below the requested boundary even after synchronization.
+    # The cushion reduces false boundary failures without weakening the actual
+    # runtime target used for verification below.
+    release_request = int(required + _VRAM_HANDOFF_REQUEST_CUSHION)
+    result["release_request_bytes"] = release_request
+    mm.free_memory(release_request, device)
     result["release_seconds"] = time.perf_counter() - release_started
 
     # free_memory()/AIMDO may finish bookkeeping before every CUDA-side residency
@@ -690,11 +731,22 @@ def _request_comfyui_room(mm, required_bytes, device):
     result["free_after_bytes"] = final["comfy_free_bytes"]
     result["raw_free_after_bytes"] = final["raw_free_bytes"]
     result["torch_reclaimable_after_bytes"] = final["torch_reclaimable_bytes"]
+    final_fit = final["raw_free_bytes"] if final["raw_free_bytes"] is not None else final["comfy_free_bytes"]
+    result["remaining_shortfall_bytes"] = max(0, required - int(final_fit or 0))
+    result["within_verification_tolerance"] = (
+        result["remaining_shortfall_bytes"] <= _VRAM_HANDOFF_VERIFY_TOLERANCE
+    )
+    result["fatal_shortfall_bytes"] = max(
+        0, result["remaining_shortfall_bytes"] - _VRAM_HANDOFF_VERIFY_TOLERANCE
+    )
+    result["satisfied"] = bool(result["within_verification_tolerance"])
     result["total_seconds"] = time.perf_counter() - total_started
     _perf_log(
         "LLM VRAM handoff complete",
         strategy=result["strategy"],
         required_mib=required / _MIB,
+        release_request_mib=result.get("release_request_bytes", 0) / _MIB,
+        verify_tolerance_mib=_VRAM_HANDOFF_VERIFY_TOLERANCE / _MIB,
         shortfall_mib=shortfall / _MIB,
         reclaimable_mib=reclaimable_before / _MIB,
         comfy_before_mib=free_before / _MIB,
@@ -708,6 +760,8 @@ def _request_comfyui_room(mm, required_bytes, device):
         post_release_sync_s=result.get("post_release_sync_seconds"),
         cache_s=result.get("soft_empty_cache_seconds"),
         post_cache_sync_s=result.get("post_cache_sync_seconds"),
+        satisfied=result.get("satisfied"),
+        remaining_shortfall_mib=(result.get("remaining_shortfall_bytes", 0) / _MIB),
         total_s=result.get("total_seconds"),
     )
     return result
@@ -2121,18 +2175,18 @@ class _NativeLLMResident:
         return int(max(0, self._observed_vram_bytes))
 
     def preload_target_bytes(self):
-        """Use measured native allocation for warm reloads; estimate only first load.
+        """Return the driver-visible VRAM target required before native load/reload.
 
-        The first-load estimator already includes a substantial fixed/proportional
-        overhead. After one verified allocation, a small fixed driver margin is
-        safer and usually much less wasteful than reapplying the conservative
-        estimate plus ComfyUI's unrelated inference reserve.
+        A constructor-time CUDA delta is useful evidence, but it is *not* a peak
+        runtime measurement: prompt evaluation, large physical batches, vision,
+        and speculative/MTP work can need additional temporary VRAM after
+        ``Llama(...)`` returns. Warm reloads therefore never reserve less than
+        the conservative runtime estimate. If reality exceeds the estimate, the
+        observed allocation wins with an additional fixed driver/runtime margin.
         """
         if self.load_device.type == "cpu":
             return 0, "cpu"
-        if self._observed_vram_bytes > 0:
-            return int(self._observed_vram_bytes + _RELOAD_VRAM_MARGIN), "observed+256MiB"
-        return int(self._estimated_vram), "first-load-estimate"
+        return _reload_vram_target_bytes(self._estimated_vram, self._observed_vram_bytes)
 
     def _load_native(self):
         with _native_operation("resident-load"):
@@ -4295,7 +4349,7 @@ class LocalGGUFLLM:
                 was_resident = resident_ctl.llm is not None
 
             managed_preload_memory = {
-                "policy": "thin-native-auto-yield-v6-conservative-sync",
+                "policy": "thin-native-auto-yield-v7-runtime-floor",
                 "signature_id": resident_ctl.signature_id,
                 "requested_release_bytes": 0,
                 "free_before_bytes": None,
@@ -4332,13 +4386,34 @@ class LocalGGUFLLM:
                             "strategy": room.get("strategy", "none"),
                             "aimdo": bool(room.get("aimdo")),
                             "room_details": copy.deepcopy(room),
+                            "room_satisfied": bool(room.get("satisfied")),
+                            "remaining_shortfall_bytes": int(room.get("remaining_shortfall_bytes") or 0),
                         })
+                        if not room.get("satisfied", False):
+                            shortfall = int(room.get("remaining_shortfall_bytes") or 0)
+                            raw_after = room.get("raw_free_after_bytes")
+                            raw_after_text = f"{float(raw_after) / _MIB:.1f}" if raw_after is not None else "unknown"
+                            managed_preload_memory["fatal_room_error"] = (
+                                "Local GGUF LLM could not secure enough driver-visible VRAM before native load: "
+                                f"target={reserve / _MIB:.1f} MiB, "
+                                f"release_request={float(room.get('release_request_bytes') or reserve) / _MIB:.1f} MiB, "
+                                f"raw_free_after={raw_after_text} MiB, shortfall={shortfall / _MIB:.1f} MiB, "
+                                f"tolerance={float(room.get('verification_tolerance_bytes') or 0) / _MIB:.1f} MiB. "
+                                "ComfyUI/AIMDO remained materially below the safe runtime target; native llama.cpp load was not attempted."
+                            )
                 except Exception as e:
                     managed_preload_memory["error"] = str(e)
+                    managed_preload_memory.setdefault(
+                        "fatal_room_error",
+                        "Local GGUF LLM could not verify the required VRAM handoff before native load: " + str(e),
+                    )
                     _LOGGER.warning(
                         "[Local GGUF LLM] native pre-load ComfyUI memory handoff failed: %s", e
                     )
             managed_preload_memory["handoff_seconds"] = round(time.perf_counter() - handoff_started, 4)
+            fatal_room_error = managed_preload_memory.get("fatal_room_error")
+            if fatal_room_error:
+                raise RuntimeError(str(fatal_room_error))
 
             if was_resident:
                 # Exact signature + resident context = strict no-op. No ComfyUI
@@ -4368,7 +4443,7 @@ class LocalGGUFLLM:
             load_diagnostics["preload_memory"] = managed_preload_memory
             load_diagnostics["comfy_load_models_gpu_seconds"] = 0.0
             load_diagnostics["comfyui_loaded_model_registration"] = False
-            load_diagnostics["coordination_mode"] = "thin-free-memory-hook-v6-conservative-sync"
+            load_diagnostics["coordination_mode"] = VRAM_COORDINATION_MODE
             load_diagnostics["last_unload"] = copy.deepcopy(resident_ctl._last_unload_diagnostics)
         else:
             with _MODEL_LOCK:
@@ -4416,10 +4491,31 @@ class LocalGGUFLLM:
                                 "strategy": room.get("strategy", "none"),
                                 "aimdo": bool(room.get("aimdo")),
                                 "room_details": copy.deepcopy(room),
+                                "room_satisfied": bool(room.get("satisfied")),
+                                "remaining_shortfall_bytes": int(room.get("remaining_shortfall_bytes") or 0),
                             })
+                            if not room.get("satisfied", False):
+                                shortfall = int(room.get("remaining_shortfall_bytes") or 0)
+                                raw_after = room.get("raw_free_after_bytes")
+                                raw_after_text = f"{float(raw_after) / _MIB:.1f}" if raw_after is not None else "unknown"
+                                preload_memory["fatal_room_error"] = (
+                                    "Local GGUF LLM could not secure enough driver-visible VRAM before native load: "
+                                    f"target={reserve / _MIB:.1f} MiB, "
+                                    f"release_request={float(room.get('release_request_bytes') or reserve) / _MIB:.1f} MiB, "
+                                    f"raw_free_after={raw_after_text} MiB, shortfall={shortfall / _MIB:.1f} MiB, "
+                                    f"tolerance={float(room.get('verification_tolerance_bytes') or 0) / _MIB:.1f} MiB. "
+                                    "ComfyUI/AIMDO remained materially below the safe runtime target; native llama.cpp load was not attempted."
+                                )
                     except Exception as e:
                         preload_memory["error"] = str(e)
+                        preload_memory.setdefault(
+                            "fatal_room_error",
+                            "Local GGUF LLM could not verify the required VRAM handoff before native load: " + str(e),
+                        )
                         _LOGGER.warning("[Local GGUF LLM] conditional pre-load ComfyUI memory release failed: %s", e)
+                    fatal_room_error = preload_memory.get("fatal_room_error")
+                    if fatal_room_error:
+                        raise RuntimeError(str(fatal_room_error))
 
                 runtime_load_kwargs, draft_obj, speculative_info = _materialize_speculative_kwargs(
                     load_kwargs, speculative_config, model_path, family,

@@ -1,12 +1,14 @@
 from pathlib import Path
 
+from .version import PACKAGE_VERSION, BRIDGE_API_VERSION, VRAM_POLICY_VERSION, VRAM_COORDINATION_MODE
+
 # Keep exactly one version of each frontend module. This matters when users
 # extract an update over an existing custom-node directory because ComfyUI loads
 # every JS module found under WEB_DIRECTORY.
 _js_dir = Path(__file__).resolve().parent / "web" / "js"
 _FRONTENDS = {
     "local_llm_server": "local_llm_server_v100.js",
-    "prompt_enhancer": "prompt_enhancer_dom_v0626.js",
+    "prompt_enhancer": "prompt_enhancer_dom_v0627.js",
 }
 if _js_dir.is_dir():
     for _candidate in _js_dir.glob("*.js"):
@@ -50,7 +52,10 @@ import types
 _bridge = types.ModuleType("comfyui_local_gguf_llm_bridge")
 _bridge.SERVICE = SERVICE
 _bridge.SAMPLER_PRESET_FIELDS = SAMPLER_PRESET_FIELDS
-_bridge.API_VERSION = 2
+_bridge.API_VERSION = BRIDGE_API_VERSION
+_bridge.PACKAGE_VERSION = PACKAGE_VERSION
+_bridge.VRAM_POLICY_VERSION = VRAM_POLICY_VERSION
+_bridge.VRAM_COORDINATION_MODE = VRAM_COORDINATION_MODE
 sys.modules["comfyui_local_gguf_llm_bridge"] = _bridge
 
 # LocalGGUFLLM remains the internal engine behind the persistent service and is
@@ -79,4 +84,8 @@ __all__ = [
     "LocalLLMGenerate",
     "LocalLLMPromptEnhancer",
     "SERVICE",
+    "PACKAGE_VERSION",
+    "BRIDGE_API_VERSION",
+    "VRAM_POLICY_VERSION",
+    "VRAM_COORDINATION_MODE",
 ]

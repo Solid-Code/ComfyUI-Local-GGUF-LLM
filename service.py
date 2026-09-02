@@ -44,13 +44,14 @@ from .nodes import (
     _mtp_layer_count,
     _full_path,
     _gpu_index,
-    _RELOAD_VRAM_MARGIN,
+    _reload_vram_target_bytes,
     _MODEL_CACHE,
     _MODEL_LOCK,
     LocalLLMInterrupted,
 )
 from .gguf_meta import detect_family, recommended_model_preset, available_model_presets
 from .presets import MEMORY_PRESETS, MODEL_PRESETS, capabilities_for_family, public_presets
+from .version import PACKAGE_VERSION, BRIDGE_API_VERSION, VRAM_POLICY_VERSION, VRAM_COORDINATION_MODE
 
 log = logging.getLogger(__name__)
 
@@ -795,7 +796,10 @@ class LocalLLMServiceManager:
             "recommendation": None, "error": None, "started_at": None, "finished_at": None,
             "profile": "Quick", "message": "Ready to benchmark the saved server configuration.",
         }
-        self._log("Service manager initialized")
+        self._log(
+            f"Service manager initialized — Local GGUF LLM v{PACKAGE_VERSION} • "
+            f"bridge API {BRIDGE_API_VERSION} • VRAM policy v{VRAM_POLICY_VERSION}"
+        )
 
     @property
     def api(self):
@@ -1712,6 +1716,9 @@ class LocalLLMServiceManager:
                     f"estimated={float(preload.get('estimated_vram_bytes') or 0) / (1024*1024):.1f}MiB • "
                     f"observed={float(preload.get('observed_vram_bytes') or gpu_backend.get('observed_vram_bytes') or 0) / (1024*1024):.1f}MiB • "
                     f"raw_before={float(room.get('raw_free_before_bytes') or 0) / (1024*1024):.1f}MiB • "
+                    f"raw_after={float(room.get('raw_free_after_bytes') or 0) / (1024*1024):.1f}MiB • "
+                    f"satisfied={bool(room.get('satisfied', True))} • "
+                    f"shortfall={float(room.get('remaining_shortfall_bytes') or 0) / (1024*1024):.1f}MiB • "
                     f"reclaimable={float(room.get('torch_reclaimable_before_bytes') or 0) / (1024*1024):.1f}MiB • "
                     f"cache_probe={'skipped' if room.get('cache_probe_skipped') else ('run' if room.get('cache_probe_called') else 'not-needed')} • "
                     f"sync={float(room.get('pre_release_sync_seconds') or 0):.3f}s • "
@@ -1879,8 +1886,9 @@ class LocalLLMServiceManager:
         base_total = int(components["base_total_bytes"])
         total_with_vision = int(components["total_bytes"])
         vision_bytes = int(components["vision_bytes"])
-        reload_target = int((measured + _RELOAD_VRAM_MARGIN) if measured_applies else base_total)
-        reload_target_source = "observed+256MiB" if measured_applies else "conservative estimate"
+        reload_target, reload_target_source = _reload_vram_target_bytes(
+            base_total, measured if measured_applies else 0
+        )
 
         # Current free VRAM already excludes a resident LLM.  If the same saved
         # configuration is resident, its projected base headroom is therefore the

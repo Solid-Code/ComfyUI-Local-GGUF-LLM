@@ -2,7 +2,7 @@ import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
 const EXTENSION_NAME = "LocalLLM.PromptEnhancer";
-const FRONTEND_VERSION = "0.6.26-alpha";
+const FRONTEND_VERSION = "0.6.27-alpha";
 console.info(`[Local LLM Prompt Enhancer] frontend ${FRONTEND_VERSION}`);
 const NODE_CLASS = "LocalLLMPromptEnhancer";
 const DEFAULT_PRESET = "Default / Krea 2 - Image";
@@ -13,6 +13,19 @@ const ENHANCE_BATCH_MAX = 64;
 
 let graphConfigureDepth = 0;
 const pendingNodes = new Map();
+const pendingNodesByInstanceId = new Map();
+// Runtime journal keyed by a stable enhancer-instance id. ComfyUI may unmount a
+// workflow while its queued Prompt Enhancer execution is still running; node
+// ids alone are graph-local and are therefore not safe across workflow tabs.
+const runtimeStateByInstanceId = new Map();
+const deferredExecutionsByInstanceId = new Map();
+
+function newPromptEnhancerInstanceId() {
+  try {
+    if (typeof crypto?.randomUUID === "function") return crypto.randomUUID();
+  } catch (_) {}
+  return `pe-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+}
 
 function widget(node, name) {
   return node?.widgets?.find((w) => w?.name === name) || null;
@@ -184,7 +197,11 @@ function resetBackendPromptCycle(node) {
   const epoch = (Number(node.__promptEnhancerCycleSyncEpoch) || 0) + 1;
   node.__promptEnhancerCycleSyncEpoch = epoch;
   node.__promptEnhancerCycleResetPending = true;
-  void postJSON("/local_llm_prompt_enhancer/cycle_reset", { node_id: nodeId, revision })
+  void postJSON("/local_llm_prompt_enhancer/cycle_reset", {
+    node_id: nodeId,
+    state_id: ensurePromptEnhancerInstanceId(node),
+    revision,
+  })
     .catch(() => {})
     .finally(() => {
       if (Number(node.__promptEnhancerCycleSyncEpoch) === epoch) {
@@ -213,6 +230,7 @@ async function syncPromptCycleFromBackend(node, { force = false } = {}) {
   const nodeId = String(node.id ?? "");
   const request = postJSON("/local_llm_prompt_enhancer/cycle_state", {
     node_id: nodeId,
+    state_id: ensurePromptEnhancerInstanceId(node),
     mode,
     history,
     revision,
@@ -271,12 +289,22 @@ function reconcilePromptCyclesAfterGraphActivation() {
   // ComfyUI workflow-tab switches are asynchronous. Mouse/focus events happen
   // before app.graph has necessarily been replaced, so they are not a reliable
   // signal that the newly selected workflow is ready. afterConfigureGraph() is
-  // the authoritative lifecycle point; these passes only allow our async node
-  // panel initialization/rendering to settle after the graph itself is active.
+  // the authoritative lifecycle point. Rehydrate the *entire* enhancer state
+  // here, not only Prompt Cycle, because executions may have completed while
+  // this workflow was unmounted.
   const generation = ++graphActivationSyncGeneration;
   const sync = () => {
     if (generation !== graphActivationSyncGeneration) return;
-    syncCurrentGraphPromptCycles({ force: true });
+    for (const node of currentGraphPromptEnhancerNodes()) {
+      reconcileRuntimeEnhancementState(node);
+      setSeedOverrideUI(node);
+      hideNativeWidgetsForPanel(node);
+      wrapDomPanelSyncCallbacks(node);
+      syncDomPanel(node);
+      scheduleDomPanelHeight(node);
+      void syncPromptCycleFromBackend(node, { force: true });
+      redraw(node);
+    }
   };
   queueMicrotask(sync);
   requestAnimationFrame(sync);
@@ -863,6 +891,8 @@ function clearEnhanceTransport(node) {
   node.__promptEnhancerJobId = null;
   node.__promptEnhancerRequestController = null;
   pendingNodes.delete(String(node.id));
+  const instanceId = String(node.__promptEnhancerInstanceId || widget(node, "prompt_state_id")?.value || "").trim();
+  if (instanceId && pendingNodesByInstanceId.get(instanceId) === node) pendingNodesByInstanceId.delete(instanceId);
 }
 
 function settleEnhanceExecution(node, error = null, data = null) {
@@ -962,10 +992,13 @@ function handleEnhanceExecuted(node, output) {
 function handleEnhanceBatchProgressEvent(detail) {
   const data = detail?.detail ?? detail ?? {};
   const nodeId = String(data?.node_id ?? "");
+  const stateId = String(data?.state_id ?? "").trim();
   const token = String(data?.token ?? "");
-  if (!nodeId || !token) return;
-  const node = pendingNodes.get(nodeId);
+  if (!token) return;
+  let node = stateId ? pendingNodesByInstanceId.get(stateId) : null;
+  if (!node && nodeId) node = pendingNodes.get(nodeId);
   if (!node || String(node.__promptEnhancerPendingToken || "") !== token) return;
+  if (stateId && ensurePromptEnhancerInstanceId(node) !== stateId) return;
 
   const revised = String(data?.prompt ?? "");
   const index = Math.max(0, Math.trunc(Number(data?.index) || 0));
@@ -988,6 +1021,7 @@ async function cancelArmed(node, token) {
   try {
     await postJSON("/local_llm_prompt_enhancer/cancel", {
       node_id: String(node?.id ?? ""),
+      state_id: ensurePromptEnhancerInstanceId(node),
       token: String(token || ""),
     });
   } catch (_) {}
@@ -1215,6 +1249,7 @@ async function runTargetedEnhancementBatch(node, prompt, enhancementText, seeds,
         prompt_history_index: Number(widget(node, "prompt_history_index")?.value ?? 0),
         enhanced_prompt: String(widget(node, "enhanced_prompt")?.value ?? ""),
         overwrite_enhanced: !!node.__promptEnhancerOverwriteAtStart,
+        state_id: ensurePromptEnhancerInstanceId(node),
       },
       { signal: controller.signal },
     );
@@ -1227,6 +1262,7 @@ async function runTargetedEnhancementBatch(node, prompt, enhancementText, seeds,
 
     node.__promptEnhancerPendingToken = token;
     pendingNodes.set(String(node.id), node);
+    pendingNodesByInstanceId.set(ensurePromptEnhancerInstanceId(node), node);
 
     if (typeof app?.graphToPrompt !== "function" || typeof api?.queuePrompt !== "function") {
       throw new Error("This ComfyUI frontend does not support targeted execution required for connected media/settings enhancement.");
@@ -1556,8 +1592,36 @@ function captureTextareaHeights(node) {
   scheduleDomPanelHeight(node);
 }
 
-const PERSISTENCE_STATE_VERSION = 1;
+const PERSISTENCE_STATE_VERSION = 2;
 const PERSISTENCE_STATE_KEY = "local_llm_prompt_enhancer_state";
+
+function ensurePromptEnhancerInstanceId(node, { forceNew = false } = {}) {
+  if (!node) return "";
+  const rawState = node?.properties?.[PERSISTENCE_STATE_KEY];
+  const stateIdWidget = widget(node, "prompt_state_id");
+  let instanceId = forceNew ? "" : String(
+    node.__promptEnhancerInstanceId ||
+    stateIdWidget?.value ||
+    rawState?.instanceId ||
+    ""
+  ).trim();
+  if (!instanceId) instanceId = newPromptEnhancerInstanceId();
+  node.__promptEnhancerInstanceId = instanceId;
+  if (stateIdWidget && String(stateIdWidget.value || "") !== instanceId) {
+    setWidgetValue(stateIdWidget, instanceId, false);
+  }
+  node.properties ||= {};
+  if (rawState && typeof rawState === "object") rawState.instanceId = instanceId;
+  return instanceId;
+}
+
+function nextPromptEnhancerRuntimeRevision(node, instanceId) {
+  const nodeRevision = Math.max(0, Math.trunc(Number(node?.__promptEnhancerRuntimeRevision) || 0));
+  const cachedRevision = Math.max(0, Math.trunc(Number(runtimeStateByInstanceId.get(instanceId)?.runtimeRevision) || 0));
+  const revision = Math.max(nodeRevision, cachedRevision) + 1;
+  if (node) node.__promptEnhancerRuntimeRevision = revision;
+  return revision;
+}
 
 function normalizedHistorySnapshot(node) {
   let history = promptHistory(node);
@@ -1588,8 +1652,11 @@ function enhancementStateSnapshot(node) {
   const seed = Number.isFinite(seedRaw) ? Math.max(0, Math.trunc(seedRaw)) : 0;
   const control = seedControlWidget(node);
 
+  const instanceId = ensurePromptEnhancerInstanceId(node);
   return {
     version: PERSISTENCE_STATE_VERSION,
+    instanceId,
+    runtimeRevision: Math.max(0, Math.trunc(Number(node.__promptEnhancerRuntimeRevision) || 0)),
     prompt: String(widget(node, "prompt")?.value ?? ""),
     promptPreset: String(widget(node, "prompt_preset")?.value ?? "Custom"),
     enhancedPrompt: normalized.enhanced,
@@ -1611,7 +1678,9 @@ function enhancementStateSnapshot(node) {
 
 function clonePersistenceState(state) {
   return {
-    version: Number(state?.version ?? PERSISTENCE_STATE_VERSION),
+    version: PERSISTENCE_STATE_VERSION,
+    instanceId: String(state?.instanceId ?? ""),
+    runtimeRevision: Math.max(0, Math.trunc(Number(state?.runtimeRevision) || 0)),
     prompt: String(state?.prompt ?? ""),
     promptPreset: String(state?.promptPreset ?? "Custom"),
     enhancedPrompt: String(state?.enhancedPrompt ?? ""),
@@ -1635,6 +1704,8 @@ function clonePersistenceState(state) {
 
 function syncNativeStateWidgets(node, state) {
   if (!node || !state) return;
+  const instanceId = String(state.instanceId || ensurePromptEnhancerInstanceId(node));
+  setWidgetValue(widget(node, "prompt_state_id"), instanceId, false);
   const history = Array.isArray(state.promptHistory) ? state.promptHistory : [];
   const index = history.length
     ? Math.max(0, Math.min(Math.trunc(Number(state.promptHistoryIndex) || 0), history.length - 1))
@@ -1655,23 +1726,42 @@ function syncNativeStateWidgets(node, state) {
 
 function persistEnhancementState(node, serializedData = null) {
   if (!node || node.__promptEnhancerRestoringState) return null;
+  const instanceId = ensurePromptEnhancerInstanceId(node);
+  // Serialization can run on an unmounted/stale workflow object. Never let that
+  // older object overwrite a newer background-execution journal entry merely by
+  // receiving a later serialize callback. Rehydrate first, then serialize.
+  const cached = runtimeStateByInstanceId.get(instanceId);
+  const cachedRevision = Math.max(0, Math.trunc(Number(cached?.runtimeRevision) || 0));
+  const nodeRevision = Math.max(0, Math.trunc(Number(node.__promptEnhancerRuntimeRevision ?? node?.properties?.[PERSISTENCE_STATE_KEY]?.runtimeRevision) || 0));
+  if (cached && cachedRevision > nodeRevision) restoreEnhancementState(node, cached);
+
+  const revision = nextPromptEnhancerRuntimeRevision(node, instanceId);
   const state = enhancementStateSnapshot(node);
+  state.instanceId = instanceId;
+  state.runtimeRevision = revision;
   syncNativeStateWidgets(node, state);
 
+  const cloned = clonePersistenceState(state);
   node.properties ||= {};
-  node.properties[PERSISTENCE_STATE_KEY] = clonePersistenceState(state);
+  node.properties[PERSISTENCE_STATE_KEY] = cloned;
+  runtimeStateByInstanceId.set(instanceId, clonePersistenceState(cloned));
 
   if (serializedData && typeof serializedData === "object") {
     serializedData.properties ||= {};
-    serializedData.properties[PERSISTENCE_STATE_KEY] = clonePersistenceState(state);
+    serializedData.properties[PERSISTENCE_STATE_KEY] = clonePersistenceState(cloned);
   }
-  return state;
+  return cloned;
 }
 
-function restoreEnhancementState(node) {
-  const raw = node?.properties?.[PERSISTENCE_STATE_KEY];
-  if (!raw || typeof raw !== "object" || Number(raw.version) !== PERSISTENCE_STATE_VERSION) return false;
+function restoreEnhancementState(node, stateOverride = null) {
+  const raw = stateOverride || node?.properties?.[PERSISTENCE_STATE_KEY];
+  const rawVersion = Number(raw?.version ?? 1);
+  if (!raw || typeof raw !== "object" || rawVersion < 1 || rawVersion > PERSISTENCE_STATE_VERSION) return false;
   const state = clonePersistenceState(raw);
+  if (!state.instanceId) state.instanceId = ensurePromptEnhancerInstanceId(node);
+  node.__promptEnhancerInstanceId = state.instanceId;
+  node.__promptEnhancerRuntimeRevision = Math.max(0, Math.trunc(Number(state.runtimeRevision) || 0));
+  setWidgetValue(widget(node, "prompt_state_id"), state.instanceId, false);
 
   node.__promptEnhancerRestoringState = true;
   node.__promptEnhancerSyncingHistory = true;
@@ -1705,7 +1795,119 @@ function restoreEnhancementState(node) {
     node.__promptEnhancerSyncingHistory = false;
     node.__promptEnhancerRestoringState = false;
   }
+  node.properties ||= {};
+  node.properties[PERSISTENCE_STATE_KEY] = clonePersistenceState(state);
+  const cached = runtimeStateByInstanceId.get(state.instanceId);
+  if (!cached || Number(cached.runtimeRevision || 0) <= Number(state.runtimeRevision || 0)) {
+    runtimeStateByInstanceId.set(state.instanceId, clonePersistenceState(state));
+  }
+  scheduleDomPanelSync(node);
   redraw(node);
+  return true;
+}
+
+function deferExecutedData(data) {
+  const instanceId = String(data?.state_id || "").trim();
+  if (!instanceId) return false;
+  const queue = deferredExecutionsByInstanceId.get(instanceId) || [];
+  let copy = data;
+  try { copy = structuredClone(data); }
+  catch (_) {
+    try { copy = JSON.parse(JSON.stringify(data)); } catch (_) {}
+  }
+  queue.push(copy);
+  if (queue.length > 128) queue.splice(0, queue.length - 128);
+  deferredExecutionsByInstanceId.set(instanceId, queue);
+  return true;
+}
+
+function drainDeferredExecutions(instanceId) {
+  const id = String(instanceId || "").trim();
+  if (!id) return 0;
+  const queue = deferredExecutionsByInstanceId.get(id);
+  if (!Array.isArray(queue) || !queue.length) return 0;
+  deferredExecutionsByInstanceId.delete(id);
+  let applied = 0;
+  for (const data of queue) {
+    if (applyExecutedDataToRuntimeState(data, { deferIfMissing: false })) applied += 1;
+  }
+  return applied;
+}
+
+function reconcileRuntimeEnhancementState(node) {
+  if (!node) return false;
+  const instanceId = ensurePromptEnhancerInstanceId(node);
+  let cached = runtimeStateByInstanceId.get(instanceId);
+  if (!cached) {
+    const serialized = node?.properties?.[PERSISTENCE_STATE_KEY];
+    const seeded = serialized && typeof serialized === "object"
+      ? clonePersistenceState(serialized)
+      : clonePersistenceState(enhancementStateSnapshot(node));
+    seeded.instanceId = instanceId;
+    runtimeStateByInstanceId.set(instanceId, seeded);
+    cached = seeded;
+  }
+  drainDeferredExecutions(instanceId);
+  cached = runtimeStateByInstanceId.get(instanceId) || cached;
+  const cachedRevision = Math.max(0, Math.trunc(Number(cached.runtimeRevision) || 0));
+  const nodeRevision = Math.max(0, Math.trunc(Number(node.__promptEnhancerRuntimeRevision ?? node?.properties?.[PERSISTENCE_STATE_KEY]?.runtimeRevision) || 0));
+  if (cachedRevision <= nodeRevision) return false;
+
+  const applied = restoreEnhancementState(node, cached);
+  if (applied) {
+    // Background execution changed this workflow while it was not mounted. Mark
+    // it dirty now that it is active so ComfyUI's next save/autosave captures
+    // exactly the state the user sees.
+    markWorkflowChanged(node);
+    syncDomPanel(node);
+    scheduleDomPanelHeight(node);
+  }
+  return applied;
+}
+
+function applyExecutedDataToRuntimeState(data, { deferIfMissing = true } = {}) {
+  const instanceId = String(data?.state_id || "").trim();
+  if (!instanceId) return false;
+  const existing = runtimeStateByInstanceId.get(instanceId);
+  if (!existing) return deferIfMissing ? deferExecutedData(data) : false;
+  const state = clonePersistenceState(existing);
+  let history = Array.isArray(state.promptHistory) ? [...state.promptHistory] : [];
+  let index = history.length
+    ? Math.max(0, Math.min(Math.trunc(Number(state.promptHistoryIndex) || 0), history.length - 1))
+    : 0;
+  const mode = String(data?.mode || "manual");
+
+  if (mode === "cycle") {
+    index = history.length
+      ? Math.max(0, Math.min(Math.trunc(Number(data?.next_index) || 0), history.length - 1))
+      : 0;
+    state.promptHistoryIndex = index;
+    state.promptShuffle = Array.isArray(data?.shuffle) ? data.shuffle.map(Number).filter(Number.isInteger) : [];
+    state.enhancedPrompt = history.length ? String(history[index] ?? "") : String(state.enhancedPrompt || "");
+  } else if (mode === "workflow" || mode === "manual_batch" || mode === "manual") {
+    const prompts = mode === "manual_batch" && Array.isArray(data?.prompts)
+      ? data.prompts.map((value) => String(value ?? ""))
+      : [String(data?.prompt ?? "")];
+    const overwrite = !!data?.overwrite;
+    for (const text of prompts) {
+      if (!text.trim()) continue;
+      if (overwrite && history.length) {
+        history[index] = text;
+      } else {
+        history.push(text);
+        index = history.length - 1;
+      }
+    }
+    state.promptHistory = history;
+    state.promptHistoryIndex = index;
+    state.promptShuffle = [];
+    state.enhancedPrompt = history.length ? String(history[index] ?? "") : String(state.enhancedPrompt || "");
+  } else {
+    return false;
+  }
+
+  state.runtimeRevision = Math.max(0, Math.trunc(Number(state.runtimeRevision) || 0)) + 1;
+  runtimeStateByInstanceId.set(instanceId, clonePersistenceState(state));
   return true;
 }
 
@@ -3325,10 +3527,29 @@ function promptEnhancerNodeForExecutedDetail(detail) {
 }
 
 function handlePromptEnhancerExecutedEvent(detail) {
-  const node = promptEnhancerNodeForExecutedDetail(detail);
-  if (!node) return;
+  const ids = [detail?.display_node, detail?.node].filter((value) => value != null).map(String);
+  const data = parseEnhanceExecution(detail?.output);
+  const stateId = String(data?.state_id || "").trim();
+  let node = promptEnhancerNodeForExecutedDetail(detail);
+  // Numeric ComfyUI node ids are only graph-local. If another workflow with the
+  // same node id is mounted, never deliver this result to the wrong enhancer.
+  if (node && stateId && ensurePromptEnhancerInstanceId(node) !== stateId) node = null;
+  if (!node && stateId) node = pendingNodesByInstanceId.get(stateId) || null;
+  if (!node) {
+    node = ids.map((id) => pendingNodes.get(id)).find((candidate) =>
+      !stateId || ensurePromptEnhancerInstanceId(candidate) === stateId
+    ) || null;
+  }
   try {
-    handleEnhanceExecuted(node, detail?.output);
+    if (node) {
+      const handled = handleEnhanceExecuted(node, detail?.output);
+      if (!handled && data) applyExecutedDataToRuntimeState(data);
+      return;
+    }
+    // The workflow that owns this execution is currently unmounted. Keep the
+    // authoritative result in the instance journal; afterConfigureGraph() will
+    // rehydrate the complete node when the user returns.
+    if (data) applyExecutedDataToRuntimeState(data);
   } catch (error) {
     console.error("[Local LLM Prompt Enhancer] global execution sync failed", error);
   }
@@ -3389,7 +3610,7 @@ function installControls(node, isNew = false, preservedSize = null) {
       setWidgetDisplayLabel(linked, "Control After Generate");
     }
   }
-  for (const name of ["prompt_history_json", "prompt_history_index", "prompt_cycle_revision", "prompt_shuffle_json"]) {
+  for (const name of ["prompt_history_json", "prompt_history_index", "prompt_cycle_revision", "prompt_shuffle_json", "prompt_state_id"]) {
     hideInternalWidget(widget(node, name));
   }
 
@@ -3525,6 +3746,10 @@ function promptEnhancerMenuItems(node) {
 
 async function initializeNode(node, loaded = false, serializedSize = null) {
   const preservedSize = loaded ? (serializedSize || copySize(node)) : null;
+  const inheritedState = node?.properties?.[PERSISTENCE_STATE_KEY];
+  // Copy/paste/duplicate creates a new enhancer identity; normal workflow loads
+  // retain the serialized identity so background results can find their owner.
+  ensurePromptEnhancerInstanceId(node, { forceNew: !loaded && !!inheritedState?.instanceId });
   applyPromptEnhancerInputLabels(node);
   installControls(node, !loaded, preservedSize);
 
@@ -3532,8 +3757,9 @@ async function initializeNode(node, loaded = false, serializedSize = null) {
   // duplicated nodes. A genuinely new node has no state object and simply keeps
   // the backend-provided defaults already present in its widgets.
   const restored = restoreEnhancementState(node);
+  const reconciledRuntime = reconcileRuntimeEnhancementState(node);
   const instructions = widget(node, "enhancement_text");
-  const shouldLoad = !restored && !loaded && !String(instructions?.value ?? "").trim();
+  const shouldLoad = !restored && !reconciledRuntime && !loaded && !String(instructions?.value ?? "").trim();
 
   // Refresh only the available choices. Never reload a selected template or
   // Prompt Set during initialization, because that would overwrite the exact
@@ -3548,6 +3774,7 @@ async function initializeNode(node, loaded = false, serializedSize = null) {
   scheduleDomPanelSync(node);
   void syncPromptCycleFromBackend(node, { force: true });
   requestAnimationFrame(() => {
+    reconcileRuntimeEnhancementState(node);
     moveSettingsInputToTop(node);
     setSeedOverrideUI(node);
     hideNativeWidgetsForPanel(node);
@@ -3559,9 +3786,10 @@ async function initializeNode(node, loaded = false, serializedSize = null) {
 }
 
 function failPendingNodes(detail) {
-  if (!pendingNodes.size) return;
+  if (!pendingNodes.size && !pendingNodesByInstanceId.size) return;
   const message = detail?.exception_message || detail?.error?.message || "Partial execution failed before enhancement completed.";
-  for (const node of [...pendingNodes.values()]) {
+  const nodes = new Set([...pendingNodes.values(), ...pendingNodesByInstanceId.values()]);
+  for (const node of nodes) {
     const token = node.__promptEnhancerPendingToken;
     if (token) cancelArmed(node, token);
     clearEnhancePending(node);

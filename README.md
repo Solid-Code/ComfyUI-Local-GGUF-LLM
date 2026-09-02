@@ -1,4 +1,45 @@
-# Local GGUF LLM — v0.18.54 alpha
+# Local GGUF LLM — v0.18.59 alpha
+
+
+
+
+## v0.18.59 alpha
+
+- Prompt Enhancer background/workflow-tab reconciliation is now stateful across workflow switches. Each enhancer carries a stable frontend instance id plus a monotonic state revision, so graph-local node-id collisions cannot route results to the wrong workflow.
+- Manual enhancement completion now resolves through the pending enhancer instance even when its workflow is not mounted, preventing completed background batches from timing out only because the user switched workflows.
+- Workflow-time enhancement and Prompt Cycle results are journaled by enhancer instance when their workflow is unmounted and are applied when that workflow becomes active again.
+- Returning to a workflow now rehydrates and repaints the complete Prompt Enhancer state (Prompt Preset, Prompt, Enhanced Prompt/history/index, Prompt Set/Cycle, overwrite mode, batch count, enhancement preset/instructions, seed/control, Enhance with Workflow, and textarea sizing), rather than synchronizing only Prompt Cycle.
+- Existing v1 Prompt Enhancer persistence state is migrated in place; copy/paste/duplicate nodes receive a fresh enhancer instance id.
+- Backend pending requests, queued-batch history reconciliation, cancellation, and Prompt Cycle cursors now use the same stable enhancer identity (with node-id fallback for older frontends), so same-numbered nodes in different workflow tabs cannot overwrite each other.
+
+## v0.18.58 alpha
+
+- Runtime now self-identifies its package version, bridge API, and VRAM policy in the first service-manager log line, making stale installs immediately obvious.
+- VRAM coordination diagnostics now report the actual v8 tolerant runtime-floor policy instead of the stale v7 label.
+- Package version, bridge API, and VRAM-policy identifiers share one source of truth (`version.py`) and are exposed on the sibling-node bridge.
+- Retains the v0.18.57 release-request cushion and 64 MiB verification tolerance; a 31.9 MiB driver-accounting miss is accepted.
+
+## v0.18.57 alpha
+
+- Makes native VRAM handoff verification robust to CUDA/AIMDO allocation granularity. ComfyUI is now asked for the conservative runtime target plus a 256 MiB release cushion, while admission is still verified against the original hard runtime target.
+- Allows at most a 64 MiB final driver-visible accounting shortfall after synchronization. The tolerance is applied only after the over-requested handoff; it prevents false failures such as 31.9 MiB below a 13.56 GiB target without lowering the estimator itself.
+- Handoff diagnostics now report hard target, release request, verification tolerance, exact shortfall, and tolerance status.
+- Bumps the ComfyUI free-memory hook to v8. Bridge API remains v2, so H3 Project Director v0.6.10 remains compatible.
+
+## v0.18.56 alpha
+
+- Fixes an import-time regression in v0.18.55 where `service.py` still imported the removed `_RELOAD_VRAM_MARGIN` symbol.
+- Centralizes warm/native VRAM target calculation in `_reload_vram_target_bytes()` so the actual resident loader and service/tuner diagnostics use the same policy.
+- Service/tuner preview now also uses `max(conservative estimate, observed + 512 MiB)` instead of the stale `observed + 256 MiB` rule.
+
+## v0.18.55 alpha
+
+- Fixes warm Auto-Yield reloads under-requesting VRAM from ComfyUI. A verified constructor-time allocation is no longer treated as peak runtime usage. Reload planning now requests `max(conservative runtime estimate, observed native allocation + 512 MiB)`.
+- Keeps the first-load estimator as a hard floor on every Auto-Yield reload, so KV cache, configured context, batch/ubatch compute allowance, vision/mmproj state, and MTP/speculative allowance cannot disappear from the memory request after the first successful load.
+- Raises the observed-allocation runtime/driver margin from 256 MiB to 512 MiB.
+- Verifies the final driver-visible CUDA free-memory result after ComfyUI/AIMDO handoff. If the requested target was not actually achieved, the Local LLM now fails before constructing llama.cpp and reports the remaining shortfall instead of knowingly attempting an undersized native allocation.
+- Handoff diagnostics now expose `room_satisfied` and `remaining_shortfall_bytes`; Auto-Yield coordination policy is reported as v7 runtime-floor planning.
+- Retains v0.18.54's process-global native ownership gate and bridge API v2 unchanged, so H3 Project Director v0.6.10 remains compatible without a companion update.
 
 
 ## v0.18.54 alpha
@@ -25,7 +66,7 @@
 - **The Enhance batch owns its full queue lifetime:** all internal LLM iterations plus the final native llama.cpp VRAM suspend happen before the single Prompt Enhancer queue item returns, so the next queued diffusion job cannot begin early.
 - **Queued-snapshot reconciliation:** workflows queued during the batch may have serialized the Prompt Enhancer before all progress updates reached the browser. The backend now recognizes pre-batch/intermediate history snapshots and upgrades them to the completed batch history when those queued jobs execute, without delaying queue submission.
 - Removed the v0.18.49 informational “Workflow queued until…” Run gate/notification.
-- Prompt Enhancer frontend: **v0.6.26-alpha**.
+- Prompt Enhancer frontend: **v0.6.27-alpha**.
 
 
 ## v0.18.49 alpha
@@ -56,7 +97,7 @@ This package includes:
 
 - **Local LLM Generate** — send prompts, images, and sampled video frames to the persistent local LLM.
 - **Local LLM Settings** — reusable model/generation settings with loadable Complete Settings Presets. Memory/performance tuning remains in the Local LLM service panel rather than crowding the workflow node.
-- **Local LLM Prompt Enhancer** — bundled **v0.6.26-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
+- **Local LLM Prompt Enhancer** — bundled **v0.6.27-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
 - **Local LLM Server panel** — model loading, presets, memory/VRAM controls, status, performance information, and the optional OpenAI-compatible API.
 
 
@@ -85,7 +126,7 @@ ComfyUI/custom_nodes/ComfyUI-Local-GGUF-LLM/
 
 Restart ComfyUI, then hard-refresh the browser if an older frontend is still cached.
 
-Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.26-alpha is already bundled here.
+Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.27-alpha is already bundled here.
 
 ## GGUF model folders
 

@@ -18,7 +18,7 @@ import folder_paths
 
 log = logging.getLogger(__name__)
 
-NODE_VERSION = "0.6.26-alpha"
+NODE_VERSION = "0.6.27-alpha"
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_DIR = PACKAGE_DIR / "templates" / "default"
 USER_TEMPLATE_DIR = Path(folder_paths.models_dir) / "LLM" / "local_LLM_presets" / "prompt_enhancer"
@@ -486,6 +486,14 @@ def _delete_prompt_set(name: str) -> dict[str, Any]:
     return {"name": clean_name}
 
 
+def _enhancer_state_key(node_id: Any = None, state_id: Any = None) -> str:
+    """Stable per-enhancer backend key, with node-id fallback for old clients."""
+    stable = str(state_id or "").strip()
+    if stable:
+        return stable
+    return str(node_id or "").strip()
+
+
 def _prune_pending_locked(now: float | None = None) -> None:
     now = time.monotonic() if now is None else now
     stale = [
@@ -593,6 +601,7 @@ def _arm_request(
     prompt_history_index: Any = 0,
     enhanced_prompt: Any = "",
     overwrite_enhanced: Any = False,
+    state_id: Any = "",
 ) -> str:
     node_id = str(node_id or "").strip()
     if not node_id:
@@ -620,10 +629,12 @@ def _arm_request(
     seed_values = seed_values[:requested_count]
 
     token = uuid.uuid4().hex
+    key = _enhancer_state_key(node_id, state_id)
     with _PENDING_LOCK:
         _prune_pending_locked()
-        _PENDING_REQUESTS[node_id] = {
+        _PENDING_REQUESTS[key] = {
             "token": token,
+            "node_id": node_id,
             "prompt": str(prompt or ""),
             "enhancement_text": str(enhancement_text or ""),
             "seed": seed_values[0],
@@ -634,16 +645,21 @@ def _arm_request(
             "prompt_history_index": prompt_history_index,
             "enhanced_prompt": str(enhanced_prompt or ""),
             "overwrite_enhanced": bool(overwrite_enhanced),
+            "state_id": str(state_id or "").strip(),
             "created": time.monotonic(),
         }
     return token
 
 
-def _pop_request(node_id: Any) -> dict[str, Any] | None:
-    node_id = str(node_id or "")
+def _pop_request(node_id: Any, state_id: Any = "") -> dict[str, Any] | None:
+    key = _enhancer_state_key(node_id, state_id)
+    fallback = _enhancer_state_key(node_id, "")
     with _PENDING_LOCK:
         _prune_pending_locked()
-        return _PENDING_REQUESTS.pop(node_id, None)
+        pending = _PENDING_REQUESTS.pop(key, None)
+        if pending is None and fallback and fallback != key:
+            pending = _PENDING_REQUESTS.pop(fallback, None)
+        return pending
 
 
 def _video_frames(video: Any):
@@ -747,6 +763,7 @@ def _publish_manual_batch_progress(
     total: int,
     result: dict[str, Any],
     *,
+    state_id: Any = "",
     used_images: bool = False,
     used_video: bool = False,
     used_settings: bool = False,
@@ -769,6 +786,7 @@ def _publish_manual_batch_progress(
             {
                 "node_id": str(node_id or ""),
                 "token": str(token or ""),
+                "state_id": str(state_id or "").strip(),
                 "index": int(index),
                 "total": int(total),
                 "prompt": str((result or {}).get("prompt") or ""),
@@ -1278,6 +1296,17 @@ class LocalLLMPromptEnhancer:
                         ),
                     },
                 ),
+                # Stable frontend-owned identity used to reconcile background
+                # executions when this workflow is not currently mounted. Keep
+                # appended after legacy serialized widgets for compatibility.
+                "prompt_state_id": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "dynamicPrompts": False,
+                    },
+                ),
             },
             "optional": {
                 "images": (
@@ -1352,6 +1381,7 @@ class LocalLLMPromptEnhancer:
         prompt_cycle_revision: int = 0,
         prompt_shuffle_json: str = "[]",
         prompt_preset: str = "Custom",
+        prompt_state_id: str = "",
         settings: Any = None,
         images: Any = None,
         video: Any = None,
@@ -1366,17 +1396,18 @@ class LocalLLMPromptEnhancer:
         # therefore contain the pre-batch or an intermediate prompt array. Upgrade
         # only a recognized batch stage to the authoritative completed array; all
         # unrelated/manual edits remain untouched.
+        state_key = _enhancer_state_key(unique_id, prompt_state_id)
         history, ui_active_index, visible_enhanced, _queued_batch_reconciled = _reconcile_queued_manual_history(
-            unique_id, history, ui_active_index, visible_enhanced
+            state_key, history, ui_active_index, visible_enhanced
         )
         effective_seed = _effective_seed(settings, seed)
 
         # A manual media/settings-aware Enhance request always takes priority. The
         # browser explicitly armed this targeted execution so connected media
         # can reach the Local GGUF service.
-        pending = _pop_request(unique_id)
+        pending = _pop_request(unique_id, prompt_state_id)
         if pending is not None:
-            _clear_prompt_cycle_state(unique_id)
+            _clear_prompt_cycle_state(state_key)
             token = str(pending.get("token") or "")
             batch_id = str(pending.get("batch_id", "") or "").strip()
             raw_seeds = pending.get("seeds")
@@ -1410,6 +1441,7 @@ class LocalLLMPromptEnhancer:
                         batch_index,
                         len(batch_seeds),
                         result,
+                        state_id=pending.get("state_id") or prompt_state_id,
                         used_images=images is not None,
                         used_video=video is not None,
                         used_settings=isinstance(settings, dict),
@@ -1435,15 +1467,17 @@ class LocalLLMPromptEnhancer:
             # already added to ComfyUI's queue during this batch can consume the
             # finished enhancements even though their prompt snapshot was taken
             # earlier. This does not delay or intercept queue submission.
-            _store_manual_batch_history(unique_id, pending, prompts)
+            _store_manual_batch_history(state_key, pending, prompts)
             payload = {
                 "mode": "manual_batch",
                 "token": token,
+                "state_id": str(pending.get("state_id") or prompt_state_id or ""),
                 "prompt": prompts[-1] if prompts else "",
                 "prompts": prompts,
                 "tokens": sum(token_counts),
                 "token_counts": token_counts,
                 "batch_count": len(prompts),
+                "overwrite": bool(pending.get("overwrite_enhanced", False)),
                 "used_images": images is not None,
                 "used_video": video is not None,
                 "used_settings": isinstance(settings, dict),
@@ -1455,7 +1489,7 @@ class LocalLLMPromptEnhancer:
             }
 
         if bool(enhance_with_workflow):
-            _clear_prompt_cycle_state(unique_id)
+            _clear_prompt_cycle_state(state_key)
             result = _run_enhancement(
                 source,
                 str(enhancement_text or ""),
@@ -1468,6 +1502,7 @@ class LocalLLMPromptEnhancer:
             revised = str(result["prompt"] or "")
             payload = {
                 "mode": "workflow",
+                "state_id": str(prompt_state_id or ""),
                 "prompt": revised,
                 "tokens": result["tokens"],
                 "used_images": images is not None,
@@ -1481,7 +1516,7 @@ class LocalLLMPromptEnhancer:
             }
 
         active_index, next_index, next_shuffle = _advance_prompt_cycle_backend(
-            unique_id,
+            state_key,
             prompt_cycle,
             history,
             ui_active_index,
@@ -1492,6 +1527,7 @@ class LocalLLMPromptEnhancer:
         effective = active_enhanced if active_enhanced.strip() else source
         payload = {
             "mode": "cycle",
+            "state_id": str(prompt_state_id or ""),
             "active_index": active_index,
             "next_index": next_index,
             "shuffle": next_shuffle,
@@ -1680,6 +1716,7 @@ try:
                 body.get("prompt_history_index", 0),
                 body.get("enhanced_prompt", ""),
                 body.get("overwrite_enhanced", False),
+                body.get("state_id", ""),
             )
             return web.json_response({"token": token})
         except ValueError as exc:
@@ -1695,7 +1732,7 @@ try:
             if not isinstance(body, dict):
                 raise TypeError("Request body must be an object")
             revision = body.get("revision") if isinstance(body, dict) and "revision" in body else None
-            _clear_prompt_cycle_state(body.get("node_id"), revision)
+            _clear_prompt_cycle_state(_enhancer_state_key(body.get("node_id"), body.get("state_id")), revision)
             return web.json_response({"ok": True})
         except Exception as exc:
             log.exception("[Local LLM Prompt Enhancer] Prompt-cycle reset failed")
@@ -1712,7 +1749,7 @@ try:
                 raise TypeError("history must be an array")
             history = [str(item) for item in history_raw]
             snapshot = _prompt_cycle_state_snapshot(
-                body.get("node_id"),
+                _enhancer_state_key(body.get("node_id"), body.get("state_id")),
                 str(body.get("mode") or "fixed"),
                 history,
             )
@@ -1728,13 +1765,20 @@ try:
         try:
             body = await request.json()
             node_id = str((body or {}).get("node_id") or "")
+            state_id = str((body or {}).get("state_id") or "")
             token = str((body or {}).get("token") or "")
+            key = _enhancer_state_key(node_id, state_id)
+            fallback = _enhancer_state_key(node_id, "")
             removed = False
             with _PENDING_LOCK:
-                current = _PENDING_REQUESTS.get(node_id)
-                if current and (not token or str(current.get("token")) == token):
-                    _PENDING_REQUESTS.pop(node_id, None)
-                    removed = True
+                for candidate_key in dict.fromkeys([key, fallback]):
+                    if not candidate_key:
+                        continue
+                    current = _PENDING_REQUESTS.get(candidate_key)
+                    if current and (not token or str(current.get("token")) == token):
+                        _PENDING_REQUESTS.pop(candidate_key, None)
+                        removed = True
+                        break
             return web.json_response({"cancelled": removed})
         except Exception as exc:
             return _json_error(exc, 500)
