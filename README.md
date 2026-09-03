@@ -1,7 +1,44 @@
-# Local GGUF LLM — v0.18.59 alpha
+# Local GGUF LLM — v0.18.62 alpha
 
 
 
+
+
+## v0.18.62 alpha
+
+Fresh GPU-memory ownership architecture:
+
+- Replaces the layered v0.18.61 `+512 / +768 / +256 / 64 MiB tolerance` admission rules with one explicit **GPU lease** policy. The runtime requirement and the post-runtime free-space margin are now separate concepts.
+- Uses `max(conservative GGUF estimate, measured native high-water)` as the llama.cpp runtime requirement. A measured load can raise the requirement but no longer receives an additional hidden fixed margin.
+- Uses a single per-device headroom value: **llama.cpp's current 1024 MiB default `--fit` margin**, or ComfyUI's configured `--reserve-vram` plus DynamicVRAM `--vram-headroom` when that is larger.
+- Before every fresh native load, mirrors ComfyUI's AIMDO node-boundary cleanup where available (`reset_cast_buffers()` and prefetch cleanup), then fully flushes the PyTorch caching allocator and synchronizes before measuring physical free VRAM.
+- Requests one rounded-up free-memory target from ComfyUI and verifies the unrounded semantic target against raw CUDA driver free memory. AIMDO requests are aligned to its 32 MiB VBAR page size; there is no separate verification tolerance.
+- If cooperative ComfyUI eviction cannot establish the lease, performs one explicit **exclusive target-GPU lease** by fully evicting ComfyUI models on that GPU. This is now a named ownership state rather than an emergency arithmetic fallback.
+- Multi-GPU Layer/Row/Tensor split no longer pretends that the single-GPU GGUF estimator can predict each device's allocation. Persistent/Unload modes take an exclusive lease on each participating GPU before the native load.
+- GPU ownership is now keyed to the unified estimated native CUDA footprint, not just `gpu_layers`. KV-only GPU offload and multimodal projector allocations therefore receive the same pre-load lease even when model weights themselves stay on CPU.
+- Keeps the process-global native ownership gate and H3 bridge API v2 unchanged. H3 Project Director v0.6.10 remains compatible.
+- Does not depend on AIMDO's internal `VRAMBuffer` API; ComfyUI currently labels that interface temporary/not supported for custom-node use.
+
+
+
+## v0.18.61 alpha
+
+VRAM handoff hardening:
+
+- Separates the projected llama.cpp runtime target from a verified pre-load clearance target. Native loads now require 768 MiB of driver-visible slack beyond the projected runtime peak.
+- The normal ComfyUI/AIMDO release request asks for another 256 MiB beyond that clearance target to absorb coarse eviction/accounting granularity.
+- Synchronizes the target CUDA device before the fast-path free-memory check, so pending ComfyUI/AIMDO work cannot make a stale raw-free snapshot look safe.
+- If bounded `free_memory()` cannot establish clearance, performs one target-GPU full-eviction fallback before failing closed.
+- `Unload After Run` now performs the same pre-load VRAM handoff as persistent/managed modes instead of loading llama.cpp directly.
+- Keeps a process-global per-signature observed VRAM high-water across suspend and unload-after-run cycles, so reload reservations do not forget larger real allocations.
+- Handoff diagnostics now report runtime target, clearance target, release request, runtime headroom, and whether full-device fallback was needed.
+
+## v0.18.60 alpha
+
+- Fixes Prompt Enhancer textarea height drift on page/workflow load. ResizeObserver/layout/remount events are no longer interpreted as user resizing and can no longer overwrite saved textbox heights.
+- Textarea heights are persisted only after an actual pointer gesture changes a textarea's rendered height. Node-width changes, DOM remounting, workflow-tab activation, browser zoom/layout settling, and state rehydration remain layout-only events.
+- Prompt Enhancer persistence state moves to v3. Existing v1/v2 textarea-height metadata is reset once because older versions could not distinguish intentional manual resizing from transient DOM geometry. After migration, manual textarea resizing persists normally.
+- Retains v0.18.59's stable enhancer-instance journal and full workflow-return rehydration.
 
 ## v0.18.59 alpha
 
@@ -66,7 +103,7 @@
 - **The Enhance batch owns its full queue lifetime:** all internal LLM iterations plus the final native llama.cpp VRAM suspend happen before the single Prompt Enhancer queue item returns, so the next queued diffusion job cannot begin early.
 - **Queued-snapshot reconciliation:** workflows queued during the batch may have serialized the Prompt Enhancer before all progress updates reached the browser. The backend now recognizes pre-batch/intermediate history snapshots and upgrades them to the completed batch history when those queued jobs execute, without delaying queue submission.
 - Removed the v0.18.49 informational “Workflow queued until…” Run gate/notification.
-- Prompt Enhancer frontend: **v0.6.27-alpha**.
+- Prompt Enhancer frontend: **v0.6.28-alpha**.
 
 
 ## v0.18.49 alpha
@@ -97,7 +134,7 @@ This package includes:
 
 - **Local LLM Generate** — send prompts, images, and sampled video frames to the persistent local LLM.
 - **Local LLM Settings** — reusable model/generation settings with loadable Complete Settings Presets. Memory/performance tuning remains in the Local LLM service panel rather than crowding the workflow node.
-- **Local LLM Prompt Enhancer** — bundled **v0.6.27-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
+- **Local LLM Prompt Enhancer** — bundled **v0.6.28-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
 - **Local LLM Server panel** — model loading, presets, memory/VRAM controls, status, performance information, and the optional OpenAI-compatible API.
 
 
@@ -126,7 +163,7 @@ ComfyUI/custom_nodes/ComfyUI-Local-GGUF-LLM/
 
 Restart ComfyUI, then hard-refresh the browser if an older frontend is still cached.
 
-Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.27-alpha is already bundled here.
+Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.28-alpha is already bundled here.
 
 ## GGUF model folders
 

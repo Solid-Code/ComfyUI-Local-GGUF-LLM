@@ -27,6 +27,7 @@ import folder_paths
 from .gguf_meta import read_gguf_metadata, detect_family, recommended_model_preset, available_model_presets
 from .presets import MODEL_PRESETS, MEMORY_PRESETS, capabilities_for_family, public_presets
 from .version import VRAM_POLICY_VERSION, VRAM_COORDINATION_MODE
+from .vram_coordination import GPUMemoryLeaseManager, runtime_target_bytes, lease_failure_message
 
 LLM_DIR = os.path.join(folder_paths.models_dir, "llm")
 os.makedirs(LLM_DIR, exist_ok=True)
@@ -66,6 +67,8 @@ if _NATIVE_COORDINATOR is None:
     _NATIVE_COORDINATOR.waiters = 0
     _NATIVE_COORDINATOR.operation_epoch = 0
     _NATIVE_COORDINATOR.context_epoch = 0
+    _NATIVE_COORDINATOR.vram_highwater_lock = threading.RLock()
+    _NATIVE_COORDINATOR.vram_highwater_by_signature = {}
     sys.modules[_NATIVE_COORDINATOR_KEY] = _NATIVE_COORDINATOR
 else:
     # Forward-compatible initialization when an older dev reload created the
@@ -92,6 +95,10 @@ else:
     }.items():
         if not hasattr(_NATIVE_COORDINATOR, _name):
             setattr(_NATIVE_COORDINATOR, _name, _value)
+    if not hasattr(_NATIVE_COORDINATOR, "vram_highwater_lock"):
+        _NATIVE_COORDINATOR.vram_highwater_lock = threading.RLock()
+    if not hasattr(_NATIVE_COORDINATOR, "vram_highwater_by_signature"):
+        _NATIVE_COORDINATOR.vram_highwater_by_signature = {}
 
 _MODEL_CACHE = _NATIVE_COORDINATOR.model_cache
 _MODEL_LOCK = _NATIVE_COORDINATOR.model_lock
@@ -397,33 +404,83 @@ def _host_load_delta(before, after, load_mode="unknown"):
     return out
 
 
-_OBSERVED_VRAM_RUNTIME_MARGIN = 512 * 1024 * 1024
-_VRAM_HANDOFF_REQUEST_CUSHION = 256 * 1024 * 1024
-_VRAM_HANDOFF_VERIFY_TOLERANCE = 64 * 1024 * 1024
-
-
 def _reload_vram_target_bytes(estimated_bytes, observed_bytes=0):
-    """Return the conservative driver-visible VRAM target for native load/reload.
+    """Return the native llama.cpp runtime requirement, excluding lease headroom."""
+    return runtime_target_bytes(estimated_bytes, observed_bytes)
 
-    This is intentionally shared by both the resident loader and service/tuner
-    diagnostics so the displayed/requested target cannot drift from the actual
-    allocation policy again. Constructor-time observed VRAM is evidence, not a
-    runtime peak measurement, so the estimate remains a hard floor.
+
+def _lease_plan_preview(runtime_target_bytes):
+    """Best-effort preview of the current ComfyUI GPU-lease policy."""
+    try:
+        import comfy.model_management as mm
+        return GPUMemoryLeaseManager(mm, aimdo_enabled=_aimdo_enabled()).plan(runtime_target_bytes).as_dict()
+    except Exception:
+        runtime = max(0, int(runtime_target_bytes or 0))
+        return {
+            "runtime_target_bytes": runtime,
+            "headroom_bytes": 1024 * _MIB if runtime > 0 else 0,
+            "free_target_bytes": runtime + (1024 * _MIB if runtime > 0 else 0),
+            "request_target_bytes": runtime + (1024 * _MIB if runtime > 0 else 0),
+        }
+
+def _vram_highwater_snapshot(signature_id):
+    if not signature_id:
+        return {}
+    try:
+        with _NATIVE_COORDINATOR.vram_highwater_lock:
+            return dict(_NATIVE_COORDINATOR.vram_highwater_by_signature.get(str(signature_id), {}) or {})
+    except Exception:
+        return {}
+
+
+def _vram_highwater_bytes(signature_id, gpu_index=None):
+    values = _vram_highwater_snapshot(signature_id)
+    if gpu_index is None:
+        return int(sum(max(0, int(v or 0)) for v in values.values()))
+    return int(max(0, values.get(str(int(gpu_index)), 0) or 0))
+
+
+def _record_vram_highwater(signature_id, diagnostics, main_gpu_index=None):
+    """Persist observed native VRAM by allocation signature across yield/unload.
+
+    This lives in the process-global coordinator rather than _MODEL_CACHE so an
+    Unload-After-Run or driver-managed suspend can still reserve from the largest
+    allocation we actually observed the next time the same signature is loaded.
     """
-    estimate = int(max(0, estimated_bytes or 0))
-    observed = int(max(0, observed_bytes or 0))
-    if observed <= 0:
-        return estimate, "first-load-estimate"
-    observed_target = int(observed + _OBSERVED_VRAM_RUNTIME_MARGIN)
-    target = max(estimate, observed_target)
-    if observed_target > estimate:
-        source = "observed+512MiB>estimate"
-    elif estimate > observed_target:
-        source = "estimate>observed+512MiB"
-    else:
-        source = "estimate=observed+512MiB"
-    return int(target), source
-
+    if not signature_id:
+        return {}
+    observed = {}
+    try:
+        for k, v in dict((diagnostics or {}).get("vram_delta_bytes_by_gpu") or {}).items():
+            value = int(max(0, int(v or 0)))
+            if value > 0:
+                observed[str(int(k))] = value
+    except Exception:
+        pass
+    if main_gpu_index is not None:
+        try:
+            fast_mib = (diagnostics or {}).get("fast_reload_immediate_vram_delta_mib")
+            fast_bytes = int(max(0.0, float(fast_mib or 0.0)) * _MIB)
+            key = str(int(main_gpu_index))
+            if fast_bytes > observed.get(key, 0):
+                observed[key] = fast_bytes
+        except Exception:
+            pass
+    if not observed:
+        return _vram_highwater_snapshot(signature_id)
+    with _NATIVE_COORDINATOR.vram_highwater_lock:
+        table = _NATIVE_COORDINATOR.vram_highwater_by_signature
+        current = dict(table.get(str(signature_id), {}) or {})
+        for k, v in observed.items():
+            current[k] = max(int(current.get(k, 0) or 0), int(v))
+        # Bound development/hot-reload lifetime growth while retaining recent model signatures.
+        if str(signature_id) not in table and len(table) >= 32:
+            try:
+                table.pop(next(iter(table)))
+            except Exception:
+                pass
+        table[str(signature_id)] = current
+        return dict(current)
 
 def _perf_log(event, **fields):
     """Compact always-on lifecycle timings for KoboldCpp-style comparisons."""
@@ -558,214 +615,29 @@ def _install_comfy_llm_yield_hook(mm):
         return True
 
 def _request_comfyui_room(mm, required_bytes, device):
-    """Make driver-visible room for native llama.cpp with minimum synchronization.
-
-    The fast path only calls ``soft_empty_cache()`` when ComfyUI reports enough
-    reclaimable allocator cache to cover the *entire* raw-driver shortfall. If
-    cache cannot possibly solve it, skip that synchronized flush and go directly
-    to model eviction. AIMDO receives the same bounded free-memory target as the
-    normal ComfyUI path; we no longer force a target-GPU full unload with an
-    effectively infinite request. Synchronization brackets residency ownership
-    changes so AIMDO/VBAR never follows immediately behind unfinished native CUDA
-    teardown or ComfyUI release work.
-    """
-    required = max(0, int(required_bytes or 0))
-    result = {
-        "required_free_bytes": required,
-        "release_request_bytes": int(required + _VRAM_HANDOFF_REQUEST_CUSHION) if required > 0 else 0,
-        "verification_tolerance_bytes": int(_VRAM_HANDOFF_VERIFY_TOLERANCE),
-        "free_before_bytes": None,
-        "raw_free_before_bytes": None,
-        "torch_reclaimable_before_bytes": 0,
-        "free_after_bytes": None,
-        "raw_free_after_bytes": None,
-        "satisfied": required <= 0,
-        "remaining_shortfall_bytes": 0,
-        "strategy": "none",
-        "release_called": False,
-        "cache_probe_called": False,
-        "cache_probe_skipped": False,
-        "aimdo": _aimdo_enabled(),
-    }
-    if required <= 0:
-        return result
-
-    total_started = time.perf_counter()
-    before = _comfy_memory_breakdown(mm, device)
-    free_before = before["comfy_free_bytes"]
-    raw_before = before["raw_free_bytes"]
-    reclaimable_before = before["torch_reclaimable_bytes"]
-    result["free_before_bytes"] = free_before
-    result["raw_free_before_bytes"] = raw_before
-    result["torch_reclaimable_before_bytes"] = reclaimable_before
-    fit_before = raw_before if raw_before is not None else free_before
-    shortfall = max(0, required - int(fit_before or 0))
-    result["raw_shortfall_before_bytes"] = shortfall
-    if fit_before >= required:
-        result["free_after_bytes"] = free_before
-        result["raw_free_after_bytes"] = raw_before
-        result["satisfied"] = True
-        result["remaining_shortfall_bytes"] = 0
-        result["total_seconds"] = time.perf_counter() - total_started
-        _perf_log(
-            "LLM VRAM room check: already fits",
-            required_mib=required / _MIB,
-            comfy_free_mib=free_before / _MIB,
-            raw_free_mib=(raw_before / _MIB) if raw_before is not None else None,
-            reclaimable_mib=reclaimable_before / _MIB,
-            total_s=result["total_seconds"],
-        )
-        return result
-
-    # Only pay for ComfyUI's synchronized cache flush if the reclaimable cache
-    # is large enough to satisfy the complete raw-driver shortage by itself.
-    cache_can_satisfy = raw_before is None or reclaimable_before >= shortfall
-    result["cache_can_satisfy_shortfall"] = bool(cache_can_satisfy)
-    if cache_can_satisfy and reclaimable_before >= 16 * _MIB:
-        result["cache_probe_called"] = True
-        cache_probe_started = time.perf_counter()
-        try:
-            mm.soft_empty_cache()
-        except Exception:
-            pass
-        result["cache_probe_seconds"] = time.perf_counter() - cache_probe_started
-        after_cache = _comfy_memory_breakdown(mm, device)
-        raw_after_cache = after_cache["raw_free_bytes"]
-        comfy_after_cache = after_cache["comfy_free_bytes"]
-        result["raw_free_after_cache_bytes"] = raw_after_cache
-        result["free_after_cache_bytes"] = comfy_after_cache
-        result["torch_reclaimable_after_cache_bytes"] = after_cache["torch_reclaimable_bytes"]
-        fit_after_cache = raw_after_cache if raw_after_cache is not None else comfy_after_cache
-        if fit_after_cache >= required:
-            result["strategy"] = "soft-cache-only"
-            result["free_after_bytes"] = comfy_after_cache
-            result["raw_free_after_bytes"] = raw_after_cache
-            result["satisfied"] = True
-            result["remaining_shortfall_bytes"] = 0
-            result["total_seconds"] = time.perf_counter() - total_started
-            _perf_log(
-                "LLM VRAM handoff complete",
-                strategy=result["strategy"],
-                required_mib=required / _MIB,
-                shortfall_mib=shortfall / _MIB,
-                reclaimable_mib=reclaimable_before / _MIB,
-                raw_before_mib=(raw_before / _MIB) if raw_before is not None else None,
-                raw_after_mib=(raw_after_cache / _MIB) if raw_after_cache is not None else None,
-                cache_probe_s=result["cache_probe_seconds"],
-                total_s=result["total_seconds"],
-            )
-            return result
-    else:
-        result["cache_probe_skipped"] = True
-        result["cache_probe_skip_reason"] = (
-            "reclaimable-cache-too-small" if raw_before is not None else "reclaimable-cache-unavailable"
-        )
-        _perf_log(
-            "skip speculative PyTorch cache flush",
-            required_mib=required / _MIB,
-            raw_free_mib=(raw_before / _MIB) if raw_before is not None else None,
-            shortfall_mib=shortfall / _MIB,
-            reclaimable_mib=reclaimable_before / _MIB,
-        )
-
-    result["release_called"] = True
-    sync_started = time.perf_counter()
-    _sync_cuda_device(device)
-    result["pre_release_sync_seconds"] = time.perf_counter() - sync_started
-
-    release_started = time.perf_counter()
-    if result["aimdo"]:
-        # Conservative AIMDO handoff: request only the actual driver-visible
-        # target needed by llama.cpp. The old 1e30 request forced the target GPU
-        # toward a complete VBAR unload, creating much larger residency churn than
-        # necessary and increasing the chance of colliding with async VBAR work.
-        result["strategy"] = "aimdo-bounded-free-memory"
-    else:
-        result["strategy"] = "targeted-free-memory"
-    # Ask ComfyUI for a little more than the hard runtime target. Model/VBAR
-    # eviction happens in coarse chunks and driver free-memory reporting can
-    # settle a few MiB below the requested boundary even after synchronization.
-    # The cushion reduces false boundary failures without weakening the actual
-    # runtime target used for verification below.
-    release_request = int(required + _VRAM_HANDOFF_REQUEST_CUSHION)
-    result["release_request_bytes"] = release_request
-    mm.free_memory(release_request, device)
-    result["release_seconds"] = time.perf_counter() - release_started
-
-    # free_memory()/AIMDO may finish bookkeeping before every CUDA-side residency
-    # transition is globally quiescent. Do not let llama.cpp begin native CUDA
-    # allocation until that work is complete. This synchronization is deliberately
-    # only on the load/reload transition, not on resident request reuse.
-    post_release_sync_started = time.perf_counter()
-    _sync_cuda_device(device)
-    result["post_release_sync_seconds"] = time.perf_counter() - post_release_sync_started
-
-    after_release = _comfy_memory_breakdown(mm, device)
-    raw_after_release = after_release["raw_free_bytes"]
-    result["raw_free_after_release_bytes"] = raw_after_release
-    result["torch_reclaimable_after_release_bytes"] = after_release["torch_reclaimable_bytes"]
-    post_cache_seconds = 0.0
-    # ComfyUI normally flushes allocator cache itself after an actual model
-    # unload. Only make one final attempt if driver-visible room is still short
-    # *and* the remaining torch cache can cover that exact shortfall.
-    fit_after_release = raw_after_release if raw_after_release is not None else after_release["comfy_free_bytes"]
-    remaining_shortfall = max(0, required - int(fit_after_release or 0))
-    if remaining_shortfall > 0 and after_release["torch_reclaimable_bytes"] >= remaining_shortfall:
-        cache_started = time.perf_counter()
-        try:
-            mm.soft_empty_cache()
-        except Exception:
-            pass
-        post_cache_seconds = time.perf_counter() - cache_started
-    result["soft_empty_cache_seconds"] = post_cache_seconds
-    if post_cache_seconds > 0.0:
-        # soft_empty_cache() can itself participate in allocator/device cleanup.
-        # Re-establish the same quiescent boundary before native allocation.
-        post_cache_sync_started = time.perf_counter()
-        _sync_cuda_device(device)
-        result["post_cache_sync_seconds"] = time.perf_counter() - post_cache_sync_started
-    else:
-        result["post_cache_sync_seconds"] = 0.0
-
-    final = _comfy_memory_breakdown(mm, device)
-    result["free_after_bytes"] = final["comfy_free_bytes"]
-    result["raw_free_after_bytes"] = final["raw_free_bytes"]
-    result["torch_reclaimable_after_bytes"] = final["torch_reclaimable_bytes"]
-    final_fit = final["raw_free_bytes"] if final["raw_free_bytes"] is not None else final["comfy_free_bytes"]
-    result["remaining_shortfall_bytes"] = max(0, required - int(final_fit or 0))
-    result["within_verification_tolerance"] = (
-        result["remaining_shortfall_bytes"] <= _VRAM_HANDOFF_VERIFY_TOLERANCE
-    )
-    result["fatal_shortfall_bytes"] = max(
-        0, result["remaining_shortfall_bytes"] - _VRAM_HANDOFF_VERIFY_TOLERANCE
-    )
-    result["satisfied"] = bool(result["within_verification_tolerance"])
-    result["total_seconds"] = time.perf_counter() - total_started
+    """Acquire one explicit driver-visible GPU lease for native llama.cpp."""
+    room = GPUMemoryLeaseManager(mm, aimdo_enabled=_aimdo_enabled()).acquire(required_bytes, device)
+    raw_before = room.get("raw_free_before_bytes")
+    raw_after = room.get("raw_free_after_bytes")
     _perf_log(
-        "LLM VRAM handoff complete",
-        strategy=result["strategy"],
-        required_mib=required / _MIB,
-        release_request_mib=result.get("release_request_bytes", 0) / _MIB,
-        verify_tolerance_mib=_VRAM_HANDOFF_VERIFY_TOLERANCE / _MIB,
-        shortfall_mib=shortfall / _MIB,
-        reclaimable_mib=reclaimable_before / _MIB,
-        comfy_before_mib=free_before / _MIB,
-        raw_before_mib=(raw_before / _MIB) if raw_before is not None else None,
-        comfy_after_mib=(result["free_after_bytes"] or 0) / _MIB,
-        raw_after_mib=(result["raw_free_after_bytes"] / _MIB) if result["raw_free_after_bytes"] is not None else None,
-        cache_probe_s=result.get("cache_probe_seconds", 0.0),
-        cache_skipped=result.get("cache_probe_skipped"),
-        pre_sync_s=result.get("pre_release_sync_seconds"),
-        release_s=result.get("release_seconds"),
-        post_release_sync_s=result.get("post_release_sync_seconds"),
-        cache_s=result.get("soft_empty_cache_seconds"),
-        post_cache_sync_s=result.get("post_cache_sync_seconds"),
-        satisfied=result.get("satisfied"),
-        remaining_shortfall_mib=(result.get("remaining_shortfall_bytes", 0) / _MIB),
-        total_s=result.get("total_seconds"),
+        "LLM GPU lease",
+        strategy=room.get("strategy"),
+        runtime_mib=float(room.get("runtime_target_bytes") or 0) / _MIB,
+        headroom_mib=float(room.get("headroom_bytes") or 0) / _MIB,
+        free_target_mib=float(room.get("free_target_bytes") or 0) / _MIB,
+        request_target_mib=float(room.get("request_target_bytes") or 0) / _MIB,
+        raw_before_mib=(float(raw_before) / _MIB) if raw_before is not None else None,
+        raw_after_mib=(float(raw_after) / _MIB) if raw_after is not None else None,
+        cooperative=bool(room.get("cooperative_eviction_called")),
+        exclusive=bool(room.get("exclusive_eviction_called")),
+        satisfied=bool(room.get("satisfied")),
+        total_s=float(room.get("elapsed_seconds") or 0.0),
     )
-    return result
+    return room
 
+
+def _vram_room_failure_message(room):
+    return lease_failure_message(room)
 
 def _llama_perf_snapshot(llm):
     """Best-effort llama.cpp context timing snapshot.
@@ -1213,6 +1085,49 @@ def _parse_tensor_split(text):
     return vals
 
 
+def _native_cuda_expected(estimated_vram_bytes, load_kwargs=None):
+    """Whether this load is expected to create any native CUDA allocation.
+
+    Do not key VRAM ownership solely off n_gpu_layers: llama.cpp can still use
+    CUDA for GPU KV/offload_kqv and multimodal projector state with zero model
+    layers offloaded.  The unified estimator already represents every native
+    GPU component we know about, so a non-zero estimate is the admission signal.
+    """
+    if int(max(0, estimated_vram_bytes or 0)) > 0:
+        return True
+    kw = load_kwargs or {}
+    return bool(
+        kw.get("offload_kqv", False)
+        or kw.get("mmproj_path")
+        or kw.get("clip_model_path")
+    )
+
+
+def _participating_gpu_indices(split_mode_name, tensor_split_values, main_gpu_index):
+    """Resolve CUDA devices that llama.cpp may allocate on for this load.
+
+    Single-GPU mode is exact. For Layer/Row/Tensor split, an explicit tensor
+    split limits the set; otherwise llama.cpp may use every visible CUDA device.
+    This is used only for the conservative multi-GPU lease boundary, not to
+    predict per-device allocation sizes.
+    """
+    try:
+        import torch
+        count = int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    except Exception:
+        count = 0
+    if count <= 0:
+        return []
+    if str(split_mode_name) == "None (single GPU)":
+        idx = max(0, min(count - 1, int(main_gpu_index)))
+        return [idx]
+    if tensor_split_values:
+        used = [i for i, value in enumerate(tensor_split_values[:count]) if float(value or 0) > 0]
+        if used:
+            return used
+    return list(range(count))
+
+
 def _parse_stop(value):
     """Normalize UI pipe-delimited or API list stop sequences.
 
@@ -1436,7 +1351,7 @@ def _load_llama_verified(llama_cpp, Llama, load_kwargs, gpu_layers):
     deltas = _snapshot_deltas(before, after)
 
     diag_started = time.perf_counter()
-    requested_gpu = int(gpu_layers) != 0
+    requested_gpu = _native_cuda_expected(0, load_kwargs) or int(gpu_layers) != 0
     total_delta = sum(deltas.values())
     support_hint = _llama_gpu_offload_hint(llama_cpp)
     system_info = _llama_system_info(llama_cpp)
@@ -1490,7 +1405,7 @@ def _load_llama_verified(llama_cpp, Llama, load_kwargs, gpu_layers):
         _close_llama_object(llm)
         lib_text = ", ".join(diagnostics["backend_libraries"]) or "none detected"
         raise RuntimeError(
-            "GPU offload was requested (gpu_layers != 0), but loading the GGUF changed visible GPU VRAM "
+            "Native CUDA use was requested, but loading the GGUF changed visible GPU VRAM "
             f"by only {diagnostics['total_vram_delta_mib']:.1f} MiB. The model is almost certainly running on CPU.\n\n"
             "Most common cause: ComfyUI's Python environment has a CPU-only llama-cpp-python build, or its "
             "llama.cpp CUDA backend does not match the installed CUDA/runtime. n_gpu_layers=-1 cannot enable GPU "
@@ -2142,7 +2057,7 @@ class _NativeLLMResident:
         self._verbose = bool(verbose)
         self._estimated_vram = int(max(0, estimated_vram))
         self._model_file_size = int(max(0, model_file_size))
-        gpu_expected = int(gpu_layers) != 0 or bool(load_kwargs.get("offload_kqv", False))
+        gpu_expected = _native_cuda_expected(estimated_vram, load_kwargs)
         if gpu_expected and torch.cuda.is_available():
             self.load_device = torch.device("cuda", int(main_gpu_index))
         else:
@@ -2151,7 +2066,7 @@ class _NativeLLMResident:
         self._base_chat_handler = None
         self._diagnostics = None
         self._accounted_size = self._estimated_vram if self.load_device.type != "cpu" else self._model_file_size
-        self._observed_vram_bytes = 0
+        self._observed_vram_bytes = _vram_highwater_bytes(self.signature_id, main_gpu_index)
         self._gpu_layers = int(gpu_layers)
         self._verified_once = False
         self._reload_count = 0
@@ -2177,12 +2092,10 @@ class _NativeLLMResident:
     def preload_target_bytes(self):
         """Return the driver-visible VRAM target required before native load/reload.
 
-        A constructor-time CUDA delta is useful evidence, but it is *not* a peak
-        runtime measurement: prompt evaluation, large physical batches, vision,
-        and speculative/MTP work can need additional temporary VRAM after
-        ``Llama(...)`` returns. Warm reloads therefore never reserve less than
-        the conservative runtime estimate. If reality exceeds the estimate, the
-        observed allocation wins with an additional fixed driver/runtime margin.
+        The conservative estimator remains the first-load floor. A measured
+        native high-water can raise that runtime requirement, but safety margin
+        is not hidden in this value; the GPU lease layer adds one explicit
+        per-device headroom policy when acquiring physical VRAM.
         """
         if self.load_device.type == "cpu":
             return 0, "cpu"
@@ -2253,9 +2166,17 @@ class _NativeLLMResident:
                 if delta > 0:
                     self._observed_vram_bytes = max(self._observed_vram_bytes, delta)
                     self._accounted_size = self._observed_vram_bytes
+                _record_vram_highwater(self.signature_id, diag, self.load_device.index)
+                self._observed_vram_bytes = max(
+                    self._observed_vram_bytes,
+                    _vram_highwater_bytes(self.signature_id, self.load_device.index),
+                )
                 diag["observed_vram_bytes"] = int(self._observed_vram_bytes)
                 diag["observed_vram_mib"] = round(self._observed_vram_bytes / _MIB, 1)
                 diag["next_reload_target_bytes"] = int(self.preload_target_bytes()[0])
+                lease_preview = _lease_plan_preview(self.preload_target_bytes()[0])
+                diag["next_reload_lease_free_target_bytes"] = int(lease_preview.get("free_target_bytes") or 0)
+                diag["next_reload_lease_free_target_mib"] = round(float(lease_preview.get("free_target_bytes") or 0) / _MIB, 1)
                 diag["next_reload_target_mib"] = round(self.preload_target_bytes()[0] / _MIB, 1)
                 diag["next_reload_target_source"] = self.preload_target_bytes()[1]
             else:
@@ -4349,24 +4270,20 @@ class LocalGGUFLLM:
                 was_resident = resident_ctl.llm is not None
 
             managed_preload_memory = {
-                "policy": "thin-native-auto-yield-v7-runtime-floor",
+                "policy": "native-gpu-lease-v1",
                 "signature_id": resident_ctl.signature_id,
-                "requested_release_bytes": 0,
-                "free_before_bytes": None,
-                "free_after_bytes": None,
-                "comfyui_release_called": False,
                 "strategy": "none",
                 "aimdo": _aimdo_enabled(),
                 "registered_with_comfyui_loaded_models": False,
             }
             handoff_started = time.perf_counter()
-            if not was_resident and int(gpu_layers) != 0:
+            if not was_resident and _native_cuda_expected(estimated_vram, load_kwargs):
                 try:
                     import torch
                     if torch.cuda.is_available():
                         target = torch.device("cuda", int(main_gpu_index))
                         reserve, reserve_source = resident_ctl.preload_target_bytes()
-                        managed_preload_memory["requested_release_bytes"] = reserve
+                        managed_preload_memory["runtime_target_bytes"] = reserve
                         managed_preload_memory["target_source"] = reserve_source
                         managed_preload_memory["estimated_vram_bytes"] = int(estimated_vram)
                         managed_preload_memory["observed_vram_bytes"] = int(resident_ctl.observed_vram_bytes)
@@ -4379,28 +4296,11 @@ class LocalGGUFLLM:
                             observed_mib=resident_ctl.observed_vram_bytes / _MIB if resident_ctl.observed_vram_bytes else None,
                         )
                         room = _request_comfyui_room(mm, reserve, target)
-                        managed_preload_memory.update({
-                            "free_before_bytes": room.get("free_before_bytes"),
-                            "free_after_bytes": room.get("free_after_bytes"),
-                            "comfyui_release_called": bool(room.get("release_called")),
-                            "strategy": room.get("strategy", "none"),
-                            "aimdo": bool(room.get("aimdo")),
-                            "room_details": copy.deepcopy(room),
-                            "room_satisfied": bool(room.get("satisfied")),
-                            "remaining_shortfall_bytes": int(room.get("remaining_shortfall_bytes") or 0),
-                        })
+                        managed_preload_memory.update(copy.deepcopy(room))
+                        managed_preload_memory["room_details"] = copy.deepcopy(room)
+                        managed_preload_memory["room_satisfied"] = bool(room.get("satisfied"))
                         if not room.get("satisfied", False):
-                            shortfall = int(room.get("remaining_shortfall_bytes") or 0)
-                            raw_after = room.get("raw_free_after_bytes")
-                            raw_after_text = f"{float(raw_after) / _MIB:.1f}" if raw_after is not None else "unknown"
-                            managed_preload_memory["fatal_room_error"] = (
-                                "Local GGUF LLM could not secure enough driver-visible VRAM before native load: "
-                                f"target={reserve / _MIB:.1f} MiB, "
-                                f"release_request={float(room.get('release_request_bytes') or reserve) / _MIB:.1f} MiB, "
-                                f"raw_free_after={raw_after_text} MiB, shortfall={shortfall / _MIB:.1f} MiB, "
-                                f"tolerance={float(room.get('verification_tolerance_bytes') or 0) / _MIB:.1f} MiB. "
-                                "ComfyUI/AIMDO remained materially below the safe runtime target; native llama.cpp load was not attempted."
-                            )
+                            managed_preload_memory["fatal_room_error"] = _vram_room_failure_message(room)
                 except Exception as e:
                     managed_preload_memory["error"] = str(e)
                     managed_preload_memory.setdefault(
@@ -4453,59 +4353,71 @@ class LocalGGUFLLM:
                 # current_loaded_models list. This mirrors a long-running external
                 # llama.cpp/KoboldCPP process: once loaded, the model/context and KV
                 # allocations remain alive and ComfyUI simply observes less
-                # device-wide free VRAM. We only ask ComfyUI to release its own
-                # cached models before the FIRST native allocation when the current
-                # free-VRAM snapshot is clearly below our conservative estimate.
+                # device-wide free VRAM. Every fresh native allocation (including
+                # Unload After Run and a driver-managed reload after GPU handoff)
+                # establishes verified driver-visible clearance first.
                 preload_memory = {
-                    "policy": "conditional-first-load-only-v3",
-                    "requested_release_bytes": 0,
-                    "free_before_bytes": None,
-                    "free_after_bytes": None,
-                    "comfyui_release_called": False,
+                    "policy": "native-gpu-lease-v1",
                     "strategy": "none",
                     "aimdo": _aimdo_enabled(),
                 }
-                if int(gpu_layers) != 0 and model_retention == "Persistent (Driver Managed)":
+                if _native_cuda_expected(estimated_vram, load_kwargs) and model_retention in {"Persistent (Driver Managed)", "Unload After Run"}:
                     try:
                         import torch
                         import comfy.model_management as mm
                         if torch.cuda.is_available():
-                            target = torch.device("cuda", int(main_gpu_index))
-                            # The estimator already includes native/KV/vision overhead.
-                            # Do not stack ComfyUI's inference reserve on top of an
-                            # unrelated llama.cpp native allocation.
-                            reserve = int(estimated_vram)
-                            preload_memory["requested_release_bytes"] = reserve
-                            preload_memory["target_source"] = "first-load-estimate"
-                            _perf_log(
-                                "native preload VRAM target",
-                                source="first-load-estimate",
-                                target_mib=reserve / _MIB,
-                                estimated_mib=estimated_vram / _MIB,
-                            )
-                            room = _request_comfyui_room(mm, reserve, target)
-                            preload_memory.update({
-                                "free_before_bytes": room.get("free_before_bytes"),
-                                "free_after_bytes": room.get("free_after_bytes"),
-                                "comfyui_release_called": bool(room.get("release_called")),
-                                "strategy": room.get("strategy", "none"),
-                                "aimdo": bool(room.get("aimdo")),
-                                "room_details": copy.deepcopy(room),
-                                "room_satisfied": bool(room.get("satisfied")),
-                                "remaining_shortfall_bytes": int(room.get("remaining_shortfall_bytes") or 0),
-                            })
-                            if not room.get("satisfied", False):
-                                shortfall = int(room.get("remaining_shortfall_bytes") or 0)
-                                raw_after = room.get("raw_free_after_bytes")
-                                raw_after_text = f"{float(raw_after) / _MIB:.1f}" if raw_after is not None else "unknown"
-                                preload_memory["fatal_room_error"] = (
-                                    "Local GGUF LLM could not secure enough driver-visible VRAM before native load: "
-                                    f"target={reserve / _MIB:.1f} MiB, "
-                                    f"release_request={float(room.get('release_request_bytes') or reserve) / _MIB:.1f} MiB, "
-                                    f"raw_free_after={raw_after_text} MiB, shortfall={shortfall / _MIB:.1f} MiB, "
-                                    f"tolerance={float(room.get('verification_tolerance_bytes') or 0) / _MIB:.1f} MiB. "
-                                    "ComfyUI/AIMDO remained materially below the safe runtime target; native llama.cpp load was not attempted."
+                            signature_id = _load_signature_id(load_key)
+                            participating = _participating_gpu_indices(split_mode, tensor_split_values, main_gpu_index)
+                            if len(participating) > 1:
+                                # Initial/reload multi-GPU distribution is not reliably inferable from
+                                # GGUF size alone (Layer/Row/Tensor split distributes weights, KV and
+                                # compute differently).  Do not invent per-device estimates: take an
+                                # explicit exclusive ComfyUI lease on every GPU llama.cpp may use.
+                                lease_mgr = GPUMemoryLeaseManager(mm, aimdo_enabled=_aimdo_enabled())
+                                multi_rooms = []
+                                for gpu_idx in participating:
+                                    gpu_room = lease_mgr.acquire_exclusive(torch.device("cuda", int(gpu_idx)))
+                                    gpu_room["gpu_index"] = int(gpu_idx)
+                                    multi_rooms.append(gpu_room)
+                                preload_memory.update({
+                                    "strategy": "exclusive-multi-gpu-lease",
+                                    "participating_gpus": list(participating),
+                                    "multi_gpu_leases": copy.deepcopy(multi_rooms),
+                                    "room_satisfied": all(bool(r.get("satisfied")) for r in multi_rooms),
+                                })
+                                if not preload_memory["room_satisfied"]:
+                                    failed = next((r for r in multi_rooms if not r.get("satisfied")), multi_rooms[-1])
+                                    preload_memory["fatal_room_error"] = _vram_room_failure_message(failed)
+                                _perf_log(
+                                    "native multi-GPU exclusive lease",
+                                    signature=signature_id,
+                                    gpus=",".join(map(str, participating)),
+                                    satisfied=preload_memory["room_satisfied"],
+                                    retention=model_retention,
                                 )
+                            else:
+                                target = torch.device("cuda", int(main_gpu_index))
+                                prior_observed = _vram_highwater_bytes(signature_id, main_gpu_index)
+                                reserve, reserve_source = _reload_vram_target_bytes(estimated_vram, prior_observed)
+                                preload_memory["runtime_target_bytes"] = reserve
+                                preload_memory["target_source"] = reserve_source
+                                preload_memory["observed_vram_bytes"] = int(prior_observed)
+                                _perf_log(
+                                    "native preload VRAM target",
+                                    signature=signature_id,
+                                    source=reserve_source,
+                                    target_mib=reserve / _MIB,
+                                    lease_free_target_mib=_lease_plan_preview(reserve).get("free_target_bytes", reserve) / _MIB,
+                                    estimated_mib=estimated_vram / _MIB,
+                                    observed_mib=prior_observed / _MIB if prior_observed else None,
+                                    retention=model_retention,
+                                )
+                                room = _request_comfyui_room(mm, reserve, target)
+                                preload_memory.update(copy.deepcopy(room))
+                                preload_memory["room_details"] = copy.deepcopy(room)
+                                preload_memory["room_satisfied"] = bool(room.get("satisfied"))
+                                if not room.get("satisfied", False):
+                                    preload_memory["fatal_room_error"] = _vram_room_failure_message(room)
                     except Exception as e:
                         preload_memory["error"] = str(e)
                         preload_memory.setdefault(
@@ -4528,8 +4440,20 @@ class LocalGGUFLLM:
                     raise
                 load_diagnostics = dict(load_diagnostics or {})
                 load_diagnostics["speculative"] = copy.deepcopy(speculative_info)
-                if model_retention == "Persistent (Driver Managed)":
-                    load_diagnostics = dict(load_diagnostics or {})
+                signature_id = _load_signature_id(load_key)
+                _record_vram_highwater(signature_id, load_diagnostics, main_gpu_index)
+                observed_highwater = _vram_highwater_bytes(signature_id, main_gpu_index)
+                next_target, next_target_source = _reload_vram_target_bytes(estimated_vram, observed_highwater)
+                load_diagnostics["signature_id"] = signature_id
+                load_diagnostics["observed_vram_bytes"] = int(observed_highwater)
+                load_diagnostics["observed_vram_mib"] = round(observed_highwater / _MIB, 1)
+                load_diagnostics["next_reload_target_bytes"] = int(next_target)
+                load_diagnostics["next_reload_target_mib"] = round(next_target / _MIB, 1)
+                load_diagnostics["next_reload_target_source"] = next_target_source
+                next_lease_preview = _lease_plan_preview(next_target)
+                load_diagnostics["next_reload_lease_free_target_bytes"] = int(next_lease_preview.get("free_target_bytes") or 0)
+                load_diagnostics["next_reload_lease_free_target_mib"] = round(float(next_lease_preview.get("free_target_bytes") or 0) / _MIB, 1)
+                if model_retention in {"Persistent (Driver Managed)", "Unload After Run"}:
                     load_diagnostics["preload_memory"] = preload_memory
                 with _MODEL_LOCK:
                     _MODEL_CACHE.update({

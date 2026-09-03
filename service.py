@@ -52,6 +52,7 @@ from .nodes import (
 from .gguf_meta import detect_family, recommended_model_preset, available_model_presets
 from .presets import MEMORY_PRESETS, MODEL_PRESETS, capabilities_for_family, public_presets
 from .version import PACKAGE_VERSION, BRIDGE_API_VERSION, VRAM_POLICY_VERSION, VRAM_COORDINATION_MODE
+from .vram_coordination import GPUMemoryLeaseManager
 
 log = logging.getLogger(__name__)
 
@@ -1710,20 +1711,23 @@ class LocalLLMServiceManager:
                 )
                 room = preload.get("room_details") or {}
                 self._log(
-                    "PERF handoff: "
-                    f"target={float(preload.get('requested_release_bytes') or 0) / (1024*1024):.1f}MiB "
+                    "PERF GPU lease: "
+                    f"runtime={float(room.get('runtime_target_bytes') or preload.get('runtime_target_bytes') or 0) / (1024*1024):.1f}MiB • "
+                    f"headroom={float(room.get('headroom_bytes') or preload.get('headroom_bytes') or 0) / (1024*1024):.1f}MiB • "
+                    f"free_target={float(room.get('free_target_bytes') or preload.get('free_target_bytes') or 0) / (1024*1024):.1f}MiB • "
+                    f"request={float(room.get('request_target_bytes') or preload.get('request_target_bytes') or 0) / (1024*1024):.1f}MiB "
                     f"source={preload.get('target_source', 'n/a')} • "
                     f"estimated={float(preload.get('estimated_vram_bytes') or 0) / (1024*1024):.1f}MiB • "
                     f"observed={float(preload.get('observed_vram_bytes') or gpu_backend.get('observed_vram_bytes') or 0) / (1024*1024):.1f}MiB • "
                     f"raw_before={float(room.get('raw_free_before_bytes') or 0) / (1024*1024):.1f}MiB • "
+                    f"raw_after_cleanup={float(room.get('raw_free_after_cleanup_bytes') or 0) / (1024*1024):.1f}MiB • "
                     f"raw_after={float(room.get('raw_free_after_bytes') or 0) / (1024*1024):.1f}MiB • "
+                    f"strategy={room.get('strategy', 'none')} • "
+                    f"cooperative={bool(room.get('cooperative_eviction_called', False))} • "
+                    f"exclusive={bool(room.get('exclusive_eviction_called', False))} • "
+                    f"cache_flush={bool(room.get('soft_cache_flush_called', False))} • "
                     f"satisfied={bool(room.get('satisfied', True))} • "
-                    f"shortfall={float(room.get('remaining_shortfall_bytes') or 0) / (1024*1024):.1f}MiB • "
-                    f"reclaimable={float(room.get('torch_reclaimable_before_bytes') or 0) / (1024*1024):.1f}MiB • "
-                    f"cache_probe={'skipped' if room.get('cache_probe_skipped') else ('run' if room.get('cache_probe_called') else 'not-needed')} • "
-                    f"sync={float(room.get('pre_release_sync_seconds') or 0):.3f}s • "
-                    f"evict={float(room.get('release_seconds') or 0):.3f}s • "
-                    f"cache_flush={float(room.get('cache_probe_seconds') or room.get('soft_empty_cache_seconds') or 0):.3f}s"
+                    f"lease_time={float(room.get('elapsed_seconds') or 0):.3f}s"
                 )
                 self._log(
                     "PERF GGUF load I/O: "
@@ -1889,6 +1893,27 @@ class LocalLLMServiceManager:
         reload_target, reload_target_source = _reload_vram_target_bytes(
             base_total, measured if measured_applies else 0
         )
+        try:
+            import comfy.model_management as mm
+            import comfy.memory_management as cmm
+            lease_plan = GPUMemoryLeaseManager(
+                mm, aimdo_enabled=bool(getattr(cmm, "aimdo_enabled", False))
+            ).plan(reload_target).as_dict()
+        except Exception:
+            lease_plan = {
+                "runtime_target_bytes": int(reload_target),
+                "headroom_bytes": 1024 * 1024 * 1024,
+                "free_target_bytes": int(reload_target + 1024 * 1024 * 1024),
+                "request_target_bytes": int(reload_target + 1024 * 1024 * 1024),
+            }
+        reload_lease_free_target = int(lease_plan.get("free_target_bytes") or reload_target)
+        try:
+            vision_plan = GPUMemoryLeaseManager(
+                mm, aimdo_enabled=bool(getattr(cmm, "aimdo_enabled", False))
+            ).plan(total_with_vision).as_dict()
+            vision_lease_free_target = int(vision_plan.get("free_target_bytes") or total_with_vision)
+        except Exception:
+            vision_lease_free_target = int(total_with_vision + 1024 * 1024 * 1024)
 
         # Current free VRAM already excludes a resident LLM.  If the same saved
         # configuration is resident, its projected base headroom is therefore the
@@ -1904,8 +1929,8 @@ class LocalLLMServiceManager:
             vision_headroom = int(raw_free + release_credit - total_with_vision) if vision_bytes > 0 else int(raw_free)
         else:
             available_after_old_close = int(raw_free + release_credit)
-            base_headroom = int(available_after_old_close - base_total)
-            vision_headroom = int(available_after_old_close - total_with_vision)
+            base_headroom = int(available_after_old_close - reload_lease_free_target)
+            vision_headroom = int(available_after_old_close - vision_lease_free_target)
 
         headroom = vision_headroom if vision_bytes > 0 else base_headroom
         warning = None
@@ -1942,6 +1967,9 @@ class LocalLLMServiceManager:
             "saved_settings_match": bool(saved_settings_match),
             "reload_target_bytes": int(reload_target),
             "reload_target_source": reload_target_source,
+            "reload_lease_free_target_bytes": int(reload_lease_free_target),
+            "reload_lease_headroom_bytes": int(lease_plan.get("headroom_bytes") or 0),
+            "reload_lease_request_target_bytes": int(lease_plan.get("request_target_bytes") or reload_lease_free_target),
             "projected_base_headroom_bytes": base_headroom,
             "projected_vision_headroom_bytes": vision_headroom,
             "projected_headroom_bytes": headroom,

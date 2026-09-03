@@ -18,7 +18,7 @@ import folder_paths
 
 log = logging.getLogger(__name__)
 
-NODE_VERSION = "0.6.27-alpha"
+NODE_VERSION = "0.6.28-alpha"
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_DIR = PACKAGE_DIR / "templates" / "default"
 USER_TEMPLATE_DIR = Path(folder_paths.models_dir) / "LLM" / "local_LLM_presets" / "prompt_enhancer"

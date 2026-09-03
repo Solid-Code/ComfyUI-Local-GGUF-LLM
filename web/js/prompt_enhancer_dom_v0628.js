@@ -2,7 +2,7 @@ import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
 const EXTENSION_NAME = "LocalLLM.PromptEnhancer";
-const FRONTEND_VERSION = "0.6.27-alpha";
+const FRONTEND_VERSION = "0.6.28-alpha";
 console.info(`[Local LLM Prompt Enhancer] frontend ${FRONTEND_VERSION}`);
 const NODE_CLASS = "LocalLLMPromptEnhancer";
 const DEFAULT_PRESET = "Default / Krea 2 - Image";
@@ -1543,15 +1543,16 @@ function normalizeTextareaHeight(value) {
   return Math.max(80, Math.min(1600, Math.round(n)));
 }
 
-function textareaHeightSnapshot(node) {
+function textareaHeightStateSnapshot(node) {
+  // Only explicitly user-resized textarea heights are state. Never infer state
+  // from live DOM geometry here: ResizeObserver/layout/remount passes can report
+  // transient heights while ComfyUI is restoring a graph, switching workflows,
+  // changing zoom, or settling a DOM widget. Persisting those measurements is
+  // what caused textareas to grow unexpectedly on page/workflow load.
   const prior = node?.__promptEnhancerTextareaHeights || {};
-  const controls = node?.__promptEnhancerPanelControls || {};
   const result = {};
   for (const key of TEXTAREA_KEYS) {
-    const element = controls[key];
-    const measured = normalizeTextareaHeight(element?.getBoundingClientRect?.().height || element?.offsetHeight);
-    const fallback = normalizeTextareaHeight(prior[key]);
-    const value = measured || fallback;
+    const value = normalizeTextareaHeight(prior[key]);
     if (value) result[key] = value;
   }
   return result;
@@ -1580,19 +1581,51 @@ function applyTextareaHeights(node, heights, { schedule = true } = {}) {
   if (schedule) scheduleDomPanelHeight(node);
 }
 
-function captureTextareaHeights(node) {
-  if (!node || node.__promptEnhancerApplyingTextareaHeights || !node.__promptEnhancerPanelControls) return;
-  const next = textareaHeightSnapshot(node);
+function commitUserTextareaHeight(node, key, element) {
+  if (!node || !TEXTAREA_KEYS.includes(key) || !element || node.__promptEnhancerApplyingTextareaHeights) return false;
+  const measured = normalizeTextareaHeight(element?.getBoundingClientRect?.().height || element?.offsetHeight);
+  if (!measured) return false;
   const previous = node.__promptEnhancerTextareaHeights || {};
-  const changed = TEXTAREA_KEYS.some((key) => Number(next[key] || 0) !== Number(previous[key] || 0));
-  if (!changed) return;
-  node.__promptEnhancerTextareaHeights = next;
+  if (Number(previous[key] || 0) === measured) return false;
+  node.__promptEnhancerTextareaHeights = { ...previous, [key]: measured };
   persistEnhancementState(node);
   markWorkflowChanged(node);
   scheduleDomPanelHeight(node);
+  return true;
 }
 
-const PERSISTENCE_STATE_VERSION = 2;
+function installTextareaUserResizePersistence(node, controls) {
+  if (!node || !controls) return;
+  for (const key of TEXTAREA_KEYS) {
+    const element = controls[key];
+    if (!element || element.__promptEnhancerUserResizePersistenceInstalled) continue;
+    element.__promptEnhancerUserResizePersistenceInstalled = true;
+    element.addEventListener("pointerdown", (event) => {
+      if (event.button !== undefined && event.button !== 0) return;
+      const startHeight = normalizeTextareaHeight(element?.getBoundingClientRect?.().height || element?.offsetHeight);
+      const pointerId = event.pointerId;
+      const finish = (finishEvent) => {
+        if (pointerId !== undefined && finishEvent?.pointerId !== undefined && finishEvent.pointerId !== pointerId) return;
+        window.removeEventListener("pointerup", finish, true);
+        window.removeEventListener("pointercancel", finish, true);
+        requestAnimationFrame(() => {
+          const endHeight = normalizeTextareaHeight(element?.getBoundingClientRect?.().height || element?.offsetHeight);
+          // A normal click/selection gesture leaves height unchanged. A native
+          // textarea resize gesture changes the rendered height, so only that
+          // case is persisted. Layout-only ResizeObserver events never enter
+          // this path and therefore can no longer corrupt saved textbox sizes.
+          if (endHeight && startHeight && Math.abs(endHeight - startHeight) >= 2) {
+            commitUserTextareaHeight(node, key, element);
+          }
+        });
+      };
+      window.addEventListener("pointerup", finish, true);
+      window.addEventListener("pointercancel", finish, true);
+    }, { passive: true });
+  }
+}
+
+const PERSISTENCE_STATE_VERSION = 3;
 const PERSISTENCE_STATE_KEY = "local_llm_prompt_enhancer_state";
 
 function ensurePromptEnhancerInstanceId(node, { forceNew = false } = {}) {
@@ -1672,7 +1705,7 @@ function enhancementStateSnapshot(node) {
     seed,
     seedControl: control ? String(control.value ?? "") : "",
     enhanceWithWorkflow: !!widget(node, "enhance_with_workflow")?.value,
-    textareaHeights: textareaHeightSnapshot(node),
+    textareaHeights: textareaHeightStateSnapshot(node),
   };
 }
 
@@ -1758,6 +1791,11 @@ function restoreEnhancementState(node, stateOverride = null) {
   const rawVersion = Number(raw?.version ?? 1);
   if (!raw || typeof raw !== "object" || rawVersion < 1 || rawVersion > PERSISTENCE_STATE_VERSION) return false;
   const state = clonePersistenceState(raw);
+  // v1/v2 inferred textarea heights from live DOM measurements, so they may
+  // contain load/remount artifacts rather than an intentional user resize.
+  // Reset them once on migration. From v3 onward heights are persisted only
+  // after a real pointer resize gesture.
+  if (rawVersion < 3) state.textareaHeights = {};
   if (!state.instanceId) state.instanceId = ensurePromptEnhancerInstanceId(node);
   node.__promptEnhancerInstanceId = state.instanceId;
   node.__promptEnhancerRuntimeRevision = Math.max(0, Math.trunc(Number(state.runtimeRevision) || 0));
@@ -3233,7 +3271,12 @@ function createPromptEnhancerDomPanel(node) {
   node.__promptEnhancerPanelControls = controls;
   node.__promptEnhancerPanelRoot = root;
   node.__promptEnhancerPanelContent = content;
-  applyTextareaHeights(node, node.__promptEnhancerTextareaHeights || node?.properties?.[PERSISTENCE_STATE_KEY]?.textareaHeights, { schedule: false });
+  const persistedTextareaState = node?.properties?.[PERSISTENCE_STATE_KEY];
+  const trustedPersistedTextareaHeights = Number(persistedTextareaState?.version || 0) >= 3
+    ? persistedTextareaState?.textareaHeights
+    : null;
+  applyTextareaHeights(node, node.__promptEnhancerTextareaHeights || trustedPersistedTextareaHeights, { schedule: false });
+  installTextareaUserResizePersistence(node, controls);
 
   const panelHeight = () => measureDomPanelHeight(node);
   const domWidget = node.addDOMWidget("prompt_enhancer_panel", "prompt_enhancer_panel", root, {
@@ -3264,7 +3307,10 @@ function createPromptEnhancerDomPanel(node) {
     node.__promptEnhancerPanelResizeObserver = observer;
 
     const textareaObserver = new ResizeObserver(() => {
-      captureTextareaHeights(node);
+      // Textarea geometry changes can be caused by workflow remounting, node
+      // width changes, zoom, CSS, or an actual user drag. ResizeObserver is only
+      // a layout signal; it must never decide what gets persisted.
+      scheduleDomPanelHeight(node);
       controls.prompt.__promptEnhancerSyncWheelCapture?.();
       controls.enhanced.__promptEnhancerSyncWheelCapture?.();
       controls.instructions.__promptEnhancerSyncWheelCapture?.();
