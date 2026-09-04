@@ -291,6 +291,51 @@ def _find_local_llm_service():
     return candidates[0][2]
 
 
+
+def _pending_comfy_queue_count() -> int | None:
+    """Return the number of ComfyUI jobs waiting behind the current one.
+
+    Prompt Enhancer executes its manual batch as one targeted ComfyUI queue
+    item. While that item is running, pending jobs are exactly the work that
+    needs a deterministic native-LLM handoff before this item returns. If the
+    queue cannot be inspected, return None so callers fail safe and hand off.
+    """
+    try:
+        from server import PromptServer
+        server = getattr(PromptServer, "instance", None)
+        queue = getattr(server, "prompt_queue", None)
+        if queue is None:
+            return None
+        getter = getattr(queue, "get_current_queue_volatile", None)
+        if not callable(getter):
+            getter = getattr(queue, "get_current_queue", None)
+        if not callable(getter):
+            return None
+        _running, pending = getter()
+        return len(pending or [])
+    except Exception:
+        return None
+
+
+def _handoff_after_enhancer_batch(service, *, reason: str) -> bool:
+    """Yield immediately only when another ComfyUI job is already waiting.
+
+    When the queue is empty, leaving the resident context hot is safe in Auto
+    Yield mode: any later GPU-heavy ComfyUI load crosses the existing free_memory
+    pressure hook and acquires native ownership there. If queue inspection fails,
+    preserve the older fail-safe behavior and hand off unconditionally.
+    """
+    pending = _pending_comfy_queue_count()
+    if pending == 0:
+        log.info("[Local LLM Prompt Enhancer] Handoff decision: pending=0 -> keep resident GGUF hot")
+        return False
+    if pending is None:
+        log.info("[Local LLM Prompt Enhancer] Handoff decision: queue state unavailable -> fail-safe GPU handoff (%s)", reason)
+    else:
+        log.info("[Local LLM Prompt Enhancer] Handoff decision: pending=%d -> GPU handoff (%s)", int(pending), reason)
+    service.gpu_handoff(reason=reason)
+    return True
+
 def _find_local_llm_export(name: str):
     """Safely find a named export from the loaded Local GGUF extension."""
     candidates: list[tuple[int, str, Any]] = []
@@ -748,6 +793,7 @@ def _run_enhancement(
         # driver-managed/Keep Resident configurations.
         if bool(yield_after):
             try:
+                log.info("[Local LLM Prompt Enhancer] Manual enhance requested deterministic post-call GPU handoff")
                 service.gpu_handoff(reason="prompt-enhancer-complete")
             except Exception as suspend_exc:
                 log.warning(
@@ -1454,7 +1500,7 @@ class LocalLLMPromptEnhancer:
                     _end_batch(batch_id)
                 try:
                     service = _find_local_llm_service()
-                    service.gpu_handoff(reason="prompt-enhancer-batch-complete")
+                    _handoff_after_enhancer_batch(service, reason="prompt-enhancer-batch-complete")
                 except Exception as suspend_exc:
                     log.warning(
                         "[Local LLM Prompt Enhancer] In-job post-batch GPU handoff failed: %s",
@@ -1688,7 +1734,11 @@ try:
             if ended:
                 try:
                     service = _find_local_llm_service()
-                    await asyncio.to_thread(service.gpu_handoff, "prompt-enhancer-batch-complete")
+                    await asyncio.to_thread(
+                        _handoff_after_enhancer_batch,
+                        service,
+                        reason="prompt-enhancer-batch-complete",
+                    )
                 except Exception as suspend_exc:
                     log.warning(
                         "[Local LLM Prompt Enhancer] Post-batch GPU handoff failed: %s",

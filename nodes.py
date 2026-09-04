@@ -277,6 +277,28 @@ def _raw_cuda_free_bytes(device):
         return None
 
 
+def _comfy_request_needs_native_yield(mm, device, memory_required, raw_free=None):
+    """Return (needs_yield, raw_free, comfy_logical_free, torch_slack).
+
+    ComfyUI free_memory() uses get_free_memory(), whose CUDA result is raw driver
+    free plus inactive bytes reserved by PyTorch. Match that exact admission
+    semantic before evicting the external llama.cpp owner. The raw probe stays
+    first because it is the cheap common path and avoids allocator statistics
+    when physical free VRAM already covers the request.
+    """
+    needed = max(0, int(float(memory_required or 0)))
+    if raw_free is None:
+        raw_free = _raw_cuda_free_bytes(device)
+    if raw_free is not None and needed <= int(raw_free):
+        return False, raw_free, int(raw_free), 0
+    # Preserve the v0.18.65 yield decision exactly; the extra breakdown below
+    # is telemetry only and must not influence whether the native context yields.
+    comfy_free = _comfy_free_bytes(mm, device) if device is not None else 0
+    breakdown = _comfy_memory_breakdown(mm, device) if device is not None else {}
+    torch_slack = int(breakdown.get("torch_reclaimable_bytes") or 0)
+    return needed > int(comfy_free or 0), raw_free, int(comfy_free or 0), torch_slack
+
+
 def _comfy_memory_breakdown(mm, device):
     """Return ComfyUI total-free, reclaimable torch cache, and raw driver free bytes.
 
@@ -549,26 +571,61 @@ def _install_comfy_llm_yield_hook(mm):
                 same_device = resident and (device is None or _same_cuda_device(device, resident_ctl.load_device))
                 needed = max(0, int(float(memory_required or 0)))
                 target_device = resident_ctl.load_device if device is None and resident else device
-                comfy_free = _comfy_free_bytes(mm, target_device) if target_device is not None else 0
                 raw_free = _raw_cuda_free_bytes(target_device) if target_device is not None else None
-                # Native llama.cpp needs driver-visible VRAM. Use raw CUDA free
-                # memory when available so reclaimable PyTorch allocator cache
-                # does not hide a real shortfall while the LLM is resident.
-                effective_free = raw_free if raw_free is not None else comfy_free
-                if same_device and needed > int(effective_free or 0):
+                # Preserve ComfyUI's own free-memory semantics while keeping the
+                # common path cheap. If raw CUDA free already covers the request,
+                # no allocator-stat query is needed. Only when raw is short do we
+                # ask ComfyUI for its logical free value (raw + inactive PyTorch
+                # allocator bytes). A ComfyUI free_memory() request that fits in
+                # that logical value does not require evicting the external LLM.
+                should_yield = False
+                comfy_free = 0
+                torch_slack = 0
+                if same_device:
+                    should_yield, raw_free, comfy_free, torch_slack = _comfy_request_needs_native_yield(
+                        mm, target_device, needed, raw_free=raw_free
+                    )
+                    if not should_yield and raw_free is not None and needed > int(raw_free):
+                        _perf_log(
+                            "ComfyUI memory request kept native LLM",
+                            signature=resident_ctl.signature_id,
+                            decision="logical-free-covered",
+                            required_mib=needed / _MIB,
+                            raw_free_mib=raw_free / _MIB,
+                            comfy_logical_free_mib=comfy_free / _MIB,
+                            torch_slack_mib=torch_slack / _MIB,
+                            logical_margin_mib=(comfy_free - needed) / _MIB,
+                        )
+                if should_yield:
                     log_original_timing = True
                     _COMFY_YIELD_HOOK_TLS.active = True
                     try:
+                        op = _native_operation_snapshot()
+                        try:
+                            import traceback
+                            frames = traceback.extract_stack(limit=10)[:-1]
+                            caller = " <- ".join(f"{Path(f.filename).name}:{f.lineno}:{f.name}" for f in frames[-4:])
+                        except Exception:
+                            caller = "unknown"
                         _perf_log(
                             "ComfyUI memory pressure -> native LLM yield",
                             signature=resident_ctl.signature_id,
                             required_mib=needed / _MIB,
                             raw_free_before_mib=(raw_free / _MIB) if raw_free is not None else None,
-                            comfy_free_before_mib=comfy_free / _MIB,
+                            comfy_logical_free_before_mib=comfy_free / _MIB,
+                            torch_slack_before_mib=torch_slack / _MIB,
+                            raw_shortfall_mib=((needed - raw_free) / _MIB) if raw_free is not None else None,
+                            logical_shortfall_mib=max(0, needed - comfy_free) / _MIB,
+                            native_owner=op.get("label"),
+                            native_waiters=op.get("waiters"),
+                            for_dynamic=kwargs.get("for_dynamic"),
+                            pins_required=kwargs.get("pins_required"),
+                            caller=caller,
                         )
-                        sync_started = time.perf_counter()
-                        _sync_cuda_device(resident_ctl.load_device)
-                        sync_seconds = time.perf_counter() - sync_started
+                        # _unload_native() acquires the process-global native-operation
+                        # gate and the llama.cpp context destructor synchronizes its own
+                        # pending work before release.  A separate pre-close device-wide
+                        # synchronize here only stalls unrelated CUDA streams.
                         freed = int(resident_ctl._unload_native(
                             reason="comfy-memory-pressure",
                             required_free_bytes=needed,
@@ -582,7 +639,6 @@ def _install_comfy_llm_yield_hook(mm):
                         _perf_log(
                             "native LLM pre-yield complete",
                             signature=resident_ctl.signature_id,
-                            sync_s=sync_seconds,
                             accounted_mib=freed / _MIB,
                             hook_s=time.perf_counter() - hook_started,
                         )
@@ -594,17 +650,22 @@ def _install_comfy_llm_yield_hook(mm):
             result = original(memory_required, device, *args, **kwargs)
             original_seconds = time.perf_counter() - original_started
             if log_original_timing:
-                # This hook is the native->ComfyUI ownership transition. After
-                # ComfyUI has reclaimed memory, wait for its CUDA-side work too
-                # before control returns to the model/VBAR path that requested it.
-                post_comfy_sync_started = time.perf_counter()
-                _sync_cuda_device(target_device)
-                post_comfy_sync_seconds = time.perf_counter() - post_comfy_sync_started
+                # free_memory() synchronizes when it actually unloads models, and
+                # _unload_native() already established the native close boundary.
+                # Do not impose another unconditional device-wide sync here.
+                after_breakdown = _comfy_memory_breakdown(mm, target_device) if target_device is not None else {}
+                try:
+                    unloaded_count = len(result or [])
+                except Exception:
+                    unloaded_count = 0
                 _perf_log(
                     "ComfyUI free_memory complete after native LLM yield",
                     original_s=original_seconds,
-                    post_comfy_sync_s=post_comfy_sync_seconds,
                     total_hook_s=time.perf_counter() - hook_started,
+                    unloaded_count=unloaded_count,
+                    raw_free_after_mib=(after_breakdown.get("raw_free_bytes") / _MIB) if after_breakdown.get("raw_free_bytes") is not None else None,
+                    comfy_logical_free_after_mib=float(after_breakdown.get("comfy_free_bytes") or 0) / _MIB,
+                    torch_slack_after_mib=float(after_breakdown.get("torch_reclaimable_bytes") or 0) / _MIB,
                 )
             return result
 
@@ -628,8 +689,12 @@ def _request_comfyui_room(mm, required_bytes, device):
         request_target_mib=float(room.get("request_target_bytes") or 0) / _MIB,
         raw_before_mib=(float(raw_before) / _MIB) if raw_before is not None else None,
         raw_after_mib=(float(raw_after) / _MIB) if raw_after is not None else None,
+        cache_reclaim=bool(room.get("cache_reclaim_called")),
         cooperative=bool(room.get("cooperative_eviction_called")),
+        unloaded=int(room.get("cooperative_unloaded_count") or 0),
+        aimdo_cleanup=bool(room.get("aimdo_cleanup_called")),
         exclusive=bool(room.get("exclusive_eviction_called")),
+        final_sync=bool(room.get("final_sync_called")),
         satisfied=bool(room.get("satisfied")),
         total_s=float(room.get("elapsed_seconds") or 0.0),
     )
@@ -1361,6 +1426,9 @@ def _load_llama_verified(llama_cpp, Llama, load_kwargs, gpu_layers):
         "gpu_offload_verified": (total_delta >= 8 * _MIB) if requested_gpu else False,
         "vram_delta_bytes_by_gpu": {str(i): int(v) for i, v in deltas.items()},
         "vram_delta_mib_by_gpu": {str(i): round(v / _MIB, 1) for i, v in deltas.items()},
+        "vram_free_before_mib_by_gpu": {str(i): round(int(v.get("free") or 0) / _MIB, 1) for i, v in before.items()},
+        "vram_free_after_mib_by_gpu": {str(i): round(int(v.get("free") or 0) / _MIB, 1) for i, v in after.items()},
+        "vram_total_mib_by_gpu": {str(i): round(int(v.get("total") or 0) / _MIB, 1) for i, v in after.items()},
         "total_vram_delta_mib": round(total_delta / _MIB, 1),
         "llama_supports_gpu_offload_hint": support_hint,
         "llama_system_info": system_info,
@@ -2276,14 +2344,12 @@ class _NativeLLMResident:
                     except Exception:
                         pass
 
-            # If the unload path also touched PyTorch's allocator cache, bracket
-            # that cleanup as well. A second sync is normally near-zero when no
-            # extra work was queued, but gives AIMDO a deterministic handoff point.
+            # No second unconditional sync is needed here.  The native context
+            # destructor already synchronizes before freeing its buffers, and
+            # ComfyUI soft_empty_cache() performs its own synchronization when the
+            # fallback cache path is actually used.  Keep the field for log/schema
+            # compatibility.
             post_cleanup_sync_seconds = 0.0
-            if self.load_device.type == "cuda":
-                post_cleanup_sync_started = time.perf_counter()
-                _sync_cuda_device(self.load_device)
-                post_cleanup_sync_seconds = time.perf_counter() - post_cleanup_sync_started
 
             free_after = _raw_cuda_free_bytes(self.load_device) if self.load_device.type == "cuda" else None
             self._unload_count += 1
@@ -4183,7 +4249,7 @@ class LocalGGUFLLM:
             model_file_size = int(os.path.getsize(model_path))
         except Exception:
             model_file_size = 0
-        estimated_vram = _estimate_native_vram(
+        estimated_vram_components = _estimate_native_vram_components(
             model_path, mmproj_path, metadata, gpu_layers, context_size,
             kv_cache_k, kv_cache_v, kv_cache_location,
             n_batch=effective_prompt_batch_size,
@@ -4191,6 +4257,7 @@ class LocalGGUFLLM:
             flash_attention=flash_attention,
             speculative_mode=str(speculative_config.get("effective") or "Off"),
         )
+        estimated_vram = int(estimated_vram_components.get("total_bytes") or 0)
 
         # A change in allocation settings OR management mode invalidates the old
         # native context and its cached direct-reload signature.
@@ -4221,6 +4288,14 @@ class LocalGGUFLLM:
             mode=model_retention,
             load_needed=_load_needed,
             estimated_vram_mib=estimated_vram / _MIB,
+            weights_mib=int(estimated_vram_components.get("weights_bytes") or 0) / _MIB,
+            kv_mib=int(estimated_vram_components.get("kv_cache_bytes") or 0) / _MIB,
+            compute_mib=int(estimated_vram_components.get("compute_batch_bytes") or 0) / _MIB,
+            vision_mib=int(estimated_vram_components.get("vision_bytes") or 0) / _MIB,
+            speculative_mib=int(estimated_vram_components.get("speculative_bytes") or 0) / _MIB,
+            ctx=context_size,
+            n_batch=effective_prompt_batch_size,
+            n_ubatch=effective_memory_batch_size,
             gpu_layers=gpu_layers,
             main_gpu=main_gpu_index,
         )
@@ -4270,7 +4345,7 @@ class LocalGGUFLLM:
                 was_resident = resident_ctl.llm is not None
 
             managed_preload_memory = {
-                "policy": "native-gpu-lease-v1",
+                "policy": VRAM_COORDINATION_MODE,
                 "signature_id": resident_ctl.signature_id,
                 "strategy": "none",
                 "aimdo": _aimdo_enabled(),
@@ -4286,6 +4361,7 @@ class LocalGGUFLLM:
                         managed_preload_memory["runtime_target_bytes"] = reserve
                         managed_preload_memory["target_source"] = reserve_source
                         managed_preload_memory["estimated_vram_bytes"] = int(estimated_vram)
+                        managed_preload_memory["estimate_components"] = copy.deepcopy(estimated_vram_components)
                         managed_preload_memory["observed_vram_bytes"] = int(resident_ctl.observed_vram_bytes)
                         _perf_log(
                             "native preload VRAM target",
@@ -4357,7 +4433,7 @@ class LocalGGUFLLM:
                 # Unload After Run and a driver-managed reload after GPU handoff)
                 # establishes verified driver-visible clearance first.
                 preload_memory = {
-                    "policy": "native-gpu-lease-v1",
+                    "policy": VRAM_COORDINATION_MODE,
                     "strategy": "none",
                     "aimdo": _aimdo_enabled(),
                 }
@@ -4401,6 +4477,8 @@ class LocalGGUFLLM:
                                 reserve, reserve_source = _reload_vram_target_bytes(estimated_vram, prior_observed)
                                 preload_memory["runtime_target_bytes"] = reserve
                                 preload_memory["target_source"] = reserve_source
+                                preload_memory["estimated_vram_bytes"] = int(estimated_vram)
+                                preload_memory["estimate_components"] = copy.deepcopy(estimated_vram_components)
                                 preload_memory["observed_vram_bytes"] = int(prior_observed)
                                 _perf_log(
                                     "native preload VRAM target",

@@ -1708,6 +1708,7 @@ class LocalLLMServiceManager:
                     f"prompt={float(info.get('prompt_eval_seconds') or 0):.3f}s • "
                     f"decode={float(info.get('generation_seconds') or 0):.3f}s • "
                     f"prior_yield_close={float(last_unload.get('close_seconds') or 0):.3f}s"
+                    f"({last_unload.get('reason', 'none')})"
                 )
                 room = preload.get("room_details") or {}
                 self._log(
@@ -1716,19 +1717,142 @@ class LocalLLMServiceManager:
                     f"headroom={float(room.get('headroom_bytes') or preload.get('headroom_bytes') or 0) / (1024*1024):.1f}MiB • "
                     f"free_target={float(room.get('free_target_bytes') or preload.get('free_target_bytes') or 0) / (1024*1024):.1f}MiB • "
                     f"request={float(room.get('request_target_bytes') or preload.get('request_target_bytes') or 0) / (1024*1024):.1f}MiB "
+                    f"coop_request={float(room.get('cooperative_request_target_bytes') or 0) / (1024*1024):.1f}MiB "
+                    f"torch_slack={float(room.get('cooperative_torch_slack_bytes') or 0) / (1024*1024):.1f}MiB "
+                    f"coop_retry={float(room.get('cooperative_retry_request_target_bytes') or 0) / (1024*1024):.1f}MiB "
                     f"source={preload.get('target_source', 'n/a')} • "
                     f"estimated={float(preload.get('estimated_vram_bytes') or 0) / (1024*1024):.1f}MiB • "
                     f"observed={float(preload.get('observed_vram_bytes') or gpu_backend.get('observed_vram_bytes') or 0) / (1024*1024):.1f}MiB • "
                     f"raw_before={float(room.get('raw_free_before_bytes') or 0) / (1024*1024):.1f}MiB • "
-                    f"raw_after_cleanup={float(room.get('raw_free_after_cleanup_bytes') or 0) / (1024*1024):.1f}MiB • "
+                    f"raw_after_cache={float(room.get('raw_free_after_cache_bytes') or 0) / (1024*1024):.1f}MiB • "
+                    f"raw_after_coop={float(room.get('raw_free_after_cooperative_bytes') or 0) / (1024*1024):.1f}MiB • "
                     f"raw_after={float(room.get('raw_free_after_bytes') or 0) / (1024*1024):.1f}MiB • "
                     f"strategy={room.get('strategy', 'none')} • "
-                    f"cooperative={bool(room.get('cooperative_eviction_called', False))} • "
+                    f"cache_reclaim={bool(room.get('cache_reclaim_called', False))}({room.get('cache_reclaim_stage', 'none')}) • "
+                    f"cooperative={bool(room.get('cooperative_eviction_called', False))} "
+                    f"unloaded={int(room.get('cooperative_unloaded_count') or 0)} • "
+                    f"aimdo_cleanup={bool(room.get('aimdo_cleanup_called', False))} • "
                     f"exclusive={bool(room.get('exclusive_eviction_called', False))} • "
-                    f"cache_flush={bool(room.get('soft_cache_flush_called', False))} • "
+                    f"final_sync={bool(room.get('final_sync_called', False))} • "
                     f"satisfied={bool(room.get('satisfied', True))} • "
                     f"lease_time={float(room.get('elapsed_seconds') or 0):.3f}s"
                 )
+                # Detailed but compact lease telemetry. This is diagnostic-only:
+                # it exposes the accounting mismatch and stage costs without
+                # changing admission policy or adding per-token logging.
+                stages = room.get("stage_memory") or {}
+                timings = room.get("stage_timings_seconds") or {}
+                unloaded_models = room.get("unloaded_models") or {}
+
+                def _mib(v):
+                    return float(v or 0) / (1024 * 1024)
+
+                def _stage(name):
+                    value = stages.get(name) or {}
+                    models = value.get("loaded_models") or {}
+                    return (
+                        f"{name}[raw={_mib(value.get('raw_free_bytes')):.1f},"
+                        f"logical={_mib(value.get('comfy_logical_free_bytes')):.1f},"
+                        f"slack={_mib(value.get('torch_reclaimable_bytes')):.1f},"
+                        f"used={_mib(value.get('raw_used_bytes')):.1f},"
+                        f"models={int(models.get('same_device_count') or 0)}/{int(models.get('count') or 0)}]"
+                    )
+
+                if stages:
+                    ordered_names = [
+                        "before", "after_pre_cache", "after_cooperative",
+                        "after_cooperative_retry", "after_aimdo_cleanup",
+                        "after_aimdo_retry", "after_exclusive", "after_final_sync",
+                    ]
+                    present = [name for name in ordered_names if name in stages]
+                    self._log("PERF GPU accounting: " + " → ".join(_stage(name) for name in present))
+
+                    before_stage = stages.get("before") or {}
+                    coop_stage = stages.get("after_cooperative") or {}
+                    final_stage = stages.get("after_final_sync") or stages.get("after_exclusive") or stages.get("after_aimdo_retry") or stages.get("after_aimdo_cleanup") or coop_stage or before_stage
+                    self._log(
+                        "PERF GPU deltas: "
+                        f"target_shortfall_before={max(0.0, _mib(room.get('free_target_bytes')) - _mib(before_stage.get('raw_free_bytes'))):.1f}MiB • "
+                        f"logical_minus_raw_before={_mib(before_stage.get('logical_minus_raw_bytes')):.1f}MiB • "
+                        f"raw_gain_coop={(_mib(coop_stage.get('raw_free_bytes')) - _mib(before_stage.get('raw_free_bytes'))):.1f}MiB • "
+                        f"slack_delta_coop={(_mib(coop_stage.get('torch_reclaimable_bytes')) - _mib(before_stage.get('torch_reclaimable_bytes'))):.1f}MiB • "
+                        f"raw_gain_total={(_mib(final_stage.get('raw_free_bytes')) - _mib(before_stage.get('raw_free_bytes'))):.1f}MiB • "
+                        f"logical_margin_final={(_mib(final_stage.get('comfy_logical_free_bytes')) - _mib(room.get('free_target_bytes'))):.1f}MiB"
+                    )
+
+                if timings:
+                    timing_order = [
+                        "raw_probe", "comfy_probe", "cache_flush_pre-cooperative",
+                        "cooperative_free_memory", "cooperative_retry_free_memory",
+                        "aimdo_transient_cleanup", "aimdo_retry_free_memory",
+                        "exclusive_free_memory", "final_sync",
+                    ]
+                    timing_parts = [f"{name}={float(timings.get(name) or 0):.3f}s" for name in timing_order if name in timings]
+                    if timing_parts:
+                        self._log("PERF GPU stages: " + " • ".join(timing_parts))
+
+                if unloaded_models or stages:
+                    before_models = ((stages.get("before") or {}).get("loaded_models") or {})
+                    final_models = ((stages.get("after_final_sync") or stages.get("after_exclusive") or stages.get("after_aimdo_retry") or stages.get("after_aimdo_cleanup") or stages.get("after_cooperative_retry") or stages.get("after_cooperative") or {}).get("loaded_models") or {})
+                    model_parts = []
+                    if before_models.get("same_device_labels"):
+                        model_parts.append("before=" + ",".join(str(x) for x in before_models.get("same_device_labels") or []))
+                    for stage_name in ("cooperative", "cooperative_retry", "aimdo_retry", "exclusive"):
+                        labels = unloaded_models.get(stage_name) or []
+                        if labels:
+                            model_parts.append(stage_name + "_unloaded=" + ",".join(str(x) for x in labels))
+                    if final_models.get("same_device_labels"):
+                        model_parts.append("after=" + ",".join(str(x) for x in final_models.get("same_device_labels") or []))
+                    if model_parts:
+                        self._log("PERF GPU models: " + " • ".join(model_parts))
+
+                headroom_sources = room.get("headroom_sources") or {}
+                if headroom_sources:
+                    self._log(
+                        "PERF GPU policy inputs: "
+                        f"llama_margin={_mib(headroom_sources.get('llama_default_margin_bytes')):.1f}MiB • "
+                        f"comfy_reserved={_mib(headroom_sources.get('comfy_reserved_bytes')):.1f}MiB • "
+                        f"dynamic_headroom={_mib(headroom_sources.get('dynamic_vram_extra_headroom_bytes')):.1f}MiB • "
+                        f"configured_comfy={_mib(headroom_sources.get('configured_comfy_headroom_bytes')):.1f}MiB • "
+                        f"request_granularity={_mib(room.get('request_granularity_bytes')):.1f}MiB • "
+                        f"aimdo={bool(room.get('aimdo', False))}"
+                    )
+
+                estimate_components = preload.get("estimate_components") or {}
+                if estimate_components:
+                    self._log(
+                        "PERF VRAM estimate: "
+                        f"weights={_mib(estimate_components.get('weights_bytes')):.1f}MiB • "
+                        f"kv={_mib(estimate_components.get('kv_cache_bytes')):.1f}MiB • "
+                        f"compute={_mib(estimate_components.get('compute_batch_bytes')):.1f}MiB • "
+                        f"vision={_mib(estimate_components.get('vision_bytes')):.1f}MiB • "
+                        f"speculative={_mib(estimate_components.get('speculative_bytes')):.1f}MiB • "
+                        f"total={_mib(estimate_components.get('total_bytes')):.1f}MiB • "
+                        f"ctx={int(estimate_components.get('context_size') or 0)} • "
+                        f"batch={int(estimate_components.get('n_batch') or 0)}/{int(estimate_components.get('n_ubatch') or 0)} • "
+                        f"gpu_layers={int(estimate_components.get('gpu_layers') or 0)}"
+                    )
+
+                observed_delta = gpu_backend.get("vram_delta_mib_by_gpu") or {}
+                observed_before = gpu_backend.get("vram_free_before_mib_by_gpu") or {}
+                observed_after = gpu_backend.get("vram_free_after_mib_by_gpu") or {}
+                if observed_delta or observed_before or observed_after:
+                    gpu_keys = sorted(set(observed_delta) | set(observed_before) | set(observed_after), key=lambda x: int(x) if str(x).isdigit() else str(x))
+                    gpu_parts = []
+                    for key in gpu_keys:
+                        gpu_parts.append(
+                            f"gpu{key}[before={float(observed_before.get(key) or 0):.1f},"
+                            f"after={float(observed_after.get(key) or 0):.1f},"
+                            f"delta={float(observed_delta.get(key) or 0):.1f}]"
+                        )
+                    estimate_mib = float(preload.get("estimated_vram_bytes") or 0) / (1024 * 1024)
+                    observed_total_mib = float(gpu_backend.get("total_vram_delta_mib") or 0)
+                    ratio = (observed_total_mib / estimate_mib) if estimate_mib > 0 else 0.0
+                    self._log(
+                        "PERF native VRAM observed: " + " ".join(gpu_parts) +
+                        f" • observed_total={observed_total_mib:.1f}MiB • estimate_ratio={ratio:.3f}"
+                    )
+
                 self._log(
                     "PERF GGUF load I/O: "
                     f"mode={gpu_backend.get('load_mode', 'n/a')} • "
@@ -2067,6 +2191,68 @@ class LocalLLMServiceManager:
             "released_accounted_bytes": released,
         }
 
+    @staticmethod
+    def _tuner_fit_screen(candidate_cfg, estimate, safety_headroom_bytes):
+        """Return the tuner's non-mutating physical-fit screen.
+
+        This intentionally does *not* use live projected headroom.  Live headroom
+        answers "would it fit without reclaiming anything right now?" whereas a
+        tuner candidate is loaded through the normal GPU lease manager, which may
+        reclaim ComfyUI/DynamicVRAM residency first.
+
+        For a single GPU we can prove only one useful pre-load impossibility:
+        estimated native runtime + required free-space guard > physical VRAM.
+        For multi-GPU split modes, aggregate GGUF estimates cannot prove per-device
+        placement, so the real loader is the authoritative admission check.
+        """
+        estimate = estimate or {}
+        components = estimate.get("components") or {}
+        runtime_bytes = int(estimate.get("reload_target_bytes") or components.get("base_total_bytes") or 0)
+        loader_headroom_bytes = int(estimate.get("reload_lease_headroom_bytes") or 0)
+        guard_bytes = max(int(safety_headroom_bytes or 0), loader_headroom_bytes)
+        total_vram = estimate.get("total_vram_bytes")
+        total_vram = None if total_vram is None else int(total_vram)
+        split_mode = str((candidate_cfg or {}).get("split_mode") or "None (single GPU)")
+        current_projected = estimate.get("projected_headroom_bytes")
+        current_projected = None if current_projected is None else int(current_projected)
+
+        physical_headroom = None
+        required_bytes = None
+        if total_vram is not None and runtime_bytes > 0:
+            physical_headroom = total_vram - runtime_bytes
+            required_bytes = runtime_bytes + guard_bytes
+
+        if split_mode != "None (single GPU)":
+            basis = "runtime-loader-authoritative-multi-gpu"
+            allowed = True
+        elif total_vram is None or runtime_bytes <= 0:
+            basis = "runtime-loader-authoritative-no-capacity-proof"
+            allowed = True
+        else:
+            basis = "single-gpu-physical-capacity"
+            allowed = required_bytes <= total_vram
+
+        reason = None
+        if not allowed:
+            reason = (
+                f"Estimated native runtime {runtime_bytes/(1024**3):.2f} GiB plus "
+                f"{guard_bytes/(1024**3):.2f} GiB required free headroom exceeds "
+                f"the GPU's {total_vram/(1024**3):.2f} GiB physical VRAM."
+            )
+
+        return {
+            "allowed": bool(allowed),
+            "basis": basis,
+            "reason": reason,
+            "runtime_bytes": int(runtime_bytes),
+            "loader_headroom_bytes": int(loader_headroom_bytes),
+            "guard_bytes": int(guard_bytes),
+            "required_bytes": (None if required_bytes is None else int(required_bytes)),
+            "total_vram_bytes": total_vram,
+            "physical_headroom_bytes": (None if physical_headroom is None else int(physical_headroom)),
+            "live_projected_headroom_bytes": current_projected,
+        }
+
     def _tuner_candidate(self, base_cfg, patch, *, output_tokens, trials, safety_headroom_bytes, score_mode):
         if self._tuner_cancel.is_set():
             raise InterruptedError("Performance tuner cancelled")
@@ -2076,13 +2262,39 @@ class LocalLLMServiceManager:
         estimate = self.vram_estimate(patch)
         headroom = estimate.get("projected_headroom_bytes")
         label = self._tuner_patch_label({k: candidate_cfg.get(k) for k in patch})
-        if patch and headroom is not None and int(headroom) < int(safety_headroom_bytes):
+        fit = self._tuner_fit_screen(candidate_cfg, estimate, safety_headroom_bytes)
+
+        if patch and not fit["allowed"]:
             return {
                 "status": "skipped", "label": label, "patch": copy.deepcopy(patch),
-                "reason": f"Projected VRAM headroom {int(headroom)/(1024**3):.2f} GiB is below the tuner safety margin.",
+                "reason": str(fit.get("reason") or "Candidate cannot physically fit on the selected GPU."),
                 "estimated_vram_bytes": int((estimate.get("components") or {}).get("base_total_bytes") or 0),
-                "projected_headroom_bytes": int(headroom),
+                "projected_headroom_bytes": (None if headroom is None else int(headroom)),
+                "projected_physical_headroom_bytes": fit.get("physical_headroom_bytes"),
+                "tuner_fit_guard_bytes": int(fit.get("guard_bytes") or 0),
+                "tuner_fit_required_bytes": fit.get("required_bytes"),
+                "tuner_fit_basis": fit.get("basis"),
             }
+
+        # A negative/low live projection is informational only here: it means the
+        # currently resident ComfyUI models must yield some memory.  The actual
+        # candidate load below exercises the same lease manager used in normal
+        # operation and remains the authoritative safety check.
+        live_projected = fit.get("live_projected_headroom_bytes")
+        if patch and live_projected is not None and int(live_projected) < int(safety_headroom_bytes):
+            physical = fit.get("physical_headroom_bytes")
+            physical_text = "unknown" if physical is None else f"{int(physical)/(1024**3):.2f}GiB"
+            self._log(
+                "TUNER fit gate: "
+                f"{label} • live_projected={int(live_projected)/(1024**3):.2f}GiB is reclaimable • "
+                f"physical_after_runtime={physical_text} • guard={int(fit.get('guard_bytes') or 0)/(1024**3):.2f}GiB • "
+                f"basis={fit.get('basis')} • decision=benchmark"
+            )
+
+        physical_headroom = fit.get("physical_headroom_bytes")
+        fit_guard_bytes = fit.get("guard_bytes")
+        fit_required_bytes = fit.get("required_bytes")
+        split_mode = str(candidate_cfg.get("split_mode") or "None (single GPU)")
 
         args = self._call_args()
         args.update(patch)
@@ -2240,6 +2452,10 @@ class LocalLLMServiceManager:
             "measured_vram_bytes": int(measured_vram),
             "estimated_vram_bytes": int((estimate.get("components") or {}).get("base_total_bytes") or 0),
             "projected_headroom_bytes": (None if headroom is None else int(headroom)),
+            "projected_physical_headroom_bytes": (None if physical_headroom is None else int(physical_headroom)),
+            "tuner_fit_guard_bytes": (None if fit_guard_bytes is None else int(fit_guard_bytes)),
+            "tuner_fit_required_bytes": (None if fit_required_bytes is None else int(fit_required_bytes)),
+            "tuner_fit_basis": ("single-gpu-physical-capacity" if split_mode == "None (single GPU)" else "runtime-loader-authoritative"),
             "speculative_effective": str(spec.get("effective") or "Off"),
             "speculative_implementation": spec.get("implementation"),
             "acceptance_rate": (float(statistics.median(acceptance_rates)) if acceptance_rates else None),

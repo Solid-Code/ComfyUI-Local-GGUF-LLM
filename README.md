@@ -1,7 +1,61 @@
-# Local GGUF LLM — v0.18.62 alpha
+# Local GGUF LLM — v0.18.67 alpha
+
+## v0.18.67-alpha
+
+### Performance tuner fit-gate correction
+
+- Fixes tuner candidates being pre-skipped merely because another ComfyUI/DynamicVRAM model is currently resident. Candidate admission no longer uses the live `projected_headroom_bytes` value as a hard gate.
+- Removes double-counting of the native GPU lease headroom. The tuner safety value is now combined with the loader lease as `max(loader headroom, tuner headroom)`, not added on top of it.
+- Single-GPU candidates are pre-skipped only when `estimated native runtime + required free headroom` exceeds physical device VRAM. Otherwise the benchmark is attempted and the normal GPU lease manager is the authoritative safety check.
+- Multi-GPU split candidates are no longer rejected from aggregate projections that cannot prove per-device fit; they are attempted and allowed to fail safely through the real loader if necessary.
+- Adds tuner result metadata describing the physical-fit basis and required headroom. VRAM policy v14 and bridge API v2 are unchanged.
+
+
+## v0.18.66-alpha
+
+Diagnostic-only VRAM telemetry pass. The v0.18.65 lease/admission policy is unchanged.
+
+- Adds stage-by-stage GPU accounting for raw CUDA free memory, ComfyUI logical free memory, PyTorch allocator slack, device used memory, and loaded-model counts before/after each lease stage.
+- Adds per-stage timings for raw/comfy probes, cache reclaim, cooperative eviction/retry, AIMDO cleanup/retry, exclusive eviction, and final synchronization.
+- Logs the exact ComfyUI models returned as unloaded by cooperative/retry/exclusive stages (capped for readability), plus same-device loaded-model inventory snapshots.
+- Logs VRAM-estimator component breakdown (weights, KV cache, compute/batch, vision projector, speculative/MTP) and the configured context/batch/gpu-layer inputs.
+- Logs native llama.cpp device-wide VRAM before/after/delta by GPU and the observed/estimated allocation ratio.
+- Expands Auto-Yield diagnostics with raw shortfall, ComfyUI logical free, allocator slack, native-operation owner/waiters, post-yield raw/logical/slack, and ComfyUI unload count.
+- Adds explicit Prompt Enhancer handoff-decision logs (pending queue count / fail-safe / keep-hot).
+- No memory target, eviction threshold, handoff behavior, or bridge API semantics were changed.
+
+## v0.18.65-alpha
+
+- Reworked native GPU lease admission to compensate exactly for ComfyUI's logical-free accounting (`raw CUDA free + inactive PyTorch allocator bytes`) when requesting memory for llama.cpp, which requires raw driver-visible VRAM.
+- Cooperative eviction now requests `raw lease target + measured PyTorch allocator slack`, aligned only to the backend granularity. This avoids the ~one-page shortfall that previously escalated to full target-GPU eviction.
+- Removed the post-cooperative cache-closeout path; cache-only reclaim remains as the cheap first tier when it can satisfy the entire raw shortfall by itself.
+- Fixed Auto Yield admission semantics: the hook now uses a raw-CUDA fast check, then consults ComfyUI's logical free value only when raw memory is short. It yields llama.cpp only when the request exceeds both, avoiding unnecessary multi-gigabyte LLM unload/reload cycles for requests already covered by PyTorch allocator slack.
+- Added cooperative request/slack diagnostics and the prior native-unload reason to PERF logs so unnecessary Auto Yield events can be identified directly.
+
+## v0.18.64-alpha
+
+- Converts ComfyUI logical-free memory into driver-visible free memory before escalating: after cooperative `free_memory()`, if the remaining raw CUDA shortfall is fully covered by reclaimable PyTorch cache, the cache is released and the same semantic lease target is rechecked. This avoids unnecessary AIMDO cleanup/full-GPU eviction for small residual gaps without adding a tolerance.
+- Prompt Enhancer no longer forces a native GGUF unload after every standalone manual enhancement. It performs the deterministic handoff before the queue item returns only when another ComfyUI job is already pending; otherwise the resident model stays hot and the existing Auto-Yield pressure hook handles any later GPU owner. Queue-inspection failure remains fail-safe and yields.
+- VRAM coordination policy v12: `native-gpu-lease-v3-cache-closeout`.
 
 
 
+
+
+
+## v0.18.63 alpha
+
+GPU-lease speed pass based on current ComfyUI/AIMDO/PyTorch behavior:
+
+- Keeps v0.18.62's single semantic lease (`native runtime requirement + one device headroom`) and does **not** reduce the safety target.
+- Adds a zero-maintenance **raw-fast path**: when driver-visible VRAM already satisfies the lease, native loading begins without CUDA synchronization, PyTorch cache flush, AIMDO reset, or a ComfyUI model scan.
+- Adds a **cache-only reclaim** tier. If unused PyTorch allocator cache alone covers the physical shortfall, only that cache is returned to the driver; no ComfyUI model is evicted.
+- Normal pressure now calls ComfyUI `free_memory()` once and trusts ComfyUI's own partial/full eviction plus cache-flush behavior instead of immediately repeating cache/AIMDO cleanup afterward.
+- AIMDO cast-buffer, prefetch/CUDA-graph, and VBAR watermark cleanup is now a **recovery tier only after cooperative eviction fails**. Current ComfyUI already performs these operations at each node boundary, so repeating them on every LLM load was redundant and could destroy useful warmed state.
+- Full target-GPU eviction remains the final fallback only. A final CUDA synchronization occurs only on the rare failure path before refusing a load.
+- Removes redundant device-wide synchronizations around Auto Yield. The process-global native-operation gate already waits for generation ownership, llama.cpp's context destructor synchronizes pending context work, and ComfyUI `soft_empty_cache()` synchronizes when allocator cleanup is actually needed.
+- Makes the resident Auto-Yield hook use raw CUDA free memory as its cheap first probe and defers the more expensive PyTorch allocator-stat query until an actual pressure event.
+- Keeps bridge API v2 and the v0.18.62 memory target/headroom policy unchanged; H3 Project Director v0.6.10 remains compatible.
 
 
 ## v0.18.62 alpha
