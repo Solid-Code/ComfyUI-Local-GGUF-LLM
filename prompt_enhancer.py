@@ -18,7 +18,7 @@ import folder_paths
 
 log = logging.getLogger(__name__)
 
-NODE_VERSION = "0.6.29-alpha"
+NODE_VERSION = "0.6.30-alpha"
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_DIR = PACKAGE_DIR / "templates" / "default"
 USER_TEMPLATE_DIR = Path(folder_paths.models_dir) / "LLM" / "local_LLM_presets" / "prompt_enhancer"
@@ -1359,9 +1359,15 @@ class LocalLLMPromptEnhancer:
                         ),
                     },
                 ),
-                # Stable frontend-owned identity used to reconcile background
-                # executions when this workflow is not currently mounted. Keep
-                # appended after legacy serialized widgets for compatibility.
+            },
+            "optional": {
+                # Internal transport fields must remain OPTIONAL. They were added
+                # after the original Prompt Enhancer schema and therefore cannot
+                # be required for workflow JSON/images saved by older versions.
+                # The frontend fills them whenever it is mounted; backend defaults
+                # keep normal execution valid if a legacy workflow omits either.
+                # Keep them first in the optional section so their widget ordering
+                # remains directly after prompt_preset, matching prior releases.
                 "prompt_state_id": (
                     "STRING",
                     {
@@ -1381,8 +1387,6 @@ class LocalLLMPromptEnhancer:
                         "dynamicPrompts": False,
                     },
                 ),
-            },
-            "optional": {
                 "images": (
                     "IMAGE",
                     {
