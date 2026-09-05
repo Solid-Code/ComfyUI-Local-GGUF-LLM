@@ -287,6 +287,10 @@ class GPULeaseResult:
     elapsed_seconds: float = 0.0
     error: Optional[str] = None
     headroom_sources: Optional[dict[str, int]] = None
+    reduced_headroom_fallback: bool = False
+    available_headroom_bytes: int = 0
+    preferred_headroom_shortfall_bytes: int = 0
+    admission_warning: Optional[str] = None
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -398,6 +402,42 @@ class GPUMemoryLeaseManager:
             result.strategy = strategy
             return True
         return False
+
+    def _admit_reduced_headroom_if_runtime_fits(self, result: GPULeaseResult, raw_free: Optional[int]) -> bool:
+        """Last-resort admission when the runtime fits but preferred headroom does not.
+
+        This is deliberately evaluated only after the normal cooperative/AIMDO/
+        exclusive reclamation path has been exhausted.  It never lowers the
+        runtime requirement itself.  If the driver-visible free memory is at
+        least the full runtime target, llama.cpp is allowed to attempt the load
+        and the caller receives a prominent warning that the preferred lease
+        margin could not be preserved.
+        """
+        if result.satisfied or raw_free is None:
+            return False
+        runtime = max(0, int(result.runtime_target_bytes or 0))
+        raw = max(0, int(raw_free or 0))
+        if runtime <= 0 or raw < runtime:
+            return False
+
+        available_headroom = max(0, raw - runtime)
+        preferred_headroom = max(0, int(result.headroom_bytes or 0))
+        shortfall = max(0, preferred_headroom - available_headroom)
+        result.satisfied = True
+        result.reduced_headroom_fallback = True
+        result.available_headroom_bytes = int(available_headroom)
+        result.preferred_headroom_shortfall_bytes = int(shortfall)
+        result.strategy = "reduced-headroom-runtime-fit"
+        result.admission_warning = (
+            "Local GGUF LLM could not preserve the preferred GPU lease headroom, "
+            "but the full estimated native runtime still fits in driver-visible VRAM. "
+            f"Proceeding with reduced headroom: runtime={runtime / _MIB:.1f} MiB, "
+            f"raw_free={raw / _MIB:.1f} MiB, available_headroom={available_headroom / _MIB:.1f} MiB, "
+            f"preferred_headroom={preferred_headroom / _MIB:.1f} MiB, "
+            f"preferred_shortfall={shortfall / _MIB:.1f} MiB. "
+            "The native load will still fail normally if the model cannot actually fit."
+        )
+        return True
 
     def acquire(self, runtime_required: int, device) -> dict[str, Any]:
         result = self.plan(runtime_required)
@@ -616,6 +656,12 @@ class GPUMemoryLeaseManager:
         result.stage_timings_seconds["final_sync"] = time.perf_counter() - final_sync_started
         snap("after_final_sync")
         self._finish_if_satisfied(result, device, "exclusive-target-gpu-eviction+final-sync")
+        if not result.satisfied:
+            # All normal reclamation has been exhausted.  Preserve the runtime
+            # requirement as the hard floor, but do not turn llama.cpp's preferred
+            # fit margin into an absolute ban on smaller GPUs.  If the runtime
+            # itself fits, allow one guarded native load attempt with a warning.
+            self._admit_reduced_headroom_if_runtime_fits(result, result.raw_free_after_bytes)
         result.elapsed_seconds = time.perf_counter() - started
         return result.as_dict()
 
@@ -666,6 +712,8 @@ class GPUMemoryLeaseManager:
             result.comfy_free_after_bytes = comfy
             result.torch_reclaimable_after_bytes = reclaimable
             result.satisfied = bool(effective >= result.free_target_bytes)
+        if minimum_runtime > 0 and not result.satisfied:
+            self._admit_reduced_headroom_if_runtime_fits(result, result.raw_free_after_bytes)
         result.elapsed_seconds = time.perf_counter() - started
         return result.as_dict()
 

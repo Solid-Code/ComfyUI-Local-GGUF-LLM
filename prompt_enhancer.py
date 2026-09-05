@@ -18,7 +18,7 @@ import folder_paths
 
 log = logging.getLogger(__name__)
 
-NODE_VERSION = "0.6.28-alpha"
+NODE_VERSION = "0.6.29-alpha"
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_DIR = PACKAGE_DIR / "templates" / "default"
 USER_TEMPLATE_DIR = Path(folder_paths.models_dir) / "LLM" / "local_LLM_presets" / "prompt_enhancer"
@@ -531,9 +531,19 @@ def _delete_prompt_set(name: str) -> dict[str, Any]:
     return {"name": clean_name}
 
 
-def _enhancer_state_key(node_id: Any = None, state_id: Any = None) -> str:
-    """Stable per-enhancer backend key, with node-id fallback for old clients."""
+def _enhancer_state_key(node_id: Any = None, state_id: Any = None, runtime_scope: Any = None) -> str:
+    """Per-workflow enhancer key, with legacy fallbacks for older clients.
+
+    ``state_id`` is serialized with the node so it can identify the enhancer
+    across normal tab remounts. ``runtime_scope`` is browser-session/workflow
+    ownership supplied by the frontend and prevents an imported workflow/image
+    carrying the same serialized state id from inheriting another tab's live
+    Prompt Enhancer cursor/request state.
+    """
     stable = str(state_id or "").strip()
+    scope = str(runtime_scope or "").strip()
+    if stable and scope:
+        return f"{scope}\x1f{stable}"
     if stable:
         return stable
     return str(node_id or "").strip()
@@ -647,6 +657,7 @@ def _arm_request(
     enhanced_prompt: Any = "",
     overwrite_enhanced: Any = False,
     state_id: Any = "",
+    runtime_scope: Any = "",
 ) -> str:
     node_id = str(node_id or "").strip()
     if not node_id:
@@ -674,7 +685,7 @@ def _arm_request(
     seed_values = seed_values[:requested_count]
 
     token = uuid.uuid4().hex
-    key = _enhancer_state_key(node_id, state_id)
+    key = _enhancer_state_key(node_id, state_id, runtime_scope)
     with _PENDING_LOCK:
         _prune_pending_locked()
         _PENDING_REQUESTS[key] = {
@@ -691,18 +702,22 @@ def _arm_request(
             "enhanced_prompt": str(enhanced_prompt or ""),
             "overwrite_enhanced": bool(overwrite_enhanced),
             "state_id": str(state_id or "").strip(),
+            "runtime_scope": str(runtime_scope or "").strip(),
             "created": time.monotonic(),
         }
     return token
 
 
-def _pop_request(node_id: Any, state_id: Any = "") -> dict[str, Any] | None:
-    key = _enhancer_state_key(node_id, state_id)
-    fallback = _enhancer_state_key(node_id, "")
+def _pop_request(node_id: Any, state_id: Any = "", runtime_scope: Any = "") -> dict[str, Any] | None:
+    key = _enhancer_state_key(node_id, state_id, runtime_scope)
+    stable_fallback = _enhancer_state_key(node_id, state_id, "")
+    fallback = _enhancer_state_key(node_id, "", "")
     with _PENDING_LOCK:
         _prune_pending_locked()
         pending = _PENDING_REQUESTS.pop(key, None)
-        if pending is None and fallback and fallback != key:
+        if pending is None and stable_fallback and stable_fallback != key:
+            pending = _PENDING_REQUESTS.pop(stable_fallback, None)
+        if pending is None and fallback and fallback not in {key, stable_fallback}:
             pending = _PENDING_REQUESTS.pop(fallback, None)
         return pending
 
@@ -810,6 +825,7 @@ def _publish_manual_batch_progress(
     result: dict[str, Any],
     *,
     state_id: Any = "",
+    runtime_scope: Any = "",
     used_images: bool = False,
     used_video: bool = False,
     used_settings: bool = False,
@@ -833,6 +849,7 @@ def _publish_manual_batch_progress(
                 "node_id": str(node_id or ""),
                 "token": str(token or ""),
                 "state_id": str(state_id or "").strip(),
+                "runtime_scope": str(runtime_scope or "").strip(),
                 "index": int(index),
                 "total": int(total),
                 "prompt": str((result or {}).get("prompt") or ""),
@@ -1353,6 +1370,17 @@ class LocalLLMPromptEnhancer:
                         "dynamicPrompts": False,
                     },
                 ),
+                # Browser-session workflow ownership. This is deliberately
+                # overwritten by the frontend whenever a workflow is mounted;
+                # serialized values from workflow images are never authoritative.
+                "prompt_runtime_scope": (
+                    "STRING",
+                    {
+                        "default": "",
+                        "multiline": False,
+                        "dynamicPrompts": False,
+                    },
+                ),
             },
             "optional": {
                 "images": (
@@ -1428,6 +1456,7 @@ class LocalLLMPromptEnhancer:
         prompt_shuffle_json: str = "[]",
         prompt_preset: str = "Custom",
         prompt_state_id: str = "",
+        prompt_runtime_scope: str = "",
         settings: Any = None,
         images: Any = None,
         video: Any = None,
@@ -1442,7 +1471,7 @@ class LocalLLMPromptEnhancer:
         # therefore contain the pre-batch or an intermediate prompt array. Upgrade
         # only a recognized batch stage to the authoritative completed array; all
         # unrelated/manual edits remain untouched.
-        state_key = _enhancer_state_key(unique_id, prompt_state_id)
+        state_key = _enhancer_state_key(unique_id, prompt_state_id, prompt_runtime_scope)
         history, ui_active_index, visible_enhanced, _queued_batch_reconciled = _reconcile_queued_manual_history(
             state_key, history, ui_active_index, visible_enhanced
         )
@@ -1451,7 +1480,7 @@ class LocalLLMPromptEnhancer:
         # A manual media/settings-aware Enhance request always takes priority. The
         # browser explicitly armed this targeted execution so connected media
         # can reach the Local GGUF service.
-        pending = _pop_request(unique_id, prompt_state_id)
+        pending = _pop_request(unique_id, prompt_state_id, prompt_runtime_scope)
         if pending is not None:
             _clear_prompt_cycle_state(state_key)
             token = str(pending.get("token") or "")
@@ -1488,6 +1517,7 @@ class LocalLLMPromptEnhancer:
                         len(batch_seeds),
                         result,
                         state_id=pending.get("state_id") or prompt_state_id,
+                        runtime_scope=pending.get("runtime_scope") or prompt_runtime_scope,
                         used_images=images is not None,
                         used_video=video is not None,
                         used_settings=isinstance(settings, dict),
@@ -1518,6 +1548,7 @@ class LocalLLMPromptEnhancer:
                 "mode": "manual_batch",
                 "token": token,
                 "state_id": str(pending.get("state_id") or prompt_state_id or ""),
+                "runtime_scope": str(pending.get("runtime_scope") or prompt_runtime_scope or ""),
                 "prompt": prompts[-1] if prompts else "",
                 "prompts": prompts,
                 "tokens": sum(token_counts),
@@ -1549,6 +1580,7 @@ class LocalLLMPromptEnhancer:
             payload = {
                 "mode": "workflow",
                 "state_id": str(prompt_state_id or ""),
+                "runtime_scope": str(prompt_runtime_scope or ""),
                 "prompt": revised,
                 "tokens": result["tokens"],
                 "used_images": images is not None,
@@ -1574,6 +1606,7 @@ class LocalLLMPromptEnhancer:
         payload = {
             "mode": "cycle",
             "state_id": str(prompt_state_id or ""),
+            "runtime_scope": str(prompt_runtime_scope or ""),
             "active_index": active_index,
             "next_index": next_index,
             "shuffle": next_shuffle,
@@ -1767,6 +1800,7 @@ try:
                 body.get("enhanced_prompt", ""),
                 body.get("overwrite_enhanced", False),
                 body.get("state_id", ""),
+                body.get("runtime_scope", ""),
             )
             return web.json_response({"token": token})
         except ValueError as exc:
@@ -1782,7 +1816,7 @@ try:
             if not isinstance(body, dict):
                 raise TypeError("Request body must be an object")
             revision = body.get("revision") if isinstance(body, dict) and "revision" in body else None
-            _clear_prompt_cycle_state(_enhancer_state_key(body.get("node_id"), body.get("state_id")), revision)
+            _clear_prompt_cycle_state(_enhancer_state_key(body.get("node_id"), body.get("state_id"), body.get("runtime_scope")), revision)
             return web.json_response({"ok": True})
         except Exception as exc:
             log.exception("[Local LLM Prompt Enhancer] Prompt-cycle reset failed")
@@ -1799,7 +1833,7 @@ try:
                 raise TypeError("history must be an array")
             history = [str(item) for item in history_raw]
             snapshot = _prompt_cycle_state_snapshot(
-                _enhancer_state_key(body.get("node_id"), body.get("state_id")),
+                _enhancer_state_key(body.get("node_id"), body.get("state_id"), body.get("runtime_scope")),
                 str(body.get("mode") or "fixed"),
                 history,
             )
@@ -1816,12 +1850,14 @@ try:
             body = await request.json()
             node_id = str((body or {}).get("node_id") or "")
             state_id = str((body or {}).get("state_id") or "")
+            runtime_scope = str((body or {}).get("runtime_scope") or "")
             token = str((body or {}).get("token") or "")
-            key = _enhancer_state_key(node_id, state_id)
-            fallback = _enhancer_state_key(node_id, "")
+            key = _enhancer_state_key(node_id, state_id, runtime_scope)
+            stable_fallback = _enhancer_state_key(node_id, state_id, "")
+            fallback = _enhancer_state_key(node_id, "", "")
             removed = False
             with _PENDING_LOCK:
-                for candidate_key in dict.fromkeys([key, fallback]):
+                for candidate_key in dict.fromkeys([key, stable_fallback, fallback]):
                     if not candidate_key:
                         continue
                     current = _PENDING_REQUESTS.get(candidate_key)

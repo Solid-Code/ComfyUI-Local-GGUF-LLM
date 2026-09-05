@@ -7,8 +7,8 @@ from .version import PACKAGE_VERSION, BRIDGE_API_VERSION, VRAM_POLICY_VERSION, V
 # every JS module found under WEB_DIRECTORY.
 _js_dir = Path(__file__).resolve().parent / "web" / "js"
 _FRONTENDS = {
-    "local_llm_server": "local_llm_server_v100.js",
-    "prompt_enhancer": "prompt_enhancer_dom_v0628.js",
+    "local_llm_server": "local_llm_server_v101.js",
+    "prompt_enhancer": "prompt_enhancer_dom_v0629.js",
 }
 if _js_dir.is_dir():
     for _candidate in _js_dir.glob("*.js"):

@@ -2253,6 +2253,122 @@ class LocalLLMServiceManager:
             "live_projected_headroom_bytes": current_projected,
         }
 
+    @staticmethod
+    def _tuner_trial_summary(records):
+        """Aggregate repeated full-cycle tuner trials with robust stability metrics.
+
+        Screening can use one short trial, but sustained validation uses several
+        load -> inference -> unload cycles.  The recommendation is ranked by a
+        robust upper score (median + scaled MAD), so a setting that is fast once
+        but periodically stalls does not beat a consistently fast setting.
+        """
+        rows = [dict(r) for r in (records or []) if isinstance(r, dict) and float(r.get("score_seconds") or 0) > 0]
+        if not rows:
+            return {}
+
+        def vals(key, positive=False):
+            out=[]
+            for row in rows:
+                try:
+                    v=float(row.get(key))
+                except Exception:
+                    continue
+                if positive and v <= 0:
+                    continue
+                out.append(v)
+            return out
+
+        def med(key, positive=False):
+            v=vals(key, positive)
+            return float(statistics.median(v)) if v else 0.0
+
+        scores=vals("score_seconds", True)
+        score_med=float(statistics.median(scores)) if scores else 0.0
+        score_mad=float(statistics.median([abs(x-score_med) for x in scores])) if len(scores)>1 else 0.0
+        # 1.4826 scales MAD to a standard-deviation-equivalent measure. For a
+        # small validation set a single severe stall can still leave MAD small,
+        # so the upper-quartile score is also part of the conservative rank.
+        if len(scores) > 1:
+            score_q75=float(statistics.quantiles(scores, n=4, method="inclusive")[2])
+        else:
+            score_q75=score_med
+        robust=float(max(score_med + 1.4826*score_mad, score_q75))
+        decode=vals("decode_tps", True)
+        load=vals("load_seconds")
+        native=vals("native_load_seconds")
+        block=[int(max(0, r.get("block_inputs", 0) or 0)) for r in rows]
+        major=[int(max(0, r.get("major_faults", 0) or 0)) for r in rows]
+        storage=sum(1 for r in rows if int(r.get("block_inputs", 0) or 0)>0 or int(r.get("major_faults", 0) or 0)>0)
+        pc_before=next((r.get("page_cache_before_bytes") for r in rows if r.get("page_cache_before_bytes") is not None), None)
+        pc_after=next((r.get("page_cache_after_bytes") for r in reversed(rows) if r.get("page_cache_after_bytes") is not None), None)
+        mem_before=next((r.get("mem_available_before_bytes") for r in rows if r.get("mem_available_before_bytes") is not None), None)
+        mem_after=next((r.get("mem_available_after_bytes") for r in reversed(rows) if r.get("mem_available_after_bytes") is not None), None)
+        return {
+            "trial_count": len(rows),
+            "score_median_seconds": score_med,
+            "score_mad_seconds": score_mad,
+            "score_q75_seconds": score_q75,
+            "robust_score_seconds": robust,
+            "score_worst_seconds": max(scores) if scores else 0.0,
+            "score_best_seconds": min(scores) if scores else 0.0,
+            "score_dispersion_ratio": ((1.4826*score_mad/score_med) if score_med>0 else 0.0),
+            "prompt_tps_median": med("prompt_tps", True),
+            "decode_tps_median": med("decode_tps", True),
+            "decode_tps_floor": min(decode) if decode else 0.0,
+            "decode_tps_ceiling": max(decode) if decode else 0.0,
+            "prompt_seconds_median": med("prompt_seconds"),
+            "decode_seconds_median": med("decode_seconds"),
+            "fixed_work_seconds_median": med("fixed_work_seconds"),
+            "load_seconds_median": med("load_seconds"),
+            "load_seconds_worst": max(load) if load else 0.0,
+            "native_load_seconds_median": med("native_load_seconds"),
+            "native_load_seconds_worst": max(native) if native else 0.0,
+            "unload_seconds_median": med("unload_seconds"),
+            "unload_sync_seconds_median": med("unload_sync_seconds"),
+            "cycle_fixed_seconds_median": med("cycle_fixed_seconds"),
+            "cycle_wall_seconds_median": med("cycle_wall_seconds"),
+            "storage_backed_trials": int(storage),
+            "block_inputs_total": int(sum(block)),
+            "block_inputs_worst": int(max(block) if block else 0),
+            "major_faults_total": int(sum(major)),
+            "page_cache_delta_bytes": (None if pc_before is None or pc_after is None else int(pc_after)-int(pc_before)),
+            "mem_available_delta_bytes": (None if mem_before is None or mem_after is None else int(mem_after)-int(mem_before)),
+        }
+
+    @classmethod
+    def _tuner_merge_validation_results(cls, first, second, *, label="Validation • Baseline"):
+        """Combine baseline validation bracketing the finalists.
+
+        Measuring baseline both before and after finalists controls for gradual
+        host/page-cache/thermal drift.  The merged baseline is the reference used
+        by final selection; it is not an additional native benchmark run.
+        """
+        rows=[]
+        for item in (first, second):
+            rows.extend(copy.deepcopy((item or {}).get("trial_records") or []))
+        summary=cls._tuner_trial_summary(rows)
+        merged=copy.deepcopy(first or second or {})
+        merged.update({
+            "status": "ok" if rows else "error",
+            "label": label,
+            "validation": True,
+            "validation_role": "baseline-combined",
+            "trial_records": rows,
+            "trials": int(summary.get("trial_count") or 0),
+        })
+        mapping={
+            "prompt_tps":"prompt_tps_median", "decode_tps":"decode_tps_median",
+            "prompt_seconds":"prompt_seconds_median", "decode_seconds":"decode_seconds_median",
+            "fixed_work_seconds":"fixed_work_seconds_median", "load_seconds":"load_seconds_median",
+            "native_load_seconds":"native_load_seconds_median", "unload_seconds":"unload_seconds_median",
+            "unload_sync_seconds":"unload_sync_seconds_median", "cycle_fixed_seconds":"cycle_fixed_seconds_median",
+            "cycle_wall_seconds":"cycle_wall_seconds_median", "score_seconds":"score_median_seconds",
+        }
+        for dst,src in mapping.items():
+            if src in summary: merged[dst]=summary[src]
+        merged.update(summary)
+        return merged
+
     def _tuner_candidate(self, base_cfg, patch, *, output_tokens, trials, safety_headroom_bytes, score_mode):
         if self._tuner_cancel.is_set():
             raise InterruptedError("Performance tuner cancelled")
@@ -2276,10 +2392,6 @@ class LocalLLMServiceManager:
                 "tuner_fit_basis": fit.get("basis"),
             }
 
-        # A negative/low live projection is informational only here: it means the
-        # currently resident ComfyUI models must yield some memory.  The actual
-        # candidate load below exercises the same lease manager used in normal
-        # operation and remains the authoritative safety check.
         live_projected = fit.get("live_projected_headroom_bytes")
         if patch and live_projected is not None and int(live_projected) < int(safety_headroom_bytes):
             physical = fit.get("physical_headroom_bytes")
@@ -2295,12 +2407,13 @@ class LocalLLMServiceManager:
         fit_guard_bytes = fit.get("guard_bytes")
         fit_required_bytes = fit.get("required_bytes")
         split_mode = str(candidate_cfg.get("split_mode") or "None (single GPU)")
+        mode = "Inference Only" if str(score_mode).lower().startswith("inference") else "ComfyUI Cycle"
 
         args = self._call_args()
         args.update(patch)
         args.update({
             "messages_override": self._tuner_prompt(),
-            "prompt_cache_mode": "Off",  # every measured trial performs the same prefill work
+            "prompt_cache_mode": "Off",
             "max_tokens": int(output_tokens),
             "seed": 8675309,
             "progress_callback": None,
@@ -2308,9 +2421,8 @@ class LocalLLMServiceManager:
             "cancel_event": self._tuner_cancel,
         })
 
-        # Warm once before measurement. This primes backend/JIT state and, with
-        # mmap, the normal OS page cache. We then yield the model so every measured
-        # trial is a real Suspend-style reload -> inference -> yield cycle.
+        # Prime backend/JIT and ordinary page-cache state once. Every measured
+        # trial still begins yielded and includes a real native reload.
         warm_args = dict(args)
         warm_args["max_tokens"] = min(16, int(output_tokens))
         warm_started = time.perf_counter()
@@ -2323,145 +2435,149 @@ class LocalLLMServiceManager:
             warm_info = {}
         warm_unload = self._tuner_unload_current("tuner-warmup-yield")
 
-        prompt_rates = []
-        decode_rates = []
-        prompt_seconds = []
-        decode_seconds = []
-        load_seconds = []
-        native_load_seconds = []
-        unload_seconds = []
-        unload_sync_seconds = []
-        completion_tokens = []
-        inference_seconds = []
-        cycle_wall_seconds = []
-        acceptance_rates = []
-        measured_vram = 0
-        last_info = {}
+        prompt_rates=[]; decode_rates=[]; prompt_seconds=[]; decode_seconds=[]
+        load_seconds=[]; native_load_seconds=[]; unload_seconds=[]; unload_sync_seconds=[]
+        completion_tokens=[]; inference_seconds=[]; cycle_wall_seconds=[]; acceptance_rates=[]
+        trial_records=[]
+        measured_vram=0
+        last_info={}
 
         for trial in range(max(1, int(trials))):
             if self._tuner_cancel.is_set():
                 raise InterruptedError("Performance tuner cancelled")
-            cycle_started = time.perf_counter()
-            info = {}
-            tokens = 0
-            generate_wall = 0.0
+            cycle_started=time.perf_counter()
+            info={}; tokens=0; generate_wall=0.0
+            p_rate=d_rate=p_sec=d_sec=load_sec=native_sec=0.0
+            p_tok=c_tok=0
+            gpu={}
+            unload={}
             try:
-                started = time.perf_counter()
+                started=time.perf_counter()
                 _response, _thinking, info_json, tokens, api = LocalGGUFLLM().generate(**args)
-                generate_wall = time.perf_counter() - started
-                self._api = api
-                try:
-                    info = json.loads(info_json)
-                except Exception:
-                    info = {}
-                last_info = info
+                generate_wall=time.perf_counter()-started
+                self._api=api
+                try: info=json.loads(info_json)
+                except Exception: info={}
+                last_info=info
 
-                p_rate = float(info.get("prompt_tokens_per_second") or 0.0)
-                d_rate = float(info.get("tokens_per_second") or 0.0)
-                p_sec = float(info.get("prompt_eval_seconds") or 0.0)
-                d_sec = float(info.get("generation_seconds") or 0.0)
-                p_tok = int(info.get("prompt_eval_tokens", info.get("prompt_tokens")) or 0)
-                c_tok = int(info.get("completion_tokens") or tokens or 0)
-                if p_sec <= 0 and p_rate > 0 and p_tok > 0:
-                    p_sec = p_tok / p_rate
-                if d_sec <= 0 and d_rate > 0 and c_tok > 0:
-                    d_sec = c_tok / d_rate
+                p_rate=float(info.get("prompt_tokens_per_second") or 0.0)
+                d_rate=float(info.get("tokens_per_second") or 0.0)
+                p_sec=float(info.get("prompt_eval_seconds") or 0.0)
+                d_sec=float(info.get("generation_seconds") or 0.0)
+                p_tok=int(info.get("prompt_eval_tokens", info.get("prompt_tokens")) or 0)
+                c_tok=int(info.get("completion_tokens") or tokens or 0)
+                if p_sec<=0 and p_rate>0 and p_tok>0: p_sec=p_tok/p_rate
+                if d_sec<=0 and d_rate>0 and c_tok>0: d_sec=c_tok/d_rate
 
-                load_sec = float(info.get("load_seconds") or 0.0)
-                native_sec = float((info.get("gpu_backend") or {}).get("native_load_seconds") or 0.0)
-                if load_sec <= 0:
-                    # Each measured trial starts yielded, so any unaccounted wall
-                    # before prompt/decode is a conservative reload estimate.
-                    load_sec = max(0.0, generate_wall - max(0.0, p_sec) - max(0.0, d_sec))
+                load_sec=float(info.get("load_seconds") or 0.0)
+                gpu=info.get("gpu_backend") or {}
+                native_sec=float(gpu.get("native_load_seconds") or 0.0)
+                if load_sec<=0:
+                    load_sec=max(0.0, generate_wall-max(0.0,p_sec)-max(0.0,d_sec))
 
-                if p_rate > 0:
-                    prompt_rates.append(p_rate)
-                if d_rate > 0:
-                    decode_rates.append(d_rate)
-                if p_sec >= 0:
-                    prompt_seconds.append(p_sec)
-                if d_sec >= 0:
-                    decode_seconds.append(d_sec)
-                load_seconds.append(load_sec)
-                native_load_seconds.append(native_sec)
+                if p_rate>0: prompt_rates.append(p_rate)
+                if d_rate>0: decode_rates.append(d_rate)
+                if p_sec>=0: prompt_seconds.append(p_sec)
+                if d_sec>=0: decode_seconds.append(d_sec)
+                load_seconds.append(load_sec); native_load_seconds.append(native_sec)
                 completion_tokens.append(c_tok)
-                inference_seconds.append((p_sec + d_sec) if (p_sec > 0 or d_sec > 0) else max(0.0, generate_wall - load_sec))
-                spec_stats = ((info.get("speculative") or {}).get("stats") or {})
-                rate = spec_stats.get("acceptance_rate")
-                if isinstance(rate, (int, float)):
-                    acceptance_rates.append(float(rate))
-                gpu = info.get("gpu_backend") or {}
-                measured_vram = max(measured_vram, int(gpu.get("observed_vram_bytes") or 0))
+                inference_seconds.append((p_sec+d_sec) if (p_sec>0 or d_sec>0) else max(0.0,generate_wall-load_sec))
+                spec_stats=((info.get("speculative") or {}).get("stats") or {})
+                rate=spec_stats.get("acceptance_rate")
+                if isinstance(rate,(int,float)): acceptance_rates.append(float(rate))
+                measured_vram=max(measured_vram,int(gpu.get("observed_vram_bytes") or 0))
             finally:
-                unload = self._tuner_unload_current(f"tuner-trial-{trial + 1}-yield")
-                unload_seconds.append(float(unload.get("total_seconds") or 0.0))
-                unload_sync_seconds.append(float(unload.get("sync_seconds") or 0.0))
-                cycle_wall_seconds.append(time.perf_counter() - cycle_started)
+                unload=self._tuner_unload_current(f"tuner-trial-{trial + 1}-yield")
+                u=float(unload.get("total_seconds") or 0.0)
+                us=float(unload.get("sync_seconds") or 0.0)
+                unload_seconds.append(u); unload_sync_seconds.append(us)
+                cycle_wall=time.perf_counter()-cycle_started
+                cycle_wall_seconds.append(cycle_wall)
 
-        prompt_rate = float(statistics.median(prompt_rates)) if prompt_rates else 0.0
-        decode_rate = float(statistics.median(decode_rates)) if decode_rates else 0.0
-        prompt_sec = float(statistics.median(prompt_seconds)) if prompt_seconds else 0.0
-        decode_sec = float(statistics.median(decode_seconds)) if decode_seconds else 0.0
-        load_sec = float(statistics.median(load_seconds)) if load_seconds else 0.0
-        native_load_sec = float(statistics.median(native_load_seconds)) if native_load_seconds else 0.0
-        unload_sec = float(statistics.median(unload_seconds)) if unload_seconds else 0.0
-        unload_sync_sec = float(statistics.median(unload_sync_seconds)) if unload_sync_seconds else 0.0
+            fixed=p_sec
+            if d_rate>0:
+                fixed += float(output_tokens)/d_rate
+            elif d_sec>0:
+                fixed += d_sec
+            else:
+                fixed=max(0.0,generate_wall-load_sec)
+            cycle_fixed=float(load_sec+fixed+u)
+            trial_score=float(fixed if mode=="Inference Only" else cycle_fixed)
+            trial_records.append({
+                "trial": int(trial+1), "output_tokens": int(output_tokens),
+                "prompt_tps": float(p_rate), "decode_tps": float(d_rate),
+                "prompt_seconds": float(p_sec), "decode_seconds": float(d_sec),
+                "fixed_work_seconds": float(fixed), "load_seconds": float(load_sec),
+                "native_load_seconds": float(native_sec), "unload_seconds": float(u),
+                "unload_sync_seconds": float(us), "cycle_fixed_seconds": cycle_fixed,
+                "cycle_wall_seconds": float(cycle_wall), "score_seconds": trial_score,
+                "major_faults": int(gpu.get("major_faults_delta") or 0),
+                "minor_faults": int(gpu.get("minor_faults_delta") or 0),
+                "block_inputs": int(gpu.get("block_inputs_delta") or 0),
+                "page_cache_before_bytes": gpu.get("page_cache_before_bytes"),
+                "page_cache_after_bytes": gpu.get("page_cache_after_bytes"),
+                "mem_available_before_bytes": gpu.get("mem_available_before_bytes"),
+                "mem_available_after_bytes": gpu.get("mem_available_after_bytes"),
+                "page_cache_hint": gpu.get("page_cache_hint"),
+            })
 
-        # Normalize generation to a fixed amount of work so an early EOS cannot
-        # win merely by producing fewer tokens. The ComfyUI-cycle score then adds
-        # the measured warm reload and lightweight Suspend/Auto-Yield teardown.
-        fixed_work_seconds = prompt_sec
-        if decode_rate > 0:
-            fixed_work_seconds += float(output_tokens) / decode_rate
-        elif decode_sec > 0:
-            fixed_work_seconds += decode_sec
-        else:
-            fixed_work_seconds = float(statistics.median(inference_seconds)) if inference_seconds else 1e9
-        cycle_fixed_seconds = float(load_sec + fixed_work_seconds + unload_sec)
-        mode = "Inference Only" if str(score_mode).lower().startswith("inference") else "ComfyUI Cycle"
-        score_seconds = fixed_work_seconds if mode == "Inference Only" else cycle_fixed_seconds
+        summary=self._tuner_trial_summary(trial_records)
+        prompt_rate=float(summary.get("prompt_tps_median") or (statistics.median(prompt_rates) if prompt_rates else 0.0))
+        decode_rate=float(summary.get("decode_tps_median") or (statistics.median(decode_rates) if decode_rates else 0.0))
+        prompt_sec=float(summary.get("prompt_seconds_median") or (statistics.median(prompt_seconds) if prompt_seconds else 0.0))
+        decode_sec=float(summary.get("decode_seconds_median") or (statistics.median(decode_seconds) if decode_seconds else 0.0))
+        load_sec=float(summary.get("load_seconds_median") or (statistics.median(load_seconds) if load_seconds else 0.0))
+        native_load_sec=float(summary.get("native_load_seconds_median") or (statistics.median(native_load_seconds) if native_load_seconds else 0.0))
+        unload_sec=float(summary.get("unload_seconds_median") or (statistics.median(unload_seconds) if unload_seconds else 0.0))
+        unload_sync_sec=float(summary.get("unload_sync_seconds_median") or (statistics.median(unload_sync_seconds) if unload_sync_seconds else 0.0))
+        fixed_work_seconds=float(summary.get("fixed_work_seconds_median") or 1e9)
+        cycle_fixed_seconds=float(summary.get("cycle_fixed_seconds_median") or (load_sec+fixed_work_seconds+unload_sec))
+        score_seconds=float(summary.get("score_median_seconds") or (fixed_work_seconds if mode=="Inference Only" else cycle_fixed_seconds))
 
-        tradeoffs = []
-        quality_tradeoff = False
+        tradeoffs=[]; quality_tradeoff=False
         if candidate_cfg.get("kv_cache_k") != base_cfg.get("kv_cache_k") or candidate_cfg.get("kv_cache_v") != base_cfg.get("kv_cache_v"):
-            quality_tradeoff = True
+            quality_tradeoff=True
             tradeoffs.append("KV precision changed; lower-bit KV formats can slightly affect output quality.")
         if bool(candidate_cfg.get("use_mlock")) and not bool(base_cfg.get("use_mlock")):
             tradeoffs.append("mlock pins mapped model pages in system RAM and increases RAM pressure.")
+        if not bool(candidate_cfg.get("use_mmap", True)):
+            tradeoffs.append("mmap is disabled; repeated reloads copy/read model pages instead of using normal mapped-page reuse.")
         if str(candidate_cfg.get("kv_cache_location")) != str(base_cfg.get("kv_cache_location")):
             tradeoffs.append("KV cache placement changed; CPU placement saves VRAM but can reduce throughput.")
-        if int(candidate_cfg.get("gpu_layers", -1)) != int(base_cfg.get("gpu_layers", -1)):
+        if int(candidate_cfg.get("gpu_layers",-1)) != int(base_cfg.get("gpu_layers",-1)):
             tradeoffs.append("GPU-layer offload changed; partial offload trades VRAM for CPU/PCIe work.")
 
-        spec = last_info.get("speculative") or {}
-        return {
-            "status": "ok", "label": label, "patch": copy.deepcopy(patch),
-            "prompt_tps": prompt_rate, "decode_tps": decode_rate,
-            "prompt_seconds": prompt_sec, "decode_seconds": decode_sec,
-            "fixed_work_seconds": float(fixed_work_seconds),
-            "load_seconds": load_sec, "native_load_seconds": native_load_sec,
-            "unload_seconds": unload_sec, "unload_sync_seconds": unload_sync_sec,
-            "cycle_fixed_seconds": cycle_fixed_seconds,
-            "cycle_wall_seconds": float(statistics.median(cycle_wall_seconds)) if cycle_wall_seconds else 0.0,
-            "score_mode": mode, "score_seconds": float(score_seconds),
-            "median_completion_tokens": int(statistics.median(completion_tokens)) if completion_tokens else 0,
-            "warmup_load_seconds": float(warm_info.get("load_seconds") or 0.0),
-            "warmup_native_load_seconds": float((warm_info.get("gpu_backend") or {}).get("native_load_seconds") or 0.0),
-            "warmup_wall_seconds": float(warm_wall),
-            "warmup_unload_seconds": float(warm_unload.get("total_seconds") or 0.0),
-            "measured_vram_bytes": int(measured_vram),
-            "estimated_vram_bytes": int((estimate.get("components") or {}).get("base_total_bytes") or 0),
-            "projected_headroom_bytes": (None if headroom is None else int(headroom)),
-            "projected_physical_headroom_bytes": (None if physical_headroom is None else int(physical_headroom)),
-            "tuner_fit_guard_bytes": (None if fit_guard_bytes is None else int(fit_guard_bytes)),
-            "tuner_fit_required_bytes": (None if fit_required_bytes is None else int(fit_required_bytes)),
-            "tuner_fit_basis": ("single-gpu-physical-capacity" if split_mode == "None (single GPU)" else "runtime-loader-authoritative"),
-            "speculative_effective": str(spec.get("effective") or "Off"),
-            "speculative_implementation": spec.get("implementation"),
-            "acceptance_rate": (float(statistics.median(acceptance_rates)) if acceptance_rates else None),
-            "tradeoffs": tradeoffs, "quality_tradeoff": bool(quality_tradeoff),
-            "trials": max(1, int(trials)),
+        spec=last_info.get("speculative") or {}
+        result={
+            "status":"ok", "label":label, "patch":copy.deepcopy(patch),
+            "prompt_tps":prompt_rate, "decode_tps":decode_rate,
+            "prompt_seconds":prompt_sec, "decode_seconds":decode_sec,
+            "fixed_work_seconds":fixed_work_seconds,
+            "load_seconds":load_sec, "native_load_seconds":native_load_sec,
+            "unload_seconds":unload_sec, "unload_sync_seconds":unload_sync_sec,
+            "cycle_fixed_seconds":cycle_fixed_seconds,
+            "cycle_wall_seconds":float(summary.get("cycle_wall_seconds_median") or (statistics.median(cycle_wall_seconds) if cycle_wall_seconds else 0.0)),
+            "score_mode":mode, "score_seconds":score_seconds,
+            "median_completion_tokens":int(statistics.median(completion_tokens)) if completion_tokens else 0,
+            "warmup_load_seconds":float(warm_info.get("load_seconds") or 0.0),
+            "warmup_native_load_seconds":float((warm_info.get("gpu_backend") or {}).get("native_load_seconds") or 0.0),
+            "warmup_wall_seconds":float(warm_wall),
+            "warmup_unload_seconds":float(warm_unload.get("total_seconds") or 0.0),
+            "measured_vram_bytes":int(measured_vram),
+            "estimated_vram_bytes":int((estimate.get("components") or {}).get("base_total_bytes") or 0),
+            "projected_headroom_bytes":(None if headroom is None else int(headroom)),
+            "projected_physical_headroom_bytes":(None if physical_headroom is None else int(physical_headroom)),
+            "tuner_fit_guard_bytes":(None if fit_guard_bytes is None else int(fit_guard_bytes)),
+            "tuner_fit_required_bytes":(None if fit_required_bytes is None else int(fit_required_bytes)),
+            "tuner_fit_basis":("single-gpu-physical-capacity" if split_mode=="None (single GPU)" else "runtime-loader-authoritative"),
+            "speculative_effective":str(spec.get("effective") or "Off"),
+            "speculative_implementation":spec.get("implementation"),
+            "acceptance_rate":(float(statistics.median(acceptance_rates)) if acceptance_rates else None),
+            "tradeoffs":tradeoffs, "quality_tradeoff":bool(quality_tradeoff),
+            "trials":max(1,int(trials)), "trial_records":trial_records,
         }
+        result.update(summary)
+        return result
 
     @staticmethod
     def _tuner_choose(current, candidates, minimum_gain=0.01):
@@ -2481,8 +2597,15 @@ class LocalLLMServiceManager:
         base_cfg = self.get_config()
         profile = str(options.get("profile") or "Quick").title()
         standard = profile == "Standard"
-        trials = 2 if standard else 1
-        output_tokens = 96 if standard else 48
+        # Stage 1 is deliberately cheap screening. Stage 2 re-tests only the
+        # strongest complete configurations with longer, repeated full cycles.
+        # This prevents a single short burst from becoming the recommendation.
+        screening_trials = 2 if standard else 1
+        screening_tokens = 96 if standard else 64
+        validation_trials = 6 if standard else 4
+        validation_tokens = 256 if standard else 192
+        validation_baseline_half = 3 if standard else 2
+        validation_finalists = 3 if standard else 2
         safety_mib = max(256, int(options.get("safety_headroom_mib") or 1024))
         safety_bytes = safety_mib * 1024 * 1024
         score_mode = "Inference Only" if str(options.get("score_mode") or "").lower().startswith("inference") else "ComfyUI Cycle"
@@ -2504,6 +2627,9 @@ class LocalLLMServiceManager:
             planned += 5 if standard else 3
         if tune_spec:
             planned += 5 if standard else 2
+        # Validation baseline before + finalists + baseline after. The combined
+        # baseline summary is derived from those trials and does not run again.
+        planned += 2 + validation_finalists
 
         def patch_key(patch):
             return tuple(sorted((k, json.dumps(v, sort_keys=True)) for k, v in patch.items()))
@@ -2525,7 +2651,7 @@ class LocalLLMServiceManager:
             )
             try:
                 item = self._tuner_candidate(
-                    base_cfg, patch, output_tokens=output_tokens, trials=trials,
+                    base_cfg, patch, output_tokens=screening_tokens, trials=screening_trials,
                     safety_headroom_bytes=safety_bytes, score_mode=score_mode,
                 )
             except InterruptedError:
@@ -2551,6 +2677,51 @@ class LocalLLMServiceManager:
                 self._log(f"TUNER candidate failed: {item['label']} • {item.get('reason')}", "warning")
             return item
 
+        def run_validation(patch, phase, *, role, trial_count):
+            idx = len(results) + 1
+            base_label = self._tuner_patch_label(patch)
+            display_label = f"Validation • {base_label}"
+            self._set_tuner(
+                phase=phase, candidate_index=idx, candidate_total=max(planned, idx),
+                progress=min(0.985, max(0.02, idx / max(planned, 1))),
+                current_candidate=display_label,
+                message=f"Sustained validation: {base_label} ({trial_count} cycles × {validation_tokens} tokens)",
+                results=results,
+            )
+            try:
+                item = self._tuner_candidate(
+                    base_cfg, patch, output_tokens=validation_tokens, trials=trial_count,
+                    safety_headroom_bytes=safety_bytes, score_mode=score_mode,
+                )
+            except InterruptedError:
+                raise
+            except Exception as e:
+                item = {
+                    "status": "error", "label": display_label,
+                    "patch": copy.deepcopy(patch), "reason": f"{type(e).__name__}: {e}",
+                }
+            item["screen_label"] = item.get("label") or base_label
+            item["label"] = display_label
+            item["validation"] = True
+            item["validation_role"] = role
+            item["validation_output_tokens"] = int(validation_tokens)
+            results.append(item)
+            self._set_tuner(results=results)
+            if item.get("status") == "ok":
+                self._log(
+                    "TUNER validation: "
+                    f"{base_label} • cycles={item.get('trials', 0)} • "
+                    f"median={float(item.get('score_seconds') or 0):.3f}s • "
+                    f"robust={float(item.get('robust_score_seconds') or item.get('score_seconds') or 0):.3f}s • "
+                    f"decode_median={float(item.get('decode_tps') or 0):.2f}t/s • "
+                    f"decode_floor={float(item.get('decode_tps_floor') or 0):.2f}t/s • "
+                    f"load_worst={float(item.get('load_seconds_worst') or item.get('load_seconds') or 0):.3f}s • "
+                    f"storage_trials={int(item.get('storage_backed_trials') or 0)}/{int(item.get('trials') or 0)}"
+                )
+            else:
+                self._log(f"TUNER validation failed: {base_label} • {item.get('reason')}", "warning")
+            return item
+
         try:
             with self._generation_slot(
                 workflow_owned=False,
@@ -2562,8 +2733,10 @@ class LocalLLMServiceManager:
                     self._error = None
                 self._emit()
                 self._log(
-                    f"Performance tuner started ({profile}, optimize={score_mode}, trials={trials}, "
-                    f"output_tokens={output_tokens}, safety={safety_mib}MiB, memory={tune_memory}, kv_precision={tune_kv_precision})"
+                    f"Performance tuner started ({profile}, optimize={score_mode}, "
+                    f"screen={screening_trials}x{screening_tokens}tok, "
+                    f"validate={validation_trials}x{validation_tokens}tok, finalists={validation_finalists}, "
+                    f"safety={safety_mib}MiB, memory={tune_memory}, kv_precision={tune_kv_precision})"
                 )
 
                 baseline = run_candidate({}, "Baseline full cycle")
@@ -2721,9 +2894,109 @@ class LocalLLMServiceManager:
                             current = self._tuner_choose(current, group)
                             best_patch = dict(current.get("patch") or {})
 
-                baseline_score = float(baseline.get("score_seconds") or 0.0)
+                # ----------------------------------------------------------
+                # Sustained validation
+                # ----------------------------------------------------------
+                # Short screening is allowed to be noisy. Build a small finalist
+                # set from the greedy winner plus the best complete configurations
+                # seen anywhere in screening, then benchmark those configurations
+                # repeatedly with a much longer decode. Baseline is bracketed
+                # before and after the finalists to expose host/page-cache/thermal
+                # drift instead of giving the first or last configuration an
+                # ordering advantage.
+                screen_ok = [r for r in results if r.get("status") == "ok" and not r.get("validation")]
+                ranked = sorted(screen_ok, key=lambda r: float(r.get("score_seconds") or 1e99))
+                finalist_patches = []
+                finalist_keys = set()
+
+                def add_finalist(patch):
+                    patch = copy.deepcopy(patch or {})
+                    if not patch:
+                        return
+                    key = patch_key(patch)
+                    if key in finalist_keys:
+                        return
+                    finalist_keys.add(key)
+                    finalist_patches.append(patch)
+
+                add_finalist(best_patch)
+                for item in ranked:
+                    if len(finalist_patches) >= validation_finalists:
+                        break
+                    add_finalist(item.get("patch") or {})
+
+                baseline_pre = run_validation(
+                    {}, "Validate baseline (before finalists)",
+                    role="baseline-pre", trial_count=validation_baseline_half,
+                )
+                if baseline_pre.get("status") != "ok":
+                    raise RuntimeError("Sustained baseline validation failed before finalists")
+
+                validated = []
+                for patch in finalist_patches:
+                    validated.append(run_validation(
+                        patch, "Validate finalist", role="finalist",
+                        trial_count=validation_trials,
+                    ))
+
+                baseline_post = run_validation(
+                    {}, "Validate baseline (after finalists)",
+                    role="baseline-post", trial_count=validation_baseline_half,
+                )
+                if baseline_post.get("status") != "ok":
+                    raise RuntimeError("Sustained baseline validation failed after finalists")
+
+                validation_baseline = self._tuner_merge_validation_results(
+                    baseline_pre, baseline_post, label="Validation • Baseline (combined)"
+                )
+                results.append(validation_baseline)
+                self._set_tuner(results=results)
+
+                baseline_robust = float(validation_baseline.get("robust_score_seconds") or validation_baseline.get("score_seconds") or 0.0)
+                valid_finalists = [
+                    r for r in validated
+                    if r.get("status") == "ok" and float(r.get("robust_score_seconds") or r.get("score_seconds") or 0) > 0
+                ]
+
+                chosen = validation_baseline
+                if valid_finalists and baseline_robust > 0:
+                    # Rank by sustained robust performance. If multiple finalists
+                    # are within 1% (our existing noise floor), prefer the one that
+                    # produced fewer storage-backed reloads and lower dispersion.
+                    best_robust = min(float(r.get("robust_score_seconds") or r.get("score_seconds") or 1e99) for r in valid_finalists)
+                    near = [
+                        r for r in valid_finalists
+                        if float(r.get("robust_score_seconds") or r.get("score_seconds") or 1e99) <= best_robust * 1.01
+                    ]
+                    finalist_choice = min(
+                        near,
+                        key=lambda r: (
+                            int(r.get("storage_backed_trials") or 0),
+                            float(r.get("score_dispersion_ratio") or 0.0),
+                            float(r.get("robust_score_seconds") or r.get("score_seconds") or 1e99),
+                            int(r.get("measured_vram_bytes") or 0),
+                        ),
+                    )
+                    finalist_robust = float(finalist_choice.get("robust_score_seconds") or finalist_choice.get("score_seconds") or 1e99)
+                    # A recommendation must clear the same 1% measurable-gain
+                    # floor against the *validated* baseline, not merely screening.
+                    if finalist_robust < baseline_robust * 0.99:
+                        chosen = finalist_choice
+
+                current = chosen
+                best_patch = dict(current.get("patch") or {})
+                baseline_score = float(validation_baseline.get("score_seconds") or 0.0)
                 best_score = float(current.get("score_seconds") or baseline_score or 1.0)
-                improvement = max(0.0, (baseline_score - best_score) / baseline_score) if baseline_score > 0 else 0.0
+                best_robust_score = float(current.get("robust_score_seconds") or best_score)
+                improvement = max(0.0, (baseline_robust - best_robust_score) / baseline_robust) if baseline_robust > 0 else 0.0
+
+                self._log(
+                    "TUNER sustained decision: "
+                    f"baseline_robust={baseline_robust:.3f}s • "
+                    f"chosen={current.get('label')} • chosen_robust={best_robust_score:.3f}s • "
+                    f"gain={improvement*100:.2f}% • patch={best_patch or 'current settings'}"
+                )
+
                 recommendation_patch = {}
                 final_cfg = copy.deepcopy(base_cfg)
                 final_cfg.update(best_patch)
@@ -2743,9 +3016,19 @@ class LocalLLMServiceManager:
                     "score_mode": score_mode,
                     "baseline_score_seconds": baseline_score,
                     "best_score_seconds": best_score,
-                    "baseline_fixed_work_seconds": float(baseline.get("fixed_work_seconds") or 0.0),
+                    "baseline_robust_score_seconds": baseline_robust,
+                    "best_robust_score_seconds": best_robust_score,
+                    "validated": True,
+                    "validation_trials": int(current.get("trials") or 0),
+                    "validation_tokens": int(validation_tokens),
+                    "decode_tps_floor": current.get("decode_tps_floor"),
+                    "load_seconds_worst": current.get("load_seconds_worst"),
+                    "score_dispersion_ratio": current.get("score_dispersion_ratio"),
+                    "storage_backed_trials": current.get("storage_backed_trials"),
+                    "baseline_validation_trials": int(validation_baseline.get("trials") or 0),
+                    "baseline_fixed_work_seconds": float(validation_baseline.get("fixed_work_seconds") or 0.0),
                     "best_fixed_work_seconds": float(current.get("fixed_work_seconds") or 0.0),
-                    "baseline_cycle_seconds": float(baseline.get("cycle_fixed_seconds") or 0.0),
+                    "baseline_cycle_seconds": float(validation_baseline.get("cycle_fixed_seconds") or 0.0),
                     "best_cycle_seconds": float(current.get("cycle_fixed_seconds") or 0.0),
                     "improvement_percent": improvement * 100.0,
                     "load_seconds": current.get("load_seconds"),
@@ -2763,10 +3046,14 @@ class LocalLLMServiceManager:
                     state="complete", phase="Complete", progress=1.0,
                     current_candidate=None, results=results, recommendation=recommendation,
                     error=None, finished_at=time.time(),
-                    message=f"Complete. Best {score_name} score improved {improvement*100:.1f}% over baseline.",
+                    message=(
+                        f"Complete. Sustained validation selected {self._tuner_patch_label(best_patch)}; "
+                        f"robust {score_name} improved {improvement*100:.1f}% over the bracketed baseline."
+                    ),
                 )
                 self._log(
-                    f"Performance tuner complete: {improvement*100:.1f}% {score_name} improvement • "
+                    f"Performance tuner complete: {improvement*100:.1f}% validated robust {score_name} improvement • "
+                    f"validation={int(current.get('trials') or 0)}x{validation_tokens}tok • "
                     f"recommendation={recommendation_patch or 'current settings'}"
                 )
         except (InterruptedError, LocalLLMInterrupted):

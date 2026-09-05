@@ -695,9 +695,24 @@ def _request_comfyui_room(mm, required_bytes, device):
         aimdo_cleanup=bool(room.get("aimdo_cleanup_called")),
         exclusive=bool(room.get("exclusive_eviction_called")),
         final_sync=bool(room.get("final_sync_called")),
+        reduced_headroom=bool(room.get("reduced_headroom_fallback")),
+        available_headroom_mib=float(room.get("available_headroom_bytes") or 0) / _MIB,
+        preferred_shortfall_mib=float(room.get("preferred_headroom_shortfall_bytes") or 0) / _MIB,
         satisfied=bool(room.get("satisfied")),
         total_s=float(room.get("elapsed_seconds") or 0.0),
     )
+    warning = room.get("admission_warning")
+    if warning:
+        _LOGGER.warning("[Local GGUF LLM] REDUCED VRAM HEADROOM: %s", warning)
+        _perf_log(
+            "GPU lease reduced-headroom recovery",
+            runtime_mib=float(room.get("runtime_target_bytes") or 0) / _MIB,
+            raw_free_mib=float(room.get("raw_free_after_bytes") or 0) / _MIB,
+            available_headroom_mib=float(room.get("available_headroom_bytes") or 0) / _MIB,
+            preferred_headroom_mib=float(room.get("headroom_bytes") or 0) / _MIB,
+            preferred_shortfall_mib=float(room.get("preferred_headroom_shortfall_bytes") or 0) / _MIB,
+            strategy=room.get("strategy"),
+        )
     return room
 
 

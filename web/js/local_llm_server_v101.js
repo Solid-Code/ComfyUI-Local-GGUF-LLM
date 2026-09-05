@@ -372,6 +372,13 @@ function renderTuner() {
       const vram=ok?formatTunerVRAM(r.measured_vram_bytes||r.estimated_vram_bytes):formatTunerVRAM(r.estimated_vram_bytes);
       const spec=ok?(r.speculative_effective||"Off"):"—";
       const flags=[];
+      if(r.validation){
+        flags.push(`validated ${Number(r.trials||0)} cycles`);
+        if(Number(r.decode_tps_floor||0)>0) flags.push(`floor ${Number(r.decode_tps_floor).toFixed(1)} t/s`);
+        if(Number(r.score_dispersion_ratio||0)>0) flags.push(`spread ${(Number(r.score_dispersion_ratio)*100).toFixed(1)}%`);
+        if(Number(r.storage_backed_trials||0)>0) flags.push(`storage I/O ${Number(r.storage_backed_trials)}/${Number(r.trials||0)}`);
+        if(r.validation_role==="baseline-combined") flags.push("bracketed baseline");
+      }
       if(r.acceptance_rate!=null) flags.push(`${(Number(r.acceptance_rate)*100).toFixed(1)}% accept`);
       if(r.quality_tradeoff) flags.push("KV quality tradeoff");
       const result=ok?(flags.join(" • ")||"OK"):(r.reason||r.status||"—");
@@ -400,7 +407,12 @@ function renderTuner() {
     };
     const parts=Object.entries(patch).map(([k,v])=>`${names[k]||k}: ${typeof v==="boolean"?(v?"On":"Off"):v}`);
     const settings=modal.querySelector("#llm-tuner-settings");
-    let text=parts.length?parts.join(" • "):"Current saved settings were fastest within the tuner's noise threshold; no changes are recommended.";
+    let text=parts.length?parts.join(" • "):"Current saved settings were fastest after sustained validation; no changes are recommended.";
+    if(rec.validated){
+      const floor=Number(rec.decode_tps_floor||0)>0?` • generation floor ${Number(rec.decode_tps_floor).toFixed(1)} t/s`:"";
+      const spread=Number(rec.score_dispersion_ratio||0)>0?` • score spread ${(Number(rec.score_dispersion_ratio)*100).toFixed(1)}%`:"";
+      text+=`  Validated with ${Number(rec.validation_trials||0)} sustained cycles × ${Number(rec.validation_tokens||0)} tokens${floor}${spread}.`;
+    }
     const tradeoffs=Array.isArray(rec.tradeoffs)?rec.tradeoffs:[];
     if(tradeoffs.length) text+=`  Considerations: ${tradeoffs.join(" ")}`;
     if(settings){settings.textContent=text;settings.classList.toggle("llm-warn",tradeoffs.length>0);}
@@ -715,7 +727,7 @@ function renderModal() {
         <div class="llm-pane" data-pane="tuner">
           <div class="llm-card"><h3>Performance Tuner</h3>
             <div class="llm-tuner-options">
-              <label title="Quick uses one measured full-cycle trial per candidate. Standard uses two trials, a wider memory search, and tunes the draft-token count of the winning speculative provider.">Profile</label><select id="llm-tuner-profile"><option>Quick</option><option>Standard</option></select>
+              <label title="Quick uses short screening, then validates the top 2 complete configurations with 4 sustained 192-token cycles and a bracketed baseline. Standard screens twice, validates the top 3 with 6 sustained 256-token cycles, and uses a wider search.">Profile</label><select id="llm-tuner-profile"><option>Quick</option><option>Standard</option></select>
               <label title="ComfyUI Cycle scores warm reload + fixed prompt/generation work + Suspend-style unload. Inference Only scores prompt/generation work without load/unload time.">Optimize for</label><select id="llm-tuner-score"><option>ComfyUI Cycle</option><option>Inference Only</option></select>
               <label title="Single-GPU candidates are pre-skipped only when their estimated native runtime plus this required free-space guard cannot physically fit on the GPU. Current ComfyUI/DynamicVRAM residency is reclaimable and is handled by the real loader.">Minimum physical headroom (MiB)</label><input id="llm-tuner-headroom" type="number" min="256" step="256" value="1024" title="Required free-space guard for physical-fit screening. The loader's own lease headroom remains the minimum; current ComfyUI residency does not cause a pre-skip.">
               <label>Batch sizes</label><input id="llm-tuner-batches" type="checkbox" checked>

@@ -1,4 +1,32 @@
-# Local GGUF LLM — v0.18.67 alpha
+# Local GGUF LLM — v0.18.70 alpha
+
+## v0.18.70-alpha
+
+- Adds a guarded **reduced-headroom recovery** for smaller GPUs. The normal GPU lease still targets the full native runtime requirement plus the preferred 1 GiB/configured headroom and still exhausts cooperative, AIMDO, and exclusive ComfyUI reclamation first.
+- If the preferred headroom cannot be established but final driver-visible raw VRAM is still at least the full runtime target, the load is now admitted with `strategy=reduced-headroom-runtime-fit` instead of failing before `Llama(...)`. The runtime target itself is never reduced.
+- Emits a prominent warning with runtime size, raw free VRAM, actual available headroom, preferred headroom, and the preferred-headroom shortfall. The native constructor remains authoritative: if the model truly cannot fit, llama.cpp/CUDA still fails normally rather than being masked.
+- This specifically allows capacity-constrained cards such as a 16 GB RTX 5060 Ti to attempt a model that fits in physical VRAM even when it cannot preserve the default 1 GiB fit margin.
+- VRAM coordination policy v15: `native-gpu-lease-v5-runtime-fit-recovery`. Bridge API remains v2; Prompt Enhancer and tuner behavior are unchanged.
+
+## v0.18.69-alpha
+
+- **Prompt Enhancer workflow-scoped runtime ownership.** Background-state reconciliation is now keyed by both the serialized enhancer instance id and ComfyUI's live workflow-tab object. Loading a workflow from image/JSON therefore restores the values embedded in that workflow instead of inheriting newer Prompt/settings/history values from another open workflow that happens to carry the same node state id.
+- Added an internal `prompt_runtime_scope` transport field (hidden in the node UI) and carried it through manual Enhance, workflow Enhance, Prompt Cycle, cancellation, batch progress, deferred execution replay, and backend cycle/pending-request state. The serialized value is never trusted; the frontend rewrites it from the current ComfyUI workflow runtime.
+- Loaded graphs no longer seed/reconcile the runtime journal during graph construction, when ComfyUI may still report the previously active workflow. Reconciliation occurs from the graph-activation lifecycle after workflow selection settles.
+- Prompt Enhancer frontend/backend: **v0.6.29-alpha**. VRAM policy, tuner methodology, and bridge API are unchanged from v0.18.68.
+
+## v0.18.68-alpha
+
+### Sustained performance tuner validation
+
+- Reworks tuning into two stages instead of allowing a single short burst to become the recommendation. Quick screens each candidate with 1×64 generated tokens; Standard screens with 2×96.
+- The strongest complete configurations are then re-benchmarked with repeated long full cycles: Quick validates the top 2 finalists with 4×192-token cycles; Standard validates the top 3 with 6×256-token cycles.
+- Baseline is validated both before and after the finalists, and those trial records are combined. This controls for host-memory/page-cache/thermal drift and catches configurations whose performance deteriorates over repeated reloads.
+- Final ranking uses a conservative sustained score: the worse of median + scaled median absolute deviation or the 75th-percentile cycle/inference score. This catches both general variance and isolated severe stalls. A recommendation still must beat the validated baseline by at least 1%.
+- When finalists are effectively tied within the existing 1% noise floor, the tuner prefers fewer storage-backed reloads, lower run-to-run dispersion, then lower VRAM use.
+- Records per-trial generation throughput, native load time, unload time, page faults, block I/O, page-cache movement, and available-memory movement. Validation rows expose generation floor, score spread, and storage-I/O incidence in the Tuner results table.
+- The final recommendation now comes only from sustained validation. A screening winner that becomes unstable under repeated load→inference→unload cycles is rejected automatically in favor of a validated finalist or the original saved baseline.
+- Does not ban mmap/mlock/batch combinations and does not change VRAM policy v14 or bridge API v2.
 
 ## v0.18.67-alpha
 
@@ -157,7 +185,7 @@ VRAM handoff hardening:
 - **The Enhance batch owns its full queue lifetime:** all internal LLM iterations plus the final native llama.cpp VRAM suspend happen before the single Prompt Enhancer queue item returns, so the next queued diffusion job cannot begin early.
 - **Queued-snapshot reconciliation:** workflows queued during the batch may have serialized the Prompt Enhancer before all progress updates reached the browser. The backend now recognizes pre-batch/intermediate history snapshots and upgrades them to the completed batch history when those queued jobs execute, without delaying queue submission.
 - Removed the v0.18.49 informational “Workflow queued until…” Run gate/notification.
-- Prompt Enhancer frontend: **v0.6.28-alpha**.
+- Prompt Enhancer frontend: **v0.6.29-alpha**.
 
 
 ## v0.18.49 alpha
@@ -188,7 +216,7 @@ This package includes:
 
 - **Local LLM Generate** — send prompts, images, and sampled video frames to the persistent local LLM.
 - **Local LLM Settings** — reusable model/generation settings with loadable Complete Settings Presets. Memory/performance tuning remains in the Local LLM service panel rather than crowding the workflow node.
-- **Local LLM Prompt Enhancer** — bundled **v0.6.28-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
+- **Local LLM Prompt Enhancer** — bundled **v0.6.29-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
 - **Local LLM Server panel** — model loading, presets, memory/VRAM controls, status, performance information, and the optional OpenAI-compatible API.
 
 
@@ -217,7 +245,7 @@ ComfyUI/custom_nodes/ComfyUI-Local-GGUF-LLM/
 
 Restart ComfyUI, then hard-refresh the browser if an older frontend is still cached.
 
-Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.28-alpha is already bundled here.
+Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.29-alpha is already bundled here.
 
 ## GGUF model folders
 
