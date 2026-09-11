@@ -12,8 +12,7 @@ Admission is deliberately staged so the common case is cheap:
 3. Otherwise ask ComfyUI for a *logical-free* target that is compensated by
    its current PyTorch allocator slack. ComfyUI intentionally stops eviction on
    (raw CUDA free + allocator slack); llama.cpp requires raw CUDA free. Adding
-   the current allocator slack to the request aligns those two metrics without
-   inventing a tolerance or safety margin.
+   the current allocator slack to the request aligns those two metrics.
 4. Re-measure after cooperative eviction. If allocator slack changed enough to
    leave raw VRAM short, issue one corrected cooperative request from the new
    measurement.
@@ -25,8 +24,14 @@ Admission is deliberately staged so the common case is cheap:
 The semantic lease remains simple:
     native runtime requirement + one device headroom = raw-free target
 
-No verification tolerances or stacked safety margins are used.  AIMDO requests
-are only rounded upward to its physical VBAR page granularity.
+Normal admission also requires a small, separately-accounted native-load
+stability guard above that semantic target.  This is intentionally not folded
+into llama.cpp's headroom: it protects against driver/WSL/WDDM allocation
+movement between the ComfyUI handoff probe and the native CUDA load.  If even
+an exclusive ComfyUI eviction cannot provide the guard, the existing fallback
+still permits the semantic target (or, ultimately, the runtime itself) rather
+than rejecting a model that genuinely fits.  AIMDO requests are rounded upward
+to its physical VBAR page granularity.
 """
 from __future__ import annotations
 
@@ -41,6 +46,15 @@ _GIB = 1024 * 1024 * 1024
 
 # llama.cpp's current --fit default target margin is 1024 MiB per device.
 LLAMA_DEFAULT_DEVICE_MARGIN_BYTES = 1024 * _MIB
+
+# Raw free VRAM can move after ComfyUI's final probe but before/during native
+# llama.cpp CUDA allocation (desktop compositor, WSL/WDDM bookkeeping, delayed
+# frees, allocator page movement).  A request that stops only a few MiB above
+# the semantic target has been observed to load successfully yet run through
+# shared/system VRAM at a fraction of normal decode speed.  Keep this separate
+# from the semantic llama headroom so tight GPUs can still use the existing
+# guarded fallback after all normal reclamation is exhausted.
+NATIVE_LOAD_STABILITY_GUARD_BYTES = 512 * _MIB
 
 # AIMDO VBAR pages are 32 MiB; only the request is aligned, never the semantic
 # target used for admission verification.
@@ -256,6 +270,8 @@ class GPULeaseResult:
     runtime_target_bytes: int
     headroom_bytes: int
     free_target_bytes: int
+    stability_guard_bytes: int
+    admission_target_bytes: int
     request_target_bytes: int
     request_granularity_bytes: int
     cooperative_request_target_bytes: int = 0
@@ -287,6 +303,9 @@ class GPULeaseResult:
     elapsed_seconds: float = 0.0
     error: Optional[str] = None
     headroom_sources: Optional[dict[str, int]] = None
+    stability_guard_fallback: bool = False
+    available_stability_guard_bytes: int = 0
+    stability_guard_shortfall_bytes: int = 0
     reduced_headroom_fallback: bool = False
     available_headroom_bytes: int = 0
     preferred_headroom_shortfall_bytes: int = 0
@@ -307,12 +326,18 @@ class GPUMemoryLeaseManager:
         runtime_required = max(0, int(runtime_required or 0))
         headroom, sources = _configured_headroom_bytes(self.mm, self.aimdo_enabled)
         free_target = runtime_required + headroom if runtime_required > 0 else 0
+        stability_guard = NATIVE_LOAD_STABILITY_GUARD_BYTES if runtime_required > 0 else 0
+        admission_target = free_target + stability_guard if runtime_required > 0 else 0
+        sources = dict(sources or {})
+        sources["native_load_stability_guard_bytes"] = int(stability_guard)
         granularity = AIMDO_REQUEST_GRANULARITY_BYTES if self.aimdo_enabled else DEFAULT_REQUEST_GRANULARITY_BYTES
-        request_target = _round_up(free_target, granularity)
+        request_target = _round_up(admission_target, granularity)
         return GPULeaseResult(
             runtime_target_bytes=runtime_required,
             headroom_bytes=headroom if runtime_required > 0 else 0,
             free_target_bytes=free_target,
+            stability_guard_bytes=stability_guard,
+            admission_target_bytes=admission_target,
             request_target_bytes=request_target,
             request_granularity_bytes=granularity,
             satisfied=(runtime_required <= 0),
@@ -331,7 +356,7 @@ class GPUMemoryLeaseManager:
         slack aligns ComfyUI's stop condition with our raw target.
         """
         slack = max(0, int(torch_slack_bytes or 0))
-        logical_target = int(result.free_target_bytes) + slack
+        logical_target = int(result.admission_target_bytes) + slack
         return _round_up(logical_target, int(result.request_granularity_bytes or 1))
 
     @staticmethod
@@ -397,11 +422,45 @@ class GPUMemoryLeaseManager:
         result.raw_free_after_bytes = raw
         result.comfy_free_after_bytes = comfy
         result.torch_reclaimable_after_bytes = reclaimable
-        if effective >= result.free_target_bytes:
+        if effective >= result.admission_target_bytes:
             result.satisfied = True
             result.strategy = strategy
             return True
         return False
+
+    def _admit_semantic_target_without_stability_guard(
+        self, result: GPULeaseResult, raw_free: Optional[int]
+    ) -> bool:
+        """Fallback after exhaustive reclamation when only the extra guard is short.
+
+        The semantic llama.cpp lease (runtime + configured headroom) is still
+        intact, so this is safer than the reduced-headroom fallback below.  It
+        is intentionally reachable only after cooperative/AIMDO/exclusive
+        reclamation has already been exhausted.
+        """
+        if result.satisfied or raw_free is None:
+            return False
+        semantic_target = max(0, int(result.free_target_bytes or 0))
+        raw = max(0, int(raw_free or 0))
+        if semantic_target <= 0 or raw < semantic_target:
+            return False
+
+        preferred_guard = max(0, int(result.stability_guard_bytes or 0))
+        available_guard = max(0, raw - semantic_target)
+        shortfall = max(0, preferred_guard - available_guard)
+        result.satisfied = True
+        result.stability_guard_fallback = True
+        result.available_stability_guard_bytes = int(available_guard)
+        result.stability_guard_shortfall_bytes = int(shortfall)
+        result.strategy = "semantic-headroom-no-stability-guard"
+        result.admission_warning = (
+            "Local GGUF LLM could not preserve the extra native-load stability guard after fully reclaiming "
+            "ComfyUI VRAM, but the complete semantic lease still fits in driver-visible VRAM. "
+            f"Proceeding without the full guard: semantic_target={semantic_target / _MIB:.1f} MiB, "
+            f"raw_free={raw / _MIB:.1f} MiB, available_guard={available_guard / _MIB:.1f} MiB, "
+            f"preferred_guard={preferred_guard / _MIB:.1f} MiB, guard_shortfall={shortfall / _MIB:.1f} MiB."
+        )
+        return True
 
     def _admit_reduced_headroom_if_runtime_fits(self, result: GPULeaseResult, raw_free: Optional[int]) -> bool:
         """Last-resort admission when the runtime fits but preferred headroom does not.
@@ -463,7 +522,7 @@ class GPUMemoryLeaseManager:
         raw = _raw_cuda_free(device)
         result.stage_timings_seconds["raw_probe"] = time.perf_counter() - probe_started
         result.raw_free_before_bytes = raw
-        if raw is not None and raw >= result.free_target_bytes:
+        if raw is not None and raw >= result.admission_target_bytes:
             result.stage_memory["before"] = {
                 "raw_free_bytes": raw, "total_bytes": _raw_cuda_total(device),
                 "raw_used_bytes": None, "comfy_logical_free_bytes": 0,
@@ -494,7 +553,7 @@ class GPUMemoryLeaseManager:
             "logical_minus_raw_bytes": (max(0, int(comfy) - int(raw)) if raw is not None else None),
             "loaded_models": _loaded_models_snapshot(self.mm, device),
         }
-        if raw is None and comfy >= result.free_target_bytes:
+        if raw is None and comfy >= result.admission_target_bytes:
             result.comfy_free_after_bytes = comfy
             result.torch_reclaimable_after_bytes = reclaimable
             result.satisfied = True
@@ -507,13 +566,13 @@ class GPUMemoryLeaseManager:
         # split blocks cannot be returned to CUDA; failure simply falls through
         # to the cooperative metric-compensated path.
         if raw is not None:
-            shortfall = max(0, result.free_target_bytes - raw)
+            shortfall = max(0, result.admission_target_bytes - raw)
             if reclaimable >= shortfall and reclaimable >= MIN_CACHE_RECLAIM_BYTES:
                 self._flush_cache(result, stage="pre-cooperative")
                 effective, raw, comfy, reclaimable = self._effective_free(device, self.mm)
                 result.raw_free_after_cache_bytes = raw
                 snap("after_pre_cache")
-                if effective >= result.free_target_bytes:
+                if effective >= result.admission_target_bytes:
                     result.raw_free_after_bytes = raw
                     result.comfy_free_after_bytes = comfy
                     result.torch_reclaimable_after_bytes = reclaimable
@@ -545,7 +604,7 @@ class GPUMemoryLeaseManager:
         effective, raw, comfy, reclaimable = self._effective_free(device, self.mm)
         result.raw_free_after_cooperative_bytes = raw
         snap("after_cooperative")
-        if raw is not None and raw >= result.free_target_bytes:
+        if raw is not None and raw >= result.admission_target_bytes:
             result.raw_free_after_bytes = raw
             result.comfy_free_after_bytes = comfy
             result.torch_reclaimable_after_bytes = reclaimable
@@ -553,7 +612,7 @@ class GPUMemoryLeaseManager:
             result.strategy = "cooperative-comfy-eviction"
             result.elapsed_seconds = time.perf_counter() - started
             return result.as_dict()
-        if raw is None and comfy >= result.free_target_bytes:
+        if raw is None and comfy >= result.admission_target_bytes:
             result.raw_free_after_bytes = raw
             result.comfy_free_after_bytes = comfy
             result.torch_reclaimable_after_bytes = reclaimable
@@ -583,7 +642,7 @@ class GPUMemoryLeaseManager:
             effective, raw, comfy, reclaimable = self._effective_free(device, self.mm)
             result.raw_free_after_cooperative_bytes = raw
             snap("after_cooperative_retry")
-            if raw is not None and raw >= result.free_target_bytes:
+            if raw is not None and raw >= result.admission_target_bytes:
                 result.raw_free_after_bytes = raw
                 result.comfy_free_after_bytes = comfy
                 result.torch_reclaimable_after_bytes = reclaimable
@@ -591,7 +650,7 @@ class GPUMemoryLeaseManager:
                 result.strategy = "cooperative-comfy-eviction-corrected"
                 result.elapsed_seconds = time.perf_counter() - started
                 return result.as_dict()
-            if raw is None and comfy >= result.free_target_bytes:
+            if raw is None and comfy >= result.admission_target_bytes:
                 result.raw_free_after_bytes = raw
                 result.comfy_free_after_bytes = comfy
                 result.torch_reclaimable_after_bytes = reclaimable
@@ -610,7 +669,7 @@ class GPUMemoryLeaseManager:
             effective, raw, comfy, reclaimable = self._effective_free(device, self.mm)
             result.raw_free_after_aimdo_cleanup_bytes = raw
             snap("after_aimdo_cleanup")
-            if effective >= result.free_target_bytes:
+            if effective >= result.admission_target_bytes:
                 result.raw_free_after_bytes = raw
                 result.comfy_free_after_bytes = comfy
                 result.torch_reclaimable_after_bytes = reclaimable
@@ -658,10 +717,12 @@ class GPUMemoryLeaseManager:
         self._finish_if_satisfied(result, device, "exclusive-target-gpu-eviction+final-sync")
         if not result.satisfied:
             # All normal reclamation has been exhausted.  Preserve the runtime
-            # requirement as the hard floor, but do not turn llama.cpp's preferred
-            # fit margin into an absolute ban on smaller GPUs.  If the runtime
-            # itself fits, allow one guarded native load attempt with a warning.
-            self._admit_reduced_headroom_if_runtime_fits(result, result.raw_free_after_bytes)
+            # requirement as the hard floor, but do not turn the extra stability
+            # guard (or llama.cpp's preferred fit margin) into an absolute ban on
+            # smaller GPUs. Prefer the full semantic lease first; only then fall
+            # back to a runtime-only fit.
+            if not self._admit_semantic_target_without_stability_guard(result, result.raw_free_after_bytes):
+                self._admit_reduced_headroom_if_runtime_fits(result, result.raw_free_after_bytes)
         result.elapsed_seconds = time.perf_counter() - started
         return result.as_dict()
 
@@ -674,8 +735,12 @@ class GPUMemoryLeaseManager:
             granularity = AIMDO_REQUEST_GRANULARITY_BYTES if self.aimdo_enabled else DEFAULT_REQUEST_GRANULARITY_BYTES
             result.headroom_bytes = int(headroom)
             result.free_target_bytes = int(headroom)
+            result.stability_guard_bytes = 0
+            result.admission_target_bytes = int(headroom)
             result.request_target_bytes = _round_up(headroom, granularity)
             result.request_granularity_bytes = int(granularity)
+            sources = dict(sources or {})
+            sources["native_load_stability_guard_bytes"] = 0
             result.headroom_sources = sources
         started = time.perf_counter()
         result.stage_memory = {}
@@ -700,7 +765,7 @@ class GPUMemoryLeaseManager:
         result.raw_free_after_bytes = raw
         result.comfy_free_after_bytes = comfy
         result.torch_reclaimable_after_bytes = reclaimable
-        result.satisfied = bool(effective >= result.free_target_bytes)
+        result.satisfied = bool(effective >= result.admission_target_bytes)
         if not result.satisfied:
             result.final_sync_called = True
             final_sync_started = time.perf_counter()
@@ -711,9 +776,10 @@ class GPUMemoryLeaseManager:
             result.raw_free_after_bytes = raw
             result.comfy_free_after_bytes = comfy
             result.torch_reclaimable_after_bytes = reclaimable
-            result.satisfied = bool(effective >= result.free_target_bytes)
+            result.satisfied = bool(effective >= result.admission_target_bytes)
         if minimum_runtime > 0 and not result.satisfied:
-            self._admit_reduced_headroom_if_runtime_fits(result, result.raw_free_after_bytes)
+            if not self._admit_semantic_target_without_stability_guard(result, result.raw_free_after_bytes):
+                self._admit_reduced_headroom_if_runtime_fits(result, result.raw_free_after_bytes)
         result.elapsed_seconds = time.perf_counter() - started
         return result.as_dict()
 
@@ -722,14 +788,17 @@ def lease_failure_message(room: dict[str, Any]) -> str:
     runtime = int((room or {}).get("runtime_target_bytes") or 0)
     headroom = int((room or {}).get("headroom_bytes") or 0)
     free_target = int((room or {}).get("free_target_bytes") or 0)
+    stability_guard = int((room or {}).get("stability_guard_bytes") or 0)
+    admission_target = int((room or {}).get("admission_target_bytes") or free_target)
     request_target = int((room or {}).get("request_target_bytes") or 0)
     raw = (room or {}).get("raw_free_after_bytes")
     raw_text = f"{float(raw) / _MIB:.1f}" if raw is not None else "unknown"
-    shortfall = max(0, free_target - int(raw or 0)) if raw is not None else free_target
+    shortfall = max(0, admission_target - int(raw or 0)) if raw is not None else admission_target
     return (
         "Local GGUF LLM could not acquire a safe GPU memory lease before native load: "
         f"runtime={runtime / _MIB:.1f} MiB, headroom={headroom / _MIB:.1f} MiB, "
-        f"free_target={free_target / _MIB:.1f} MiB, request_target={request_target / _MIB:.1f} MiB, "
+        f"free_target={free_target / _MIB:.1f} MiB, stability_guard={stability_guard / _MIB:.1f} MiB, "
+        f"admission_target={admission_target / _MIB:.1f} MiB, request_target={request_target / _MIB:.1f} MiB, "
         f"raw_free_after={raw_text} MiB, shortfall={shortfall / _MIB:.1f} MiB, "
         f"strategy={(room or {}).get('strategy', 'unknown')}. "
         "ComfyUI/AIMDO could not establish the driver-visible room required by the native llama.cpp lease; "

@@ -2,7 +2,7 @@ import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
 const EXTENSION_NAME = "LocalLLM.PromptEnhancer";
-const FRONTEND_VERSION = "0.6.30-alpha";
+const FRONTEND_VERSION = "0.6.33-alpha";
 console.info(`[Local LLM Prompt Enhancer] frontend ${FRONTEND_VERSION}`);
 const NODE_CLASS = "LocalLLMPromptEnhancer";
 const DEFAULT_PRESET = "Default / Krea 2 - Image";
@@ -15,16 +15,19 @@ let graphConfigureDepth = 0;
 const pendingNodes = new Map();
 const pendingNodesByOwnerKey = new Map();
 // Runtime journal ownership is TWO-dimensional:
-//   workflow-runtime scope + stable enhancer-instance id.
-// The instance id is intentionally serialized so an enhancer can recover a
-// background result when its own workflow tab is remounted. The workflow scope
-// is intentionally NOT trusted from serialized workflow/image data: it is
-// derived from ComfyUI's live workflow object for this browser session. This
-// prevents an imported workflow/image that contains the same enhancer instance
-// id from inheriting the current tab's newer Prompt/settings/history.
+//   workflow-runtime scope + graph-local node id.
+// Neither dimension is persisted into workflow/image metadata. A workflow save
+// is a snapshot of the actual user-visible/available node state, never of the
+// browser's background execution journal. Runtime ownership is reconstructed
+// from the live ComfyUI workflow plus node id whenever the graph is mounted.
 const runtimeStateByOwnerKey = new Map();
 const deferredExecutionsByOwnerKey = new Map();
 const workflowRuntimeScopeByObject = new WeakMap();
+// Active ComfyUI workflow tabs can rebuild their graph objects when switching
+// tabs. Keep a browser-session alias by the workflow manager's stable tab key
+// so runtime-only enhancer state can reattach after that remount without ever
+// serializing the scope into workflow/image metadata as authoritative state.
+const workflowRuntimeScopeByIdentity = new Map();
 
 function newPromptEnhancerInstanceId() {
   try {
@@ -35,25 +38,52 @@ function newPromptEnhancerInstanceId() {
 
 
 function currentPromptEnhancerWorkflowScope(node = null) {
+  const makeScope = (owner, label = "workflow", stableIdentity = "") => {
+    if (!owner || (typeof owner !== "object" && typeof owner !== "function")) return "";
+    const identity = String(stableIdentity || "").trim();
+    let scope = identity ? workflowRuntimeScopeByIdentity.get(identity) : "";
+    if (!scope) scope = workflowRuntimeScopeByObject.get(owner);
+    if (!scope) {
+      const clean = String(label || "workflow").replace(/[^A-Za-z0-9_.-]+/g, "_").slice(-80);
+      scope = `wf-${clean || "workflow"}-${newPromptEnhancerInstanceId()}`;
+    }
+    workflowRuntimeScopeByObject.set(owner, scope);
+    if (identity) workflowRuntimeScopeByIdentity.set(identity, scope);
+    return scope;
+  };
+
+  // Prefer the official active-workflow object only when this node belongs to
+  // the active graph. During graph construction ComfyUI can still expose the
+  // workflow being left, while node.graph already identifies the incoming one.
+  // The workflow-manager key/id is kept only in this browser session. This is
+  // what lets a background-tab completion reattach after ComfyUI reconstructs
+  // the workflow/graph objects.
   try {
     const workflow = app?.extensionManager?.workflow?.activeWorkflow;
-    if (workflow && (typeof workflow === "object" || typeof workflow === "function")) {
-      let scope = workflowRuntimeScopeByObject.get(workflow);
-      if (!scope) {
-        const label = String(workflow?.key || workflow?.path || "workflow").replace(/[^A-Za-z0-9_.-]+/g, "_").slice(-80);
-        scope = `wf-${label || "workflow"}-${newPromptEnhancerInstanceId()}`;
-        workflowRuntimeScopeByObject.set(workflow, scope);
-      }
-      return scope;
+    if (workflow && (!node?.graph || node.graph === app?.graph)) {
+      const rawIdentity = workflow?.key ?? workflow?.id ?? workflow?.path ?? "";
+      const identity = rawIdentity === "" ? "" : `active:${String(rawIdentity)}`;
+      const scope = makeScope(workflow, workflow?.key || workflow?.path || workflow?.id || "workflow", identity);
+      if (scope) return scope;
     }
   } catch (_) {}
-  // Compatibility fallback for frontends without ExtensionManager.workflow.
-  // This scope is page-session-only. It deliberately never trusts the value
-  // serialized inside a workflow/image.
-  if (!globalThis.__localLLMPromptEnhancerFallbackWorkflowScope) {
-    globalThis.__localLLMPromptEnhancerFallbackWorkflowScope = `page-${newPromptEnhancerInstanceId()}`;
+
+  // Graph-object ownership is a clean runtime-only fallback and is unique across
+  // simultaneously open workflow graphs without serializing an identity token.
+  const graphScope = makeScope(node?.graph, `graph-${String(node?.graph?.id ?? "runtime")}`);
+  if (graphScope) return graphScope;
+
+  // Last-resort detached-node scope. Keep it isolated to this node/runtime
+  // rather than sharing a page-global fallback across unrelated workflows.
+  if (node) {
+    let scope = String(node.__promptEnhancerDetachedWorkflowScope || "").trim();
+    if (!scope) {
+      scope = `detached-${newPromptEnhancerInstanceId()}`;
+      node.__promptEnhancerDetachedWorkflowScope = scope;
+    }
+    return scope;
   }
-  return globalThis.__localLLMPromptEnhancerFallbackWorkflowScope;
+  return "";
 }
 
 function ensurePromptEnhancerWorkflowScope(node, { refresh = false } = {}) {
@@ -73,8 +103,8 @@ function ensurePromptEnhancerWorkflowScope(node, { refresh = false } = {}) {
 function promptEnhancerOwnerKeyFromParts(scope, instanceId) {
   const cleanScope = String(scope || "").trim();
   const cleanId = String(instanceId || "").trim();
-  if (!cleanId) return "";
-  return `${cleanScope || "legacy"}\u001f${cleanId}`;
+  if (!cleanScope || !cleanId) return "";
+  return `${cleanScope}\u001f${cleanId}`;
 }
 
 function promptEnhancerOwnerKey(node) {
@@ -226,6 +256,35 @@ async function endEnhancementBatch(batchId) {
   } finally {
     publishEnhancementBatchState(id, false, 0);
   }
+}
+
+function normalizePromptEnhancerRuntimeWidgets(node) {
+  if (!node) return;
+
+  const revision = widget(node, "prompt_cycle_revision");
+  const revisionValue = Number(revision?.value);
+  if (revision && !Number.isFinite(revisionValue)) setWidgetValue(revision, 0, false);
+
+  const shuffle = widget(node, "prompt_shuffle_json");
+  if (shuffle) {
+    const raw = shuffle.value;
+    if (raw == null || typeof raw !== "string") setWidgetValue(shuffle, "[]", false);
+    else {
+      try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) setWidgetValue(shuffle, "[]", false);
+      } catch (_) {
+        setWidgetValue(shuffle, "[]", false);
+      }
+    }
+  }
+
+  // state id and runtime scope are filled by their dedicated ownership helpers.
+  // Never preserve a literal null from a refreshed/legacy workflow.
+  const stateId = widget(node, "prompt_state_id");
+  if (stateId && stateId.value == null) setWidgetValue(stateId, "", false);
+  const runtimeScope = widget(node, "prompt_runtime_scope");
+  if (runtimeScope && runtimeScope.value == null) setWidgetValue(runtimeScope, "", false);
 }
 
 function promptCycleRevision(node) {
@@ -397,7 +456,7 @@ function enhanceBatchCount(node) {
   if (!node) return ENHANCE_BATCH_MIN;
   const current = Number(node.__promptEnhancerBatchCount);
   if (Number.isFinite(current)) return normalizeEnhanceBatchCount(current);
-  const saved = node?.properties?.[PERSISTENCE_STATE_KEY]?.batchCount;
+  const saved = readUiPersistenceState(node)?.batchCount;
   const count = normalizeEnhanceBatchCount(saved ?? ENHANCE_BATCH_MIN);
   node.__promptEnhancerBatchCount = count;
   return count;
@@ -958,8 +1017,8 @@ function clearEnhanceTransport(node) {
   node.__promptEnhancerJobId = null;
   node.__promptEnhancerRequestController = null;
   pendingNodes.delete(String(node.id));
-  const instanceId = String(node.__promptEnhancerInstanceId || widget(node, "prompt_state_id")?.value || "").trim();
-  if (instanceId && pendingNodesByOwnerKey.get(promptEnhancerOwnerKey(node)) === node) pendingNodesByOwnerKey.delete(promptEnhancerOwnerKey(node));
+  const ownerKey = String(node.__promptEnhancerLastOwnerKey || promptEnhancerOwnerKey(node) || "").trim();
+  if (ownerKey && pendingNodesByOwnerKey.get(ownerKey) === node) pendingNodesByOwnerKey.delete(ownerKey);
 }
 
 function settleEnhanceExecution(node, error = null, data = null) {
@@ -1064,7 +1123,6 @@ function handleEnhanceBatchProgressEvent(detail) {
   if (!token) return;
   const ownerKey = promptEnhancerOwnerKeyFromData(data);
   let node = ownerKey ? pendingNodesByOwnerKey.get(ownerKey) : null;
-  if (!node && nodeId) node = pendingNodes.get(nodeId);
   if (!node || String(node.__promptEnhancerPendingToken || "") !== token) return;
   if (stateId && ensurePromptEnhancerInstanceId(node) !== stateId) return;
   const runtimeScope = String(data?.runtime_scope || "").trim();
@@ -1334,7 +1392,13 @@ async function runTargetedEnhancementBatch(node, prompt, enhancementText, seeds,
 
     node.__promptEnhancerPendingToken = token;
     pendingNodes.set(String(node.id), node);
-    pendingNodesByOwnerKey.set(promptEnhancerOwnerKey(node), node);
+    {
+      const ownerKey = promptEnhancerOwnerKey(node);
+      if (ownerKey) {
+        pendingNodesByOwnerKey.set(ownerKey, node);
+        node.__promptEnhancerLastOwnerKey = ownerKey;
+      }
+    }
 
     if (typeof app?.graphToPrompt !== "function" || typeof api?.queuePrompt !== "function") {
       throw new Error("This ComfyUI frontend does not support targeted execution required for connected media/settings enhancement.");
@@ -1697,26 +1761,71 @@ function installTextareaUserResizePersistence(node, controls) {
   }
 }
 
-const PERSISTENCE_STATE_VERSION = 3;
+const PERSISTENCE_STATE_VERSION = 4;
 const PERSISTENCE_STATE_KEY = "local_llm_prompt_enhancer_state";
+
+// Workflow persistence and runtime journaling are intentionally separate:
+// - normal ComfyUI widgets own all user-visible/available values;
+// - this property stores only UI state with no native widget of its own;
+// - the full background-execution journal exists only in browser memory.
+function cloneUiPersistenceState(state) {
+  return {
+    version: PERSISTENCE_STATE_VERSION,
+    batchCount: normalizeEnhanceBatchCount(state?.batchCount ?? ENHANCE_BATCH_MIN),
+    textareaHeights: Object.fromEntries(
+      TEXTAREA_KEYS
+        .map((key) => [key, normalizeTextareaHeight(state?.textareaHeights?.[key])])
+        .filter(([, value]) => value)
+    ),
+  };
+}
+
+function uiPersistenceStateSnapshot(node) {
+  return cloneUiPersistenceState({
+    batchCount: enhanceBatchCount(node),
+    textareaHeights: textareaHeightStateSnapshot(node),
+  });
+}
+
+function readUiPersistenceState(node) {
+  const raw = node?.properties?.[PERSISTENCE_STATE_KEY];
+  if (!raw || typeof raw !== "object") return cloneUiPersistenceState({});
+  const version = Number(raw?.version ?? 1);
+  // v1-v3 duplicated Prompt/settings/history/runtime ownership. Never restore
+  // those copies: the native widgets in the workflow are authoritative. We only
+  // salvage UI-only values that had no other persistence location.
+  return cloneUiPersistenceState({
+    batchCount: raw?.batchCount,
+    textareaHeights: version >= 3 ? raw?.textareaHeights : {},
+  });
+}
+
+function persistUiState(node, serializedData = null) {
+  if (!node) return null;
+  const state = uiPersistenceStateSnapshot(node);
+  node.properties ||= {};
+  node.properties[PERSISTENCE_STATE_KEY] = cloneUiPersistenceState(state);
+  if (serializedData && typeof serializedData === "object") {
+    serializedData.properties ||= {};
+    serializedData.properties[PERSISTENCE_STATE_KEY] = cloneUiPersistenceState(state);
+  }
+  return state;
+}
 
 function ensurePromptEnhancerInstanceId(node, { forceNew = false } = {}) {
   if (!node) return "";
-  const rawState = node?.properties?.[PERSISTENCE_STATE_KEY];
-  const stateIdWidget = widget(node, "prompt_state_id");
-  let instanceId = forceNew ? "" : String(
-    node.__promptEnhancerInstanceId ||
-    stateIdWidget?.value ||
-    rawState?.instanceId ||
-    ""
-  ).trim();
-  if (!instanceId) instanceId = newPromptEnhancerInstanceId();
+  let instanceId = forceNew ? "" : String(node.__promptEnhancerInstanceId || "").trim();
+  if (!instanceId) {
+    // The owner key already includes workflow scope, so graph-local node id is
+    // sufficient, deterministic across remounts, and does not need persistence.
+    const nodeId = String(node.id ?? "").trim();
+    instanceId = nodeId && nodeId !== "-1" ? `node-${nodeId}` : newPromptEnhancerInstanceId();
+  }
   node.__promptEnhancerInstanceId = instanceId;
+  const stateIdWidget = widget(node, "prompt_state_id");
   if (stateIdWidget && String(stateIdWidget.value || "") !== instanceId) {
     setWidgetValue(stateIdWidget, instanceId, false);
   }
-  node.properties ||= {};
-  if (rawState && typeof rawState === "object") rawState.instanceId = instanceId;
   return instanceId;
 }
 
@@ -1733,9 +1842,7 @@ function normalizedHistorySnapshot(node) {
   let index = promptHistoryIndex(node, history);
   const enhanced = String(widget(node, "enhanced_prompt")?.value ?? "");
 
-  // The visible editor is authoritative for the active array entry. Do this
-  // during every persistence snapshot as well as in the widget callback so a
-  // refresh/copy immediately after typing cannot lose the last edit.
+  // The visible editor is authoritative for the active array entry.
   if (history.length) {
     history[index] = enhanced;
   } else if (enhanced.trim()) {
@@ -1782,6 +1889,8 @@ function enhancementStateSnapshot(node) {
 }
 
 function clonePersistenceState(state) {
+  // Despite the historical name, this is now a RUNTIME-ONLY clone. It is never
+  // written into workflow/image metadata.
   return {
     version: PERSISTENCE_STATE_VERSION,
     instanceId: String(state?.instanceId ?? ""),
@@ -1809,8 +1918,6 @@ function clonePersistenceState(state) {
 
 function syncNativeStateWidgets(node, state) {
   if (!node || !state) return;
-  const instanceId = String(state.instanceId || ensurePromptEnhancerInstanceId(node));
-  setWidgetValue(widget(node, "prompt_state_id"), instanceId, false);
   const history = Array.isArray(state.promptHistory) ? state.promptHistory : [];
   const index = history.length
     ? Math.max(0, Math.min(Math.trunc(Number(state.promptHistoryIndex) || 0), history.length - 1))
@@ -1832,15 +1939,6 @@ function syncNativeStateWidgets(node, state) {
 function persistEnhancementState(node, serializedData = null) {
   if (!node || node.__promptEnhancerRestoringState) return null;
   const instanceId = ensurePromptEnhancerInstanceId(node);
-  // Serialization can run on an unmounted/stale workflow object. Never let that
-  // older object overwrite a newer background-execution journal entry merely by
-  // receiving a later serialize callback. Rehydrate first, then serialize.
-  const ownerKey = promptEnhancerOwnerKey(node);
-  const cached = runtimeStateByOwnerKey.get(ownerKey);
-  const cachedRevision = Math.max(0, Math.trunc(Number(cached?.runtimeRevision) || 0));
-  const nodeRevision = Math.max(0, Math.trunc(Number(node.__promptEnhancerRuntimeRevision ?? node?.properties?.[PERSISTENCE_STATE_KEY]?.runtimeRevision) || 0));
-  if (cached && cachedRevision > nodeRevision) restoreEnhancementState(node, cached);
-
   const revision = nextPromptEnhancerRuntimeRevision(node, instanceId);
   const state = enhancementStateSnapshot(node);
   state.instanceId = instanceId;
@@ -1848,31 +1946,29 @@ function persistEnhancementState(node, serializedData = null) {
   syncNativeStateWidgets(node, state);
 
   const cloned = clonePersistenceState(state);
-  node.properties ||= {};
-  node.properties[PERSISTENCE_STATE_KEY] = cloned;
-  runtimeStateByOwnerKey.set(ownerKey, clonePersistenceState(cloned));
-
-  if (serializedData && typeof serializedData === "object") {
-    serializedData.properties ||= {};
-    serializedData.properties[PERSISTENCE_STATE_KEY] = clonePersistenceState(cloned);
-  }
+  runtimeStateByOwnerKey.set(promptEnhancerOwnerKey(node), clonePersistenceState(cloned));
+  persistUiState(node, serializedData);
   return cloned;
 }
 
 function restoreEnhancementState(node, stateOverride = null, { seedRuntime = true } = {}) {
-  const raw = stateOverride || node?.properties?.[PERSISTENCE_STATE_KEY];
-  const rawVersion = Number(raw?.version ?? 1);
-  if (!raw || typeof raw !== "object" || rawVersion < 1 || rawVersion > PERSISTENCE_STATE_VERSION) return false;
-  const state = clonePersistenceState(raw);
-  // v1/v2 inferred textarea heights from live DOM measurements, so they may
-  // contain load/remount artifacts rather than an intentional user resize.
-  // Reset them once on migration. From v3 onward heights are persisted only
-  // after a real pointer resize gesture.
-  if (rawVersion < 3) state.textareaHeights = {};
+  if (!node) return false;
+  // Only an explicit in-memory runtime state is allowed to restore user data.
+  // Saved workflow/image data already configured the native widgets and is the
+  // canonical source on load; never overwrite it from a duplicated property.
+  if (!stateOverride || typeof stateOverride !== "object") {
+    const uiState = readUiPersistenceState(node);
+    node.__promptEnhancerBatchCount = normalizeEnhanceBatchCount(uiState.batchCount);
+    node.__promptEnhancerTextareaHeights = { ...uiState.textareaHeights };
+    applyTextareaHeights(node, uiState.textareaHeights, { schedule: false });
+    persistUiState(node);
+    return false;
+  }
+
+  const state = clonePersistenceState(stateOverride);
   if (!state.instanceId) state.instanceId = ensurePromptEnhancerInstanceId(node);
   node.__promptEnhancerInstanceId = state.instanceId;
   node.__promptEnhancerRuntimeRevision = Math.max(0, Math.trunc(Number(state.runtimeRevision) || 0));
-  setWidgetValue(widget(node, "prompt_state_id"), state.instanceId, false);
 
   node.__promptEnhancerRestoringState = true;
   node.__promptEnhancerSyncingHistory = true;
@@ -1901,13 +1997,13 @@ function restoreEnhancementState(node, stateOverride = null, { seedRuntime = tru
 
     const control = seedControlWidget(node);
     if (control && state.seedControl) setWidgetValue(control, state.seedControl, false);
+    node.__promptEnhancerTextareaHeights = { ...state.textareaHeights };
     applyTextareaHeights(node, state.textareaHeights, { schedule: false });
   } finally {
     node.__promptEnhancerSyncingHistory = false;
     node.__promptEnhancerRestoringState = false;
   }
-  node.properties ||= {};
-  node.properties[PERSISTENCE_STATE_KEY] = clonePersistenceState(state);
+  persistUiState(node);
   if (seedRuntime) {
     const ownerKey = promptEnhancerOwnerKey(node);
     const cached = runtimeStateByOwnerKey.get(ownerKey);
@@ -1955,10 +2051,7 @@ function reconcileRuntimeEnhancementState(node) {
   const ownerKey = promptEnhancerOwnerKey(node);
   let cached = runtimeStateByOwnerKey.get(ownerKey);
   if (!cached) {
-    const serialized = node?.properties?.[PERSISTENCE_STATE_KEY];
-    const seeded = serialized && typeof serialized === "object"
-      ? clonePersistenceState(serialized)
-      : clonePersistenceState(enhancementStateSnapshot(node));
+    const seeded = clonePersistenceState(enhancementStateSnapshot(node));
     seeded.instanceId = instanceId;
     runtimeStateByOwnerKey.set(ownerKey, seeded);
     cached = seeded;
@@ -1966,7 +2059,7 @@ function reconcileRuntimeEnhancementState(node) {
   drainDeferredExecutions(node);
   cached = runtimeStateByOwnerKey.get(ownerKey) || cached;
   const cachedRevision = Math.max(0, Math.trunc(Number(cached.runtimeRevision) || 0));
-  const nodeRevision = Math.max(0, Math.trunc(Number(node.__promptEnhancerRuntimeRevision ?? node?.properties?.[PERSISTENCE_STATE_KEY]?.runtimeRevision) || 0));
+  const nodeRevision = Math.max(0, Math.trunc(Number(node.__promptEnhancerRuntimeRevision) || 0));
   if (cachedRevision <= nodeRevision) return false;
 
   const applied = restoreEnhancementState(node, cached);
@@ -2033,10 +2126,22 @@ function wrapNodeSerialization(node) {
   node.__promptEnhancerSerializationWrapped = true;
   const oldSerialize = node.onSerialize;
   node.onSerialize = function (data) {
+    // Commit the currently available Enhanced Prompt into its history entry
+    // before the workflow snapshot is finalized. Runtime journal state is NEVER
+    // allowed to overwrite the node during serialization.
+    const state = enhancementStateSnapshot(this);
+    syncNativeStateWidgets(this, state);
+    persistUiState(this);
+
     const result = oldSerialize?.call(this, data);
-    // Always stamp current widget values into the exact object being copied,
-    // saved, tabbed, or autosaved. This is the final authority for persistence.
-    persistEnhancementState(this, data);
+
+    // Store only UI-only data that has no native widget. All Prompt/settings/
+    // history values are already persisted by ComfyUI's real widgets.
+    persistUiState(this, data);
+    if (data?.properties && typeof data.properties === "object") {
+      const ui = cloneUiPersistenceState(data.properties[PERSISTENCE_STATE_KEY]);
+      data.properties[PERSISTENCE_STATE_KEY] = ui;
+    }
     return result;
   };
 }
@@ -2126,14 +2231,28 @@ function wrapEnhancedPromptHistory(node) {
   };
 }
 
+const RUNTIME_ONLY_WIDGETS = new Set([
+  "prompt_cycle_revision",
+  "prompt_shuffle_json",
+  "prompt_state_id",
+  "prompt_runtime_scope",
+]);
+
 function hideInternalWidget(w) {
   if (!w) return;
   w.__promptEnhancerHiddenInternal = true;
   w.hidden = true;
   w.options ||= {};
   w.options.hidden = true;
-  // Keep the original widget type intact so workflow/prompt serialization remains
-  // native and stable. Legacy layout also needs a zero-size fallback.
+  if (RUNTIME_ONLY_WIDGETS.has(String(w.name || ""))) {
+    // ComfyUI intentionally separates workflow persistence (`widget.serialize`)
+    // from API-prompt inclusion (`widget.options.serialize`). These runtime-only
+    // values must reach Python when queued but must never be embedded in a saved
+    // workflow/image. Leave options.serialize enabled and disable only workflow
+    // persistence.
+    w.serialize = false;
+    if (w.options.serialize === false) delete w.options.serialize;
+  }
   w.computeSize = () => [0, 0];
   w.computeLayoutSize = () => ({ minHeight: 0, maxHeight: 0, minWidth: 0 });
 }
@@ -3350,10 +3469,8 @@ function createPromptEnhancerDomPanel(node) {
   node.__promptEnhancerPanelControls = controls;
   node.__promptEnhancerPanelRoot = root;
   node.__promptEnhancerPanelContent = content;
-  const persistedTextareaState = node?.properties?.[PERSISTENCE_STATE_KEY];
-  const trustedPersistedTextareaHeights = Number(persistedTextareaState?.version || 0) >= 3
-    ? persistedTextareaState?.textareaHeights
-    : null;
+  const persistedTextareaState = readUiPersistenceState(node);
+  const trustedPersistedTextareaHeights = persistedTextareaState?.textareaHeights || null;
   applyTextareaHeights(node, node.__promptEnhancerTextareaHeights || trustedPersistedTextareaHeights, { schedule: false });
   installTextareaUserResizePersistence(node, controls);
 
@@ -3663,12 +3780,6 @@ function handlePromptEnhancerExecutedEvent(detail) {
   if (node && runtimeScope && ensurePromptEnhancerWorkflowScope(node) !== runtimeScope) node = null;
   const ownerKey = promptEnhancerOwnerKeyFromData(data);
   if (!node && ownerKey) node = pendingNodesByOwnerKey.get(ownerKey) || null;
-  if (!node) {
-    node = ids.map((id) => pendingNodes.get(id)).find((candidate) =>
-      (!stateId || ensurePromptEnhancerInstanceId(candidate) === stateId) &&
-      (!runtimeScope || ensurePromptEnhancerWorkflowScope(candidate) === runtimeScope)
-    ) || null;
-  }
   try {
     if (node) {
       const handled = handleEnhanceExecuted(node, detail?.output);
@@ -3720,7 +3831,7 @@ function installControls(node, isNew = false, preservedSize = null) {
   node.__promptEnhancerPromptHistory ||= [];
   node.__promptEnhancerArrayUndo ||= [];
   node.__promptEnhancerBatchCount = normalizeEnhanceBatchCount(
-    node?.properties?.[PERSISTENCE_STATE_KEY]?.batchCount ?? node.__promptEnhancerBatchCount ?? ENHANCE_BATCH_MIN
+    readUiPersistenceState(node)?.batchCount ?? node.__promptEnhancerBatchCount ?? ENHANCE_BATCH_MIN
   );
 
   const promptSetWidget = widget(node, "prompt_set");
@@ -3873,21 +3984,50 @@ function promptEnhancerMenuItems(node) {
   ];
 }
 
+function clearPromptEnhancerIsolatedRuntime(node) {
+  if (!node) return;
+  const ownerKey = String(node.__promptEnhancerLastOwnerKey || promptEnhancerOwnerKey(node) || "").trim();
+  if (ownerKey) {
+    if (pendingNodesByOwnerKey.get(ownerKey) === node) pendingNodesByOwnerKey.delete(ownerKey);
+    runtimeStateByOwnerKey.delete(ownerKey);
+    deferredExecutionsByOwnerKey.delete(ownerKey);
+  }
+  pendingNodes.delete(String(node.id));
+}
+
+function installIsolationLifecycle(node) {
+  if (!node || node.__promptEnhancerIsolationLifecycleInstalled) return;
+  node.__promptEnhancerIsolationLifecycleInstalled = true;
+  const originalOnRemoved = node.onRemoved;
+  node.onRemoved = function (...args) {
+    // ComfyUI removes/rebuilds graph nodes while switching workflow tabs. That
+    // is NOT a user deletion. Cancelling/clearing here used to destroy the
+    // pending owner mapping and runtime journal, so an enhancement finishing in
+    // an unfocused workflow tab had nowhere to propagate when the tab returned.
+    // Preserve the isolated runtime state for graph configuration/remounts.
+    // A genuine node deletion still performs the strict cleanup below.
+    const transientWorkflowRemount = graphConfigureDepth > 0;
+    if (!transientWorkflowRemount) {
+      try { clearEnhancePending(node); } catch (_) {}
+      try { clearPromptEnhancerIsolatedRuntime(node); } catch (_) {}
+    }
+    return originalOnRemoved?.apply(this, args);
+  };
+}
+
 async function initializeNode(node, loaded = false, serializedSize = null) {
   const preservedSize = loaded ? (serializedSize || copySize(node)) : null;
-  const inheritedState = node?.properties?.[PERSISTENCE_STATE_KEY];
-  // Copy/paste/duplicate creates a new enhancer identity; normal workflow loads
-  // retain the serialized identity. Runtime ownership is additionally scoped to
-  // ComfyUI's live workflow object so an imported workflow/image cannot inherit
-  // another tab's newer journal merely because it carries the same state id.
-  ensurePromptEnhancerInstanceId(node, { forceNew: !loaded && !!inheritedState?.instanceId });
+  // Runtime ownership is reconstructed from live workflow scope + node id. It is
+  // never inherited from workflow/image metadata, including copy/paste.
+  normalizePromptEnhancerRuntimeWidgets(node);
+  ensurePromptEnhancerInstanceId(node, { forceNew: false });
   ensurePromptEnhancerWorkflowScope(node);
+  installIsolationLifecycle(node);
   applyPromptEnhancerInputLabels(node);
   installControls(node, !loaded, preservedSize);
 
-  // Restore explicit node state for both loaded workflows and copied/pasted or
-  // duplicated nodes. A genuinely new node has no state object and simply keeps
-  // the backend-provided defaults already present in its widgets.
+  // Saved native widgets are authoritative. Restore only UI-only state (batch
+  // count and intentional textarea heights); full runtime state is in-memory only.
   const restored = restoreEnhancementState(node, null, { seedRuntime: !loaded });
   // A loaded graph's ComfyUI active-workflow object is published after graph
   // configuration. Do not journal/reconcile it here under the previously active
@@ -3912,6 +4052,7 @@ async function initializeNode(node, loaded = false, serializedSize = null) {
   requestAnimationFrame(() => {
     ensurePromptEnhancerWorkflowScope(node, { refresh: true });
     reconcileRuntimeEnhancementState(node);
+    node.__promptEnhancerLastOwnerKey = promptEnhancerOwnerKey(node);
     moveSettingsInputToTop(node);
     setSeedOverrideUI(node);
     hideNativeWidgetsForPanel(node);

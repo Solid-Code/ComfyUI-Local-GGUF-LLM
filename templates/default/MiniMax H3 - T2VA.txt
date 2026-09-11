@@ -1,1 +1,30 @@
-Rewrite the source as a MiniMax H3 T2VA (text-to-video-with-audio) generation prompt. There is no supplied endpoint image to preserve. Build a coherent audiovisual timeline beginning at local 0.00 seconds, with clear observable subject actions, environment motion, camera behavior, and synchronized diegetic sound. Preserve exact dialogue and explicit user constraints. Use the standard H3 base fields in this order when creating or normalizing structure: integrated_multimodal_description:, overall_soundscape:, non_diegetic_music:. Use timestamps where they clarify temporal progression; timestamps are local to this H3 generation. Describe camera movement precisely enough to avoid contradictory motion, and make sound events line up with visible actions. Do not invent unnecessary characters, props, plot events, or reference images. If the source already contains H3 tags, fields, timestamps, or reference labels, preserve them unless a structural correction is required. Return only the finished H3 prompt.
+Rewrite the source as a production-ready MiniMax H3 T2VA prompt using MiniMax's canonical base prompt structure. Preserve the user's concept, identities, names, exact dialogue/lyrics, visible text, explicit constraints, requested style, and any existing reference/project wrappers that are still relevant. Improve specificity, continuity, camera language, action progression, and synchronized audio without inventing unnecessary characters, props, story events, or unsupported facts.
+
+OUTPUT STRUCTURE
+Use exactly these three H3 fields, in this order:
+integrated_multimodal_description:
+overall_soundscape:
+non_diegetic_music:
+T2VA has no keyframe-alignment instruction before these fields.
+
+TIMING AND SHOTS — FOLLOW THIS EXACTLY
+- The H3 timeline is local to this generation.
+- Begin the body with `[Shot 1]` and DO NOT put a timestamp on Shot 1. Correct form: `[Shot 1] Live-action, cinematic, ...`
+- Only actual later shot cuts receive timestamps, using exactly: `[Shot N] At MM:SS.mmm, ...` Example: `[Shot 2] At 00:03.500, the shot cuts to ...`
+- Use three decimal places in shot-cut timestamps. Timestamps must be strictly increasing and fall within the supplied video duration.
+- Do NOT use timestamp ranges such as `00:00.000-00:03.500` or `00:00.000–00:03.500` as the H3 shot syntax.
+- Do NOT write `[Shot 1] At 00:00.000, ...`.
+- Do not create a new Shot merely because an action changes. Create a new Shot only for a real cut/shot transition. Prefer continuous camera motion inside the existing shot when appropriate.
+- Do not invent a duration. If the source provides a duration, make the action and any cut times fit it naturally.
+- If the source contains project/global timestamps such as `global_video_time`, preserve them as metadata, but never substitute them for the local H3 cut timeline.
+
+MULTIMODAL DESCRIPTION
+Write concrete observable audiovisual events in playback order. Establish the visual style and opening composition immediately after `[Shot 1]`. Keep subject identity, clothing, environment, object state, spatial relationships, lighting, and screen direction coherent across the generation. Describe meaningful action progression rather than static prose. Write camera movement as natural English with motion type and, when useful, amplitude and speed; avoid contradictory simultaneous camera commands. Align physical sounds and vocal events with the visible actions that cause them.
+
+DIALOGUE / VOCALS / TEXT
+Preserve user-supplied dialogue and lyrics verbatim. Give actual vocal sources stable IDs `(S1)`, `(S2)`, etc. and reuse each ID consistently. Put spoken dialogue or lyrics in `<d>[Language] exact text</d>`. Do not invent dialogue. If a line crosses a cut, preserve continuity with H3's `<scenetrans>` handling; if speech is explicitly cut off by the end of the video, use `<cutoff>`. Preserve visible on-screen text verbatim in double quotation marks.
+
+AUDIO FIELDS
+`overall_soundscape:` should be a concise 1-4 sentence summary of ambience, physical action sounds, and non-verbal human sounds across the video; do not duplicate full dialogue/lyrics there. `non_diegetic_music:` should describe audience-only background music in concrete musical terms (instrumentation, tempo/rhythm, dynamics), or `N/A` when none is requested or implied. Diegetic music heard by characters belongs in the multimodal description instead.
+
+If the source already contains valid H3 fields, shot labels, dialogue tags, or metadata wrappers, preserve valid structure while correcting malformed H3 timing/shot syntax. Return only the finished H3 prompt.

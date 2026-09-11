@@ -18,7 +18,7 @@ import folder_paths
 
 log = logging.getLogger(__name__)
 
-NODE_VERSION = "0.6.30-alpha"
+NODE_VERSION = "0.6.35-alpha"
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_DIR = PACKAGE_DIR / "templates" / "default"
 USER_TEMPLATE_DIR = Path(folder_paths.models_dir) / "LLM" / "local_LLM_presets" / "prompt_enhancer"
@@ -532,21 +532,21 @@ def _delete_prompt_set(name: str) -> dict[str, Any]:
 
 
 def _enhancer_state_key(node_id: Any = None, state_id: Any = None, runtime_scope: Any = None) -> str:
-    """Per-workflow enhancer key, with legacy fallbacks for older clients.
+    """Strict workflow-scoped enhancer key.
 
-    ``state_id`` is serialized with the node so it can identify the enhancer
-    across normal tab remounts. ``runtime_scope`` is browser-session/workflow
-    ownership supplied by the frontend and prevents an imported workflow/image
-    carrying the same serialized state id from inheriting another tab's live
-    Prompt Enhancer cursor/request state.
+    Runtime state that can mutate Prompt Enhancer behavior must be isolated to
+    the live ComfyUI workflow/tab. ``state_id`` alone is not sufficient because
+    imported workflows/images can legitimately reuse the same graph-local node
+    id, and ``node_id`` alone is never globally unique. If the current frontend
+    did not provide both the live workflow scope and the enhancer instance id,
+    return an empty key so shared backend journals/pending-state fall back to
+    stateless behavior rather than risking cross-workflow leakage.
     """
     stable = str(state_id or "").strip()
     scope = str(runtime_scope or "").strip()
     if stable and scope:
         return f"{scope}\x1f{stable}"
-    if stable:
-        return stable
-    return str(node_id or "").strip()
+    return ""
 
 
 def _prune_pending_locked(now: float | None = None) -> None:
@@ -686,6 +686,8 @@ def _arm_request(
 
     token = uuid.uuid4().hex
     key = _enhancer_state_key(node_id, state_id, runtime_scope)
+    if not key:
+        raise ValueError("Missing Prompt Enhancer workflow runtime scope. Refresh ComfyUI and try again.")
     with _PENDING_LOCK:
         _prune_pending_locked()
         _PENDING_REQUESTS[key] = {
@@ -710,16 +712,11 @@ def _arm_request(
 
 def _pop_request(node_id: Any, state_id: Any = "", runtime_scope: Any = "") -> dict[str, Any] | None:
     key = _enhancer_state_key(node_id, state_id, runtime_scope)
-    stable_fallback = _enhancer_state_key(node_id, state_id, "")
-    fallback = _enhancer_state_key(node_id, "", "")
+    if not key:
+        return None
     with _PENDING_LOCK:
         _prune_pending_locked()
-        pending = _PENDING_REQUESTS.pop(key, None)
-        if pending is None and stable_fallback and stable_fallback != key:
-            pending = _PENDING_REQUESTS.pop(stable_fallback, None)
-        if pending is None and fallback and fallback not in {key, stable_fallback}:
-            pending = _PENDING_REQUESTS.pop(fallback, None)
-        return pending
+        return _PENDING_REQUESTS.pop(key, None)
 
 
 def _video_frames(video: Any):
@@ -1330,6 +1327,26 @@ class LocalLLMPromptEnhancer:
                         "max": 0x7FFFFFFF,
                     },
                 ),
+                # Keep this appended after the existing serialized widgets so old
+                # Prompt Enhancer workflows retain their widget-value positions.
+                # The frontend renders this selector above Prompt.
+                "prompt_preset": (
+                    ["Custom", *_prompt_preset_names()],
+                    {
+                        "default": "Custom",
+                        "tooltip": (
+                            "Reusable prompts shared with Local LLM Generate from "
+                            "models/LLM/local_LLM_presets/prompts. Editing Prompt switches this selector to Custom."
+                        ),
+                    },
+                ),
+            },
+            "optional": {
+                # Runtime-only cycle transport. These are intentionally optional
+                # because they are not persisted into workflow/image metadata.
+                # A page refresh or legacy workflow may therefore omit them or
+                # reconstruct them as null; backend normalization treats that as
+                # the default rather than allowing ComfyUI validation to fail.
                 "prompt_cycle_revision": (
                     "INT",
                     {
@@ -1346,26 +1363,12 @@ class LocalLLMPromptEnhancer:
                         "dynamicPrompts": False,
                     },
                 ),
-                # Keep this appended after the existing serialized widgets so old
-                # Prompt Enhancer workflows retain their widget-value positions.
-                # The frontend renders this selector above Prompt.
-                "prompt_preset": (
-                    ["Custom", *_prompt_preset_names()],
-                    {
-                        "default": "Custom",
-                        "tooltip": (
-                            "Reusable prompts shared with Local LLM Generate from "
-                            "models/LLM/local_LLM_presets/prompts. Editing Prompt switches this selector to Custom."
-                        ),
-                    },
-                ),
-            },
-            "optional": {
                 # Internal transport fields must remain OPTIONAL. They were added
                 # after the original Prompt Enhancer schema and therefore cannot
                 # be required for workflow JSON/images saved by older versions.
-                # The frontend fills them whenever it is mounted; backend defaults
-                # keep normal execution valid if a legacy workflow omits either.
+                # The frontend fills them whenever it is mounted. If a legacy
+                # workflow omits either, normal node execution stays valid but
+                # workflow-scoped background/runtime journaling is disabled.
                 # Keep them first in the optional section so their widget ordering
                 # remains directly after prompt_preset, matching prior releases.
                 "prompt_state_id": (
@@ -1436,12 +1439,40 @@ class LocalLLMPromptEnhancer:
     )
 
     @classmethod
-    def IS_CHANGED(cls, **_kwargs):
-        # The manual Enhance action arms an out-of-band request that is not part
-        # of serialized widget inputs. Force this lightweight node to execute so
-        # a repeated enhancement with identical graph values cannot be satisfied
-        # from ComfyUI's output cache.
-        return float("nan")
+    def IS_CHANGED(cls, **kwargs):
+        """Invalidate only when Prompt Enhancer runtime behavior requires it.
+
+        Normal fixed-prompt operation must remain cacheable so an unchanged
+        Prompt Enhancer does not invalidate downstream diffusion/sampler nodes.
+        A manual Enhance request is out-of-band, so its armed request token is
+        used as a one-shot cache signature. Workflow enhancement and active
+        Prompt Cycle modes intentionally produce/advance runtime output on every
+        queue and therefore remain non-cacheable.
+        """
+        if bool(kwargs.get("enhance_with_workflow", False)):
+            return float("nan")
+
+        cycle_mode = str(kwargs.get("prompt_cycle") or "fixed").strip().lower()
+        if cycle_mode in {"increment", "decrement", "random", "shuffle"}:
+            return float("nan")
+
+        key = _enhancer_state_key(
+            kwargs.get("unique_id"),
+            kwargs.get("prompt_state_id"),
+            kwargs.get("prompt_runtime_scope"),
+        )
+        if key:
+            with _PENDING_LOCK:
+                _prune_pending_locked()
+                pending = _PENDING_REQUESTS.get(key)
+                if pending is not None:
+                    token = str(pending.get("token") or "").strip()
+                    if token:
+                        return f"manual:{token}"
+
+        # Stable extra signature. ComfyUI still hashes all declared inputs, so
+        # edits to Prompt/history/settings/seed continue to invalidate normally.
+        return "idle"
 
     def output_prompts(
         self,
@@ -1456,8 +1487,8 @@ class LocalLLMPromptEnhancer:
         enhance_with_workflow: bool = False,
         prompt_history_json: str = "[]",
         prompt_history_index: int = 0,
-        prompt_cycle_revision: int = 0,
-        prompt_shuffle_json: str = "[]",
+        prompt_cycle_revision: Any = 0,
+        prompt_shuffle_json: Any = "[]",
         prompt_preset: str = "Custom",
         prompt_state_id: str = "",
         prompt_runtime_scope: str = "",
@@ -1857,18 +1888,13 @@ try:
             runtime_scope = str((body or {}).get("runtime_scope") or "")
             token = str((body or {}).get("token") or "")
             key = _enhancer_state_key(node_id, state_id, runtime_scope)
-            stable_fallback = _enhancer_state_key(node_id, state_id, "")
-            fallback = _enhancer_state_key(node_id, "", "")
             removed = False
-            with _PENDING_LOCK:
-                for candidate_key in dict.fromkeys([key, stable_fallback, fallback]):
-                    if not candidate_key:
-                        continue
-                    current = _PENDING_REQUESTS.get(candidate_key)
+            if key:
+                with _PENDING_LOCK:
+                    current = _PENDING_REQUESTS.get(key)
                     if current and (not token or str(current.get("token")) == token):
-                        _PENDING_REQUESTS.pop(candidate_key, None)
+                        _PENDING_REQUESTS.pop(key, None)
                         removed = True
-                        break
             return web.json_response({"cancelled": removed})
         except Exception as exc:
             return _json_error(exc, 500)

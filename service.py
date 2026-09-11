@@ -52,7 +52,7 @@ from .nodes import (
 from .gguf_meta import detect_family, recommended_model_preset, available_model_presets
 from .presets import MEMORY_PRESETS, MODEL_PRESETS, capabilities_for_family, public_presets
 from .version import PACKAGE_VERSION, BRIDGE_API_VERSION, VRAM_POLICY_VERSION, VRAM_COORDINATION_MODE
-from .vram_coordination import GPUMemoryLeaseManager
+from .vram_coordination import GPUMemoryLeaseManager, NATIVE_LOAD_STABILITY_GUARD_BYTES
 
 log = logging.getLogger(__name__)
 
@@ -1716,6 +1716,8 @@ class LocalLLMServiceManager:
                     f"runtime={float(room.get('runtime_target_bytes') or preload.get('runtime_target_bytes') or 0) / (1024*1024):.1f}MiB • "
                     f"headroom={float(room.get('headroom_bytes') or preload.get('headroom_bytes') or 0) / (1024*1024):.1f}MiB • "
                     f"free_target={float(room.get('free_target_bytes') or preload.get('free_target_bytes') or 0) / (1024*1024):.1f}MiB • "
+                    f"stability_guard={float(room.get('stability_guard_bytes') or 0) / (1024*1024):.1f}MiB • "
+                    f"admission_target={float(room.get('admission_target_bytes') or room.get('free_target_bytes') or preload.get('free_target_bytes') or 0) / (1024*1024):.1f}MiB • "
                     f"request={float(room.get('request_target_bytes') or preload.get('request_target_bytes') or 0) / (1024*1024):.1f}MiB "
                     f"coop_request={float(room.get('cooperative_request_target_bytes') or 0) / (1024*1024):.1f}MiB "
                     f"torch_slack={float(room.get('cooperative_torch_slack_bytes') or 0) / (1024*1024):.1f}MiB "
@@ -1772,12 +1774,12 @@ class LocalLLMServiceManager:
                     final_stage = stages.get("after_final_sync") or stages.get("after_exclusive") or stages.get("after_aimdo_retry") or stages.get("after_aimdo_cleanup") or coop_stage or before_stage
                     self._log(
                         "PERF GPU deltas: "
-                        f"target_shortfall_before={max(0.0, _mib(room.get('free_target_bytes')) - _mib(before_stage.get('raw_free_bytes'))):.1f}MiB • "
+                        f"target_shortfall_before={max(0.0, _mib(room.get('admission_target_bytes') or room.get('free_target_bytes')) - _mib(before_stage.get('raw_free_bytes'))):.1f}MiB • "
                         f"logical_minus_raw_before={_mib(before_stage.get('logical_minus_raw_bytes')):.1f}MiB • "
                         f"raw_gain_coop={(_mib(coop_stage.get('raw_free_bytes')) - _mib(before_stage.get('raw_free_bytes'))):.1f}MiB • "
                         f"slack_delta_coop={(_mib(coop_stage.get('torch_reclaimable_bytes')) - _mib(before_stage.get('torch_reclaimable_bytes'))):.1f}MiB • "
                         f"raw_gain_total={(_mib(final_stage.get('raw_free_bytes')) - _mib(before_stage.get('raw_free_bytes'))):.1f}MiB • "
-                        f"logical_margin_final={(_mib(final_stage.get('comfy_logical_free_bytes')) - _mib(room.get('free_target_bytes'))):.1f}MiB"
+                        f"logical_margin_final={(_mib(final_stage.get('comfy_logical_free_bytes')) - _mib(room.get('admission_target_bytes') or room.get('free_target_bytes'))):.1f}MiB"
                     )
 
                 if timings:
@@ -1811,6 +1813,7 @@ class LocalLLMServiceManager:
                     self._log(
                         "PERF GPU policy inputs: "
                         f"llama_margin={_mib(headroom_sources.get('llama_default_margin_bytes')):.1f}MiB • "
+                        f"stability_guard={_mib(headroom_sources.get('native_load_stability_guard_bytes')):.1f}MiB • "
                         f"comfy_reserved={_mib(headroom_sources.get('comfy_reserved_bytes')):.1f}MiB • "
                         f"dynamic_headroom={_mib(headroom_sources.get('dynamic_vram_extra_headroom_bytes')):.1f}MiB • "
                         f"configured_comfy={_mib(headroom_sources.get('configured_comfy_headroom_bytes')):.1f}MiB • "
@@ -2028,16 +2031,21 @@ class LocalLLMServiceManager:
                 "runtime_target_bytes": int(reload_target),
                 "headroom_bytes": 1024 * 1024 * 1024,
                 "free_target_bytes": int(reload_target + 1024 * 1024 * 1024),
-                "request_target_bytes": int(reload_target + 1024 * 1024 * 1024),
+                "stability_guard_bytes": int(NATIVE_LOAD_STABILITY_GUARD_BYTES),
+                "admission_target_bytes": int(reload_target + 1024 * 1024 * 1024 + NATIVE_LOAD_STABILITY_GUARD_BYTES),
+                "request_target_bytes": int(reload_target + 1024 * 1024 * 1024 + NATIVE_LOAD_STABILITY_GUARD_BYTES),
             }
         reload_lease_free_target = int(lease_plan.get("free_target_bytes") or reload_target)
+        reload_lease_admission_target = int(lease_plan.get("admission_target_bytes") or reload_lease_free_target)
         try:
             vision_plan = GPUMemoryLeaseManager(
                 mm, aimdo_enabled=bool(getattr(cmm, "aimdo_enabled", False))
             ).plan(total_with_vision).as_dict()
             vision_lease_free_target = int(vision_plan.get("free_target_bytes") or total_with_vision)
+            vision_lease_admission_target = int(vision_plan.get("admission_target_bytes") or vision_lease_free_target)
         except Exception:
             vision_lease_free_target = int(total_with_vision + 1024 * 1024 * 1024)
+            vision_lease_admission_target = int(total_with_vision + 1024 * 1024 * 1024 + NATIVE_LOAD_STABILITY_GUARD_BYTES)
 
         # Current free VRAM already excludes a resident LLM.  If the same saved
         # configuration is resident, its projected base headroom is therefore the
@@ -2053,8 +2061,8 @@ class LocalLLMServiceManager:
             vision_headroom = int(raw_free + release_credit - total_with_vision) if vision_bytes > 0 else int(raw_free)
         else:
             available_after_old_close = int(raw_free + release_credit)
-            base_headroom = int(available_after_old_close - reload_lease_free_target)
-            vision_headroom = int(available_after_old_close - vision_lease_free_target)
+            base_headroom = int(available_after_old_close - reload_lease_admission_target)
+            vision_headroom = int(available_after_old_close - vision_lease_admission_target)
 
         headroom = vision_headroom if vision_bytes > 0 else base_headroom
         warning = None
@@ -2093,6 +2101,8 @@ class LocalLLMServiceManager:
             "reload_target_source": reload_target_source,
             "reload_lease_free_target_bytes": int(reload_lease_free_target),
             "reload_lease_headroom_bytes": int(lease_plan.get("headroom_bytes") or 0),
+            "reload_lease_stability_guard_bytes": int(lease_plan.get("stability_guard_bytes") or 0),
+            "reload_lease_admission_target_bytes": int(reload_lease_admission_target),
             "reload_lease_request_target_bytes": int(lease_plan.get("request_target_bytes") or reload_lease_free_target),
             "projected_base_headroom_bytes": base_headroom,
             "projected_vision_headroom_bytes": vision_headroom,
@@ -2208,7 +2218,9 @@ class LocalLLMServiceManager:
         estimate = estimate or {}
         components = estimate.get("components") or {}
         runtime_bytes = int(estimate.get("reload_target_bytes") or components.get("base_total_bytes") or 0)
-        loader_headroom_bytes = int(estimate.get("reload_lease_headroom_bytes") or 0)
+        loader_headroom_bytes = int(estimate.get("reload_lease_headroom_bytes") or 0) + int(
+            estimate.get("reload_lease_stability_guard_bytes") or 0
+        )
         guard_bytes = max(int(safety_headroom_bytes or 0), loader_headroom_bytes)
         total_vram = estimate.get("total_vram_bytes")
         total_vram = None if total_vram is None else int(total_vram)

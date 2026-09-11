@@ -1,1 +1,36 @@
-Rewrite the source as a MiniMax H3 I2VA prompt where the supplied image/Picture 1 is the exact FIRST FRAME at local 0.00 seconds. Treat that frame as authoritative for visible identity, appearance, pose, composition, environment, lighting, and object placement; do not verbally reset or replace it. Describe motion developing forward naturally from that exact state. Use a local timeline beginning at 0.00 seconds, with continuous subject/object momentum, camera motion, expression changes, environmental motion, synchronized diegetic sound, and any requested music. Preserve exact dialogue and explicit constraints. Use the H3 base fields integrated_multimodal_description:, overall_soundscape:, non_diegetic_music: when structuring the result. Preserve existing <Picture 1>, [Shot N], <shot> tags, global_video_time, and other reference syntax if present. Never substitute a global sequence timestamp for the internal H3 timeline. Return only the finished H3 prompt.
+Rewrite the source as a production-ready MiniMax H3 I2VA prompt where supplied `<Picture 1>` is the exact FIRST FRAME of the target video. Treat that image as authoritative for visible identity, face/body appearance, clothing, pose, composition, environment, lighting, object placement, and spatial relationships at the opening. Do not verbally reset or replace the first frame; describe motion developing forward naturally from it. Preserve the user's concept, exact dialogue/lyrics, visible text, explicit constraints, and existing project/reference wrappers that remain relevant.
+
+FIRST-FRAME ALIGNMENT — USE THE CANONICAL H3 LINE
+The first line of the finished prompt must be:
+For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
+Then insert one blank line before the core fields.
+
+OUTPUT STRUCTURE
+Use exactly these three H3 fields, in this order:
+integrated_multimodal_description:
+overall_soundscape:
+non_diegetic_music:
+
+TIMING AND SHOTS — FOLLOW THIS EXACTLY
+- The H3 shot timeline is local to this generation.
+- Begin the body with `[Shot 1]` and DO NOT timestamp Shot 1. The 0.00-second first-frame alignment is already expressed by the alignment instruction above.
+- Only later actual cuts use: `[Shot N] At MM:SS.mmm, ...` Example: `[Shot 2] At 00:04.250, the camera cuts to ...`
+- Use three decimal places for shot-cut timestamps. They must be strictly increasing and inside the supplied duration.
+- Do NOT use timestamp ranges as H3 shot syntax and do NOT write `[Shot 1] At 00:00.000, ...`.
+- Do not invent cuts merely to timestamp action beats. Keep continuous action and camera movement within the same shot unless a true cut is intended.
+- Do not invent a duration. If one is supplied, fit all action/cut timing to it.
+- Preserve external/global timing metadata if present, but never use a global sequence time in place of the local H3 cut time.
+
+FIRST-FRAME CONTINUITY
+Immediately after `[Shot 1]`, establish the style and the visible first-frame anchors from `<Picture 1>` only as needed for continuity, then move forward: action onset -> continuous subject/object motion -> camera evolution -> reactions/results. Do not waste prompt space repeatedly redescribing the still image. Keep identities, clothing, scene geometry, light direction, held objects, and initial pose relationships stable unless the source explicitly requests a transformation.
+
+CAMERA / ACTION / SOUND
+Describe observable movement with clear physical causality and continuous momentum from the exact first frame. Write camera movement in natural English with motion type and, when useful, amplitude/speed. Avoid incompatible simultaneous moves. Synchronize footsteps, impacts, cloth movement, environment sounds, speech, and other diegetic audio with visible events.
+
+DIALOGUE / VOCALS / TEXT
+Preserve user-supplied dialogue and lyrics verbatim. Assign stable `(S1)`, `(S2)`, etc. only to actual vocal sources and write speech/lyrics as `<d>[Language] exact text</d>`. Do not invent dialogue. Preserve visible text verbatim in double quotation marks. Use H3 continuity tags such as `<scenetrans>` or `<cutoff>` only when their actual conditions apply.
+
+AUDIO FIELDS
+`overall_soundscape:` summarizes ambience, physical action sounds, and non-verbal human sounds in 1-4 concise sentences without repeating full dialogue. `non_diegetic_music:` describes audience-only score using concrete instrumentation, tempo/rhythm, and dynamics, or `N/A` when absent. Diegetic music belongs in the multimodal timeline.
+
+Preserve valid `<Picture 1>`, `[Shot N]`, `<shot>`, `global_video_time`, and other project/reference syntax when present outside the canonical H3 body, while correcting malformed H3 shot timing. Return only the finished H3 prompt.

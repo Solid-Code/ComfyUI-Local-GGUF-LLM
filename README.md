@@ -1,4 +1,59 @@
-# Local GGUF LLM — v0.18.71 alpha
+# Local GGUF LLM — v0.18.79 alpha
+
+
+
+
+## v0.18.79-alpha
+
+- Fixes llama-cpp-python cross-version token compatibility for **all** generation paths, including the Performance Tuner. Some bindings/speculative helpers can emit NumPy `int64` token ids that stricter `Llama.eval()` versions reject with `invalid token type ... int64`; Local GGUF now normalizes only those non-builtin integer tokens to Python `int` at the shared `Llama.eval` boundary.
+- The compatibility shim applies to normal node generation, Prompt Enhancer, OpenAI-compatible API requests, N-gram/speculative decoding, tuner warmup, tuner baseline, candidate screening, and sustained validation. Ordinary `list[int]` batches stay on the unchanged fast path.
+- VRAM policy remains **v17** and Prompt Enhancer remains **v0.6.35-alpha**.
+
+## v0.18.78-alpha
+
+- Merges the newer v0.18.77 VRAM policy v17 and background-workflow-tab/remount handling with the Prompt Enhancer cache and refresh/null-safety fixes from the parallel v0.18.77 branch.
+- Fixed Prompt Enhancer cache invalidation so fixed, unchanged prompts remain cacheable and no longer force identical downstream diffusion generations to rerun; manual Enhance, Enhance with Workflow, and active cycle modes still invalidate when required.
+- `prompt_cycle_revision` and `prompt_shuffle_json` are runtime-only optional inputs and null/invalid refreshed widget values are normalized before queue validation.
+- Prompt Enhancer frontend/backend: **v0.6.35-alpha**. VRAM policy remains **v17**.
+
+## v0.18.77-alpha
+
+- Strengthens native llama.cpp VRAM admission with a separate 512 MiB driver/load stability guard above the existing 1 GiB semantic headroom. This prevents knife-edge ComfyUI handoffs that technically fit but can spill native CUDA allocations into shared/system VRAM and collapse token speed.
+- The stability guard is used for normal raw-free admission, cooperative ComfyUI eviction, AIMDO recovery, and exclusive fallback. If a GPU genuinely cannot provide the extra guard after full reclamation, the existing semantic-headroom/runtime-fit fallbacks still permit models that actually fit.
+- VRAM telemetry now reports semantic free target, stability guard, admission target, and guard fallback independently.
+
+## v0.18.75-alpha
+
+- Tightened Prompt Enhancer workflow isolation. Workflow-scoped runtime state now requires an exact `(runtime_scope, state_id)` match; legacy backend fallbacks by state id or graph-local node id were removed so background progress/results/cancellation cannot spill across workflows with overlapping node ids.
+- The frontend owner key is now strictly `workflow scope + node instance`, with no shared page-global `legacy` scope. Detached nodes receive a node-local runtime scope instead of a page-global fallback.
+- Removed node-id-based event matching fallbacks for executed/progress events. Prompt Enhancer background replay now reattaches only by exact workflow-scoped ownership.
+- Added Prompt Enhancer cleanup on node removal so workflow-scoped runtime journals, deferred execution queues, and pending-owner registrations are discarded when a node is deleted.
+- Prompt Enhancer frontend/backend: **v0.6.32-alpha**. VRAM policy v16, tuner, bridge API 2, templates, and Local LLM runtime behavior are unchanged.
+
+## v0.18.74-alpha
+
+- Prompt Enhancer workflow persistence was rebuilt around one source of truth: the actual ComfyUI widgets backing the visible/available controls.
+- Removed duplicated Prompt/settings/history/runtime data from the custom workflow property; that property now stores only UI-only values with no native widget (`batchCount` and intentional textarea heights).
+- Runtime-only Prompt Enhancer fields (`prompt_state_id`, `prompt_runtime_scope`, shuffle cursor, cycle revision) are no longer persisted in workflow/image metadata, while remaining available to API execution.
+- Legacy v1-v3 enhancer state migrates by trusting native serialized widgets and salvaging only UI-only values, preventing stale custom-state copies from overwriting what the workflow actually contains.
+- Prompt Enhancer frontend/backend: **v0.6.32-alpha**. VRAM policy v16, tuner, bridge API 2, and Local LLM runtime behavior are unchanged.
+
+
+## v0.18.73-alpha
+
+- Adds automatic MTMD projector placement recovery for constrained GPUs. Vision requests still prefer GPU projector offload, but if the full GPU vision runtime cannot acquire a safe lease while the base LLM runtime can, the node transparently retries with the native MTMD CPU projector backend (`use_gpu=False`, equivalent to llama.cpp `--no-mmproj-offload`). The language model remains GPU-offloaded; only image/audio/video projector encoding moves to CPU.
+- Keeps the normal 1 GiB preferred lease and runtime-fit recovery unchanged; policy v16 adds only the automatic projector-placement recovery layer. The fallback is only considered after the GPU-projector lease genuinely fails; it does not lower the LLM runtime requirement or pretend the projector fits.
+- Remembers a proven CPU-projector placement for the exact model/mmproj/runtime allocation signature for the lifetime of the ComfyUI process, avoiding repeated destructive GPU-fit attempts on every image request. Changing model/runtime settings creates a new placement signature and re-evaluates GPU placement.
+- Adds projector-placement diagnostics to load info and VRAM estimates (`gpu`, `cpu`, or `none`) and emits a clear warning when automatic CPU projector fallback is activated.
+
+## v0.18.72-alpha
+
+- Rebuilt all five protected MiniMax H3 Prompt Enhancer defaults against MiniMax's current official H3 prompt-writing guides for T2VA/I2VA/FL2VA/L2VA and full-reference Ref2VA.
+- Corrected H3 shot timing rules in every default: `[Shot 1]` has no timestamp; only later real cuts use `[Shot N] At MM:SS.mmm, ...` with strictly increasing local cut times. Timestamp ranges are explicitly rejected as H3 shot syntax.
+- Added canonical keyframe-alignment instructions: I2VA uses the required `0.00 seconds` first-frame line; FL2VA/L2VA use the separate two-decimal `S.SS-second` endpoint alignment notation while keeping internal cut timestamps at three decimals.
+- Improved camera/action continuity, dialogue `<d>[Language] ...</d>` handling, speaker IDs, soundscape/music separation, global-vs-local timeline handling, and endpoint convergence guidance.
+- Expanded Ref2VA defaults to enforce the official six-section structure, reference-role semantics, retention markers, and full-reference shot timing.
+- Template-only enhancement release. Prompt Enhancer runtime remains v0.6.30-alpha; VRAM policy v15, tuner, bridge API 2, and Local LLM runtime behavior are unchanged.
 
 
 ## v0.18.71-alpha
@@ -6,7 +61,7 @@
 - Fixed Prompt Enhancer workflow validation for legacy/image-loaded workflows: `prompt_runtime_scope` is now an optional internal transport field instead of a required prompt input. Missing scope safely falls back to the backend default until the live frontend stamps the current workflow runtime scope.
 - Made `prompt_state_id` optional for the same backward-compatibility reason, so workflows saved before the stable enhancer identity was introduced cannot be rejected at prompt validation.
 - This changes only Prompt Enhancer schema compatibility. VRAM policy v15, tuner behavior, Local LLM runtime behavior, and bridge API 2 are unchanged.
-- Prompt Enhancer frontend/backend: **v0.6.30-alpha**.
+- Prompt Enhancer frontend/backend: **v0.6.32-alpha**.
 
 ## v0.18.70-alpha
 
@@ -193,7 +248,7 @@ VRAM handoff hardening:
 - **The Enhance batch owns its full queue lifetime:** all internal LLM iterations plus the final native llama.cpp VRAM suspend happen before the single Prompt Enhancer queue item returns, so the next queued diffusion job cannot begin early.
 - **Queued-snapshot reconciliation:** workflows queued during the batch may have serialized the Prompt Enhancer before all progress updates reached the browser. The backend now recognizes pre-batch/intermediate history snapshots and upgrades them to the completed batch history when those queued jobs execute, without delaying queue submission.
 - Removed the v0.18.49 informational “Workflow queued until…” Run gate/notification.
-- Prompt Enhancer frontend: **v0.6.30-alpha**.
+- Prompt Enhancer frontend: **v0.6.32-alpha**.
 
 
 ## v0.18.49 alpha
@@ -224,7 +279,7 @@ This package includes:
 
 - **Local LLM Generate** — send prompts, images, and sampled video frames to the persistent local LLM.
 - **Local LLM Settings** — reusable model/generation settings with loadable Complete Settings Presets. Memory/performance tuning remains in the Local LLM service panel rather than crowding the workflow node.
-- **Local LLM Prompt Enhancer** — bundled **v0.6.30-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
+- **Local LLM Prompt Enhancer** — bundled **v0.6.32-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
 - **Local LLM Server panel** — model loading, presets, memory/VRAM controls, status, performance information, and the optional OpenAI-compatible API.
 
 
@@ -253,7 +308,7 @@ ComfyUI/custom_nodes/ComfyUI-Local-GGUF-LLM/
 
 Restart ComfyUI, then hard-refresh the browser if an older frontend is still cached.
 
-Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.30-alpha is already bundled here.
+Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.35-alpha is already bundled here.
 
 ## GGUF model folders
 

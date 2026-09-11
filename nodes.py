@@ -27,7 +27,12 @@ import folder_paths
 from .gguf_meta import read_gguf_metadata, detect_family, recommended_model_preset, available_model_presets
 from .presets import MODEL_PRESETS, MEMORY_PRESETS, capabilities_for_family, public_presets
 from .version import VRAM_POLICY_VERSION, VRAM_COORDINATION_MODE
-from .vram_coordination import GPUMemoryLeaseManager, runtime_target_bytes, lease_failure_message
+from .vram_coordination import (
+    GPUMemoryLeaseManager,
+    NATIVE_LOAD_STABILITY_GUARD_BYTES,
+    runtime_target_bytes,
+    lease_failure_message,
+)
 
 LLM_DIR = os.path.join(folder_paths.models_dir, "llm")
 os.makedirs(LLM_DIR, exist_ok=True)
@@ -69,6 +74,8 @@ if _NATIVE_COORDINATOR is None:
     _NATIVE_COORDINATOR.context_epoch = 0
     _NATIVE_COORDINATOR.vram_highwater_lock = threading.RLock()
     _NATIVE_COORDINATOR.vram_highwater_by_signature = {}
+    _NATIVE_COORDINATOR.vision_placement_lock = threading.RLock()
+    _NATIVE_COORDINATOR.vision_placement_by_signature = {}
     sys.modules[_NATIVE_COORDINATOR_KEY] = _NATIVE_COORDINATOR
 else:
     # Forward-compatible initialization when an older dev reload created the
@@ -99,6 +106,10 @@ else:
         _NATIVE_COORDINATOR.vram_highwater_lock = threading.RLock()
     if not hasattr(_NATIVE_COORDINATOR, "vram_highwater_by_signature"):
         _NATIVE_COORDINATOR.vram_highwater_by_signature = {}
+    if not hasattr(_NATIVE_COORDINATOR, "vision_placement_lock"):
+        _NATIVE_COORDINATOR.vision_placement_lock = threading.RLock()
+    if not hasattr(_NATIVE_COORDINATOR, "vision_placement_by_signature"):
+        _NATIVE_COORDINATOR.vision_placement_by_signature = {}
 
 _MODEL_CACHE = _NATIVE_COORDINATOR.model_cache
 _MODEL_LOCK = _NATIVE_COORDINATOR.model_lock
@@ -442,7 +453,9 @@ def _lease_plan_preview(runtime_target_bytes):
             "runtime_target_bytes": runtime,
             "headroom_bytes": 1024 * _MIB if runtime > 0 else 0,
             "free_target_bytes": runtime + (1024 * _MIB if runtime > 0 else 0),
-            "request_target_bytes": runtime + (1024 * _MIB if runtime > 0 else 0),
+            "stability_guard_bytes": NATIVE_LOAD_STABILITY_GUARD_BYTES if runtime > 0 else 0,
+            "admission_target_bytes": runtime + ((1024 * _MIB + NATIVE_LOAD_STABILITY_GUARD_BYTES) if runtime > 0 else 0),
+            "request_target_bytes": runtime + ((1024 * _MIB + NATIVE_LOAD_STABILITY_GUARD_BYTES) if runtime > 0 else 0),
         }
 
 def _vram_highwater_snapshot(signature_id):
@@ -686,6 +699,8 @@ def _request_comfyui_room(mm, required_bytes, device):
         runtime_mib=float(room.get("runtime_target_bytes") or 0) / _MIB,
         headroom_mib=float(room.get("headroom_bytes") or 0) / _MIB,
         free_target_mib=float(room.get("free_target_bytes") or 0) / _MIB,
+        stability_guard_mib=float(room.get("stability_guard_bytes") or 0) / _MIB,
+        admission_target_mib=float(room.get("admission_target_bytes") or room.get("free_target_bytes") or 0) / _MIB,
         request_target_mib=float(room.get("request_target_bytes") or 0) / _MIB,
         raw_before_mib=(float(raw_before) / _MIB) if raw_before is not None else None,
         raw_after_mib=(float(raw_after) / _MIB) if raw_after is not None else None,
@@ -695,6 +710,9 @@ def _request_comfyui_room(mm, required_bytes, device):
         aimdo_cleanup=bool(room.get("aimdo_cleanup_called")),
         exclusive=bool(room.get("exclusive_eviction_called")),
         final_sync=bool(room.get("final_sync_called")),
+        stability_guard_fallback=bool(room.get("stability_guard_fallback")),
+        available_stability_guard_mib=float(room.get("available_stability_guard_bytes") or 0) / _MIB,
+        stability_guard_shortfall_mib=float(room.get("stability_guard_shortfall_bytes") or 0) / _MIB,
         reduced_headroom=bool(room.get("reduced_headroom_fallback")),
         available_headroom_mib=float(room.get("available_headroom_bytes") or 0) / _MIB,
         preferred_shortfall_mib=float(room.get("preferred_headroom_shortfall_bytes") or 0) / _MIB,
@@ -703,11 +721,14 @@ def _request_comfyui_room(mm, required_bytes, device):
     )
     warning = room.get("admission_warning")
     if warning:
-        _LOGGER.warning("[Local GGUF LLM] REDUCED VRAM HEADROOM: %s", warning)
+        _LOGGER.warning("[Local GGUF LLM] VRAM LEASE FALLBACK: %s", warning)
         _perf_log(
-            "GPU lease reduced-headroom recovery",
+            "GPU lease fallback recovery",
             runtime_mib=float(room.get("runtime_target_bytes") or 0) / _MIB,
             raw_free_mib=float(room.get("raw_free_after_bytes") or 0) / _MIB,
+            stability_guard_fallback=bool(room.get("stability_guard_fallback")),
+            available_stability_guard_mib=float(room.get("available_stability_guard_bytes") or 0) / _MIB,
+            stability_guard_shortfall_mib=float(room.get("stability_guard_shortfall_bytes") or 0) / _MIB,
             available_headroom_mib=float(room.get("available_headroom_bytes") or 0) / _MIB,
             preferred_headroom_mib=float(room.get("headroom_bytes") or 0) / _MIB,
             preferred_shortfall_mib=float(room.get("preferred_headroom_shortfall_bytes") or 0) / _MIB,
@@ -1280,6 +1301,82 @@ def _require_init_option(llama_init_params, has_var_kw, option, reason):
     )
 
 
+def _normalize_llama_eval_tokens(tokens):
+    """Return a llama-cpp-python-safe sequence of built-in Python ``int`` tokens.
+
+    Some llama-cpp-python / llama.cpp combinations return NumPy integer scalars
+    from chat-template or speculative-decoding helpers. Newer strict ``Llama.eval``
+    implementations reject those values even though they are valid token ids,
+    raising e.g. ``invalid token type ... int64``. Keep the zero-copy/common path
+    for ordinary ``list[int]`` input and coerce only when a non-builtin integer
+    representation is actually present.
+    """
+    if isinstance(tokens, list) and all(type(token) is int for token in tokens):
+        return tokens
+
+    # NumPy arrays and similar containers expose tolist(); use it only on the
+    # compatibility path so normal token batches pay no conversion cost.
+    value = tokens
+    tolist = getattr(value, "tolist", None)
+    if callable(tolist):
+        try:
+            value = tolist()
+        except Exception:
+            value = tokens
+
+    if isinstance(value, int) and type(value) is int:
+        return [value]
+    try:
+        items = list(value)
+    except TypeError:
+        items = [value]
+
+    normalized = []
+    for index, token in enumerate(items):
+        if type(token) is int:
+            normalized.append(token)
+            continue
+        # __index__ is the lossless integer protocol implemented by NumPy integer
+        # scalars and other integer wrappers. Do not use int(float), which could
+        # silently turn an invalid token representation into a different id.
+        indexer = getattr(token, "__index__", None)
+        if not callable(indexer):
+            raise TypeError(
+                f"Llama.eval token at index {index} is not an integer token id: "
+                f"{type(token).__name__}"
+            )
+        normalized.append(int(indexer()))
+    return normalized
+
+
+def _install_llama_eval_token_compat(llm):
+    """Install version-agnostic token normalization on ``Llama.eval`` once.
+
+    The shim is attached to the Llama class, not to one caller. Therefore normal
+    node generation, Prompt Enhancer, OpenAI-compatible API requests, speculative
+    decoding, and the performance tuner all traverse the same compatibility path.
+    """
+    cls = type(llm)
+    marker = "_local_gguf_eval_token_compat_v1"
+    if getattr(cls, marker, False):
+        return False
+    original = getattr(cls, "eval", None)
+    if not callable(original):
+        return False
+
+    def _eval_with_python_int_tokens(self, tokens, *args, **kwargs):
+        return original(self, _normalize_llama_eval_tokens(tokens), *args, **kwargs)
+
+    _eval_with_python_int_tokens.__name__ = getattr(original, "__name__", "eval")
+    _eval_with_python_int_tokens.__doc__ = getattr(original, "__doc__", None)
+    setattr(cls, "eval", _eval_with_python_int_tokens)
+    setattr(cls, marker, True)
+    _LOGGER.info(
+        "[Local GGUF LLM] Installed Llama.eval token-type compatibility shim for this llama-cpp-python build."
+    )
+    return True
+
+
 _LOGGER = logging.getLogger(__name__)
 _MIB = 1024 * 1024
 _GIB = 1024 * 1024 * 1024
@@ -1422,6 +1519,7 @@ def _load_llama_verified(llama_cpp, Llama, load_kwargs, gpu_layers):
     context_epoch = _next_native_context_epoch()
     started = time.perf_counter()
     llm = Llama(**load_kwargs)
+    _install_llama_eval_token_compat(llm)
     elapsed = time.perf_counter() - started
     host_after = _host_load_snapshot()
     host_delta = _host_load_delta(host_before, host_after, load_mode)
@@ -1526,6 +1624,7 @@ def _load_llama_fast(Llama, load_kwargs, prior_diagnostics=None, reload_count=0)
     context_epoch = _next_native_context_epoch()
     started = time.perf_counter()
     llm = Llama(**load_kwargs)
+    _install_llama_eval_token_compat(llm)
     elapsed = time.perf_counter() - started
     host_after = _host_load_snapshot()
     host_delta = _host_load_delta(host_before, host_after, load_mode)
@@ -2004,7 +2103,8 @@ def _estimate_kv_vram(metadata, n_ctx, type_k, type_v, location):
 
 def _estimate_native_vram_components(model_path, mmproj_path, metadata, gpu_layers, n_ctx,
                                      kv_k, kv_v, kv_location, n_batch=2048, n_ubatch=512,
-                                     flash_attention=True, speculative_mode="Off"):
+                                     flash_attention=True, speculative_mode="Off",
+                                     vision_offload=True):
 
     """Return a conservative, explainable native llama.cpp VRAM estimate.
 
@@ -2032,14 +2132,18 @@ def _estimate_native_vram_components(model_path, mmproj_path, metadata, gpu_laye
 
     kv_gpu = int(_estimate_kv_vram(metadata, int(n_ctx), kv_k, kv_v, kv_location))
     vision_gpu = 0
+    vision_file = 0
     if mmproj_path:
         try:
             vision_file = int(os.path.getsize(mmproj_path))
-            # Projectors also create native/compute state beyond the raw GGUF
-            # tensors. Keep a modest separate allowance rather than hiding it in
-            # the base text-model overhead.
-            vision_gpu = int(vision_file + 128 * _MIB + min(384 * _MIB, vision_file * 0.05))
+            if bool(vision_offload):
+                # GPU-backed MTMD keeps the projector tensors plus native/compute
+                # state on the accelerator. CPU projector mode is a real upstream
+                # MTMD backend choice (use_gpu=False / --no-mmproj-offload), so it
+                # contributes no persistent projector allocation to the GPU lease.
+                vision_gpu = int(vision_file + 128 * _MIB + min(384 * _MIB, vision_file * 0.05))
         except Exception:
+            vision_file = 0
             vision_gpu = 0
 
     # Keep the previous fixed/proportional safety allowance, but make the batch
@@ -2091,6 +2195,8 @@ def _estimate_native_vram_components(model_path, mmproj_path, metadata, gpu_laye
         "speculative_bytes": int(speculative_gpu),
         "speculative_mode": spec_mode,
         "vision_bytes": int(vision_gpu),
+        "vision_file_bytes": int(vision_file),
+        "vision_offload": bool(vision_offload and mmproj_path),
         "base_total_bytes": int(base_total),
         "total_bytes": int(total_with_vision),
         "gpu_layers": int(gpu_layers),
@@ -2105,13 +2211,13 @@ def _estimate_native_vram_components(model_path, mmproj_path, metadata, gpu_laye
 
 def _estimate_native_vram(model_path, mmproj_path, metadata, gpu_layers, n_ctx, kv_k, kv_v,
                           kv_location, n_batch=2048, n_ubatch=512, flash_attention=True,
-                          speculative_mode="Off"):
+                          speculative_mode="Off", vision_offload=True):
 
     """Conservative first-load estimate for ComfyUI pressure planning."""
     return int(_estimate_native_vram_components(
         model_path, mmproj_path, metadata, gpu_layers, n_ctx, kv_k, kv_v, kv_location,
         n_batch=n_batch, n_ubatch=n_ubatch, flash_attention=flash_attention,
-        speculative_mode=speculative_mode,
+        speculative_mode=speculative_mode, vision_offload=vision_offload,
     )["total_bytes"])
 
 
@@ -2260,6 +2366,10 @@ class _NativeLLMResident:
                 lease_preview = _lease_plan_preview(self.preload_target_bytes()[0])
                 diag["next_reload_lease_free_target_bytes"] = int(lease_preview.get("free_target_bytes") or 0)
                 diag["next_reload_lease_free_target_mib"] = round(float(lease_preview.get("free_target_bytes") or 0) / _MIB, 1)
+                diag["next_reload_lease_stability_guard_bytes"] = int(lease_preview.get("stability_guard_bytes") or 0)
+                diag["next_reload_lease_stability_guard_mib"] = round(float(lease_preview.get("stability_guard_bytes") or 0) / _MIB, 1)
+                diag["next_reload_lease_admission_target_bytes"] = int(lease_preview.get("admission_target_bytes") or lease_preview.get("free_target_bytes") or 0)
+                diag["next_reload_lease_admission_target_mib"] = round(float(lease_preview.get("admission_target_bytes") or lease_preview.get("free_target_bytes") or 0) / _MIB, 1)
                 diag["next_reload_target_mib"] = round(self.preload_target_bytes()[0] / _MIB, 1)
                 diag["next_reload_target_source"] = self.preload_target_bytes()[1]
             else:
@@ -3044,7 +3154,7 @@ def _available_vision_handlers():
     return found
 
 
-def _vision_handler(family, mmproj_path, thinking_mode, preserve_thinking, reasoning_effort, verbose=False):
+def _vision_handler(family, mmproj_path, thinking_mode, preserve_thinking, reasoning_effort, verbose=False, use_gpu=True):
     extra_template = _thinking_template_kwargs(
         family, thinking_mode, preserve_thinking, reasoning_effort
     )
@@ -3072,6 +3182,7 @@ def _vision_handler(family, mmproj_path, thinking_mode, preserve_thinking, reaso
 
     extra = {
         "verbose": verbose,
+        "use_gpu": bool(use_gpu),
         "extra_template_arguments": extra_template,
     }
     # Model-specific handler switches mirrored from current llama-cpp VLM handlers.
@@ -3084,7 +3195,15 @@ def _vision_handler(family, mmproj_path, thinking_mode, preserve_thinking, reaso
     if "preserve_thinking" in extra_template:
         extra["preserve_thinking"] = extra_template["preserve_thinking"]
 
-    return _instantiate_handler(cls, mmproj_path, extra)
+    handler = _instantiate_handler(cls, mmproj_path, extra)
+    if not bool(use_gpu):
+        accepted = getattr(handler, "use_gpu", None)
+        if accepted is not False:
+            raise RuntimeError(
+                "The installed llama-cpp-python multimodal handler does not expose a verified CPU projector backend. "
+                "Update to an MTMD build that supports use_gpu=False / llama.cpp --no-mmproj-offload."
+            )
+    return handler
 
 
 def _embedded_template_chat_handler(llm, template_kwargs):
@@ -4144,62 +4263,19 @@ class LocalGGUFLLM:
         if swa_full != "Auto":
             load_kwargs["swa_full"] = (swa_full == "Enabled")
         # Keep text chat-template controls out of Llama construction so switching
-        # Qwen thinking mode/reasoning effort does not reload the model. They are
-        # injected into the embedded Jinja handler per request below. Multimodal
-        # handlers are different: their template behavior is commonly fixed when
-        # the handler is constructed, so it is included in the stable vision cache
-        # key and rebuilt only when those controls change.
-        handler = None
-        if mmproj_path:
-            if "mmproj_path" in llama_init_params or "clip_model_path" in llama_init_params:
-                path_arg = "mmproj_path" if "mmproj_path" in llama_init_params else "clip_model_path"
-                load_kwargs[path_arg] = mmproj_path
-                if "chat_template_kwargs" in llama_init_params:
-                    load_kwargs["chat_template_kwargs"] = template_kwargs
-                elif "chat_handler_kwargs" in llama_init_params:
-                    load_kwargs["chat_handler_kwargs"] = {
-                        "extra_template_arguments": template_kwargs,
-                        "verbose": verbose,
-                    }
-            else:
-                handler = _vision_handler(family, mmproj_path, thinking_mode, preserve_thinking, reasoning_effort, verbose)
-                load_kwargs["chat_handler"] = handler
+        # Qwen thinking mode/reasoning effort does not reload the model. Multimodal
+        # projector placement is an allocation decision and is therefore part of
+        # the native signature. GPU is preferred; a proven capacity failure may
+        # select the upstream MTMD CPU projector backend for this allocation shape.
+        base_load_kwargs = dict(load_kwargs)
 
-            # Newer MTMD implementations recommend disabling context checkpoints
-            # for single-turn hybrid Qwen vision models; only pass it when the
-            # installed binding explicitly supports the parameter.
-            if family in {"qwen3.5", "qwen3.6", "qwen3.8"} and "ctx_checkpoints" in llama_init_params:
-                load_kwargs["ctx_checkpoints"] = 0
-
-        # llama-cpp-python changes quickly. Pass only options the installed
-        # constructor advertises instead of failing on a newly-added/removed knob.
-        # Critical memory options were validated above, so filtering cannot hide a
-        # requested KV behavior.
-        load_kwargs, unsupported_load_options = _filter_supported_kwargs(Llama.__init__, load_kwargs)
-
-        # Only parameters that affect model/context allocation belong in the cache key.
         def freeze(v):
             if isinstance(v, list):
                 return tuple(v)
             if isinstance(v, dict):
                 return tuple(sorted((k, freeze(x)) for k, x in v.items()))
             return v
-        # Explicit chat-handler objects are not stable cache-key values: dedicated
-        # multimodal handlers are recreated on each execution, so including the
-        # object itself would force a full model reload every run.  Text-only
-        # thinking/reasoning controls are applied by a lightweight handler below
-        # and therefore do not belong in the allocation key.  For vision handlers,
-        # template behavior is part of the handler construction, so include a
-        # stable behavior tuple to reload only when that behavior actually changes.
-        allocation_kwargs = {
-            k: v for k, v in load_kwargs.items()
-            if k not in {"verbose", "chat_handler", "chat_handler_kwargs", "chat_template_kwargs"}
-        }
-        vision_behavior_key = (
-            "vision_behavior",
-            resolved_vision or "",
-            tuple(sorted(template_kwargs.items())),
-        ) if mmproj_path else ("text_behavior",)
+
         speculative_key = (
             "speculative",
             str(speculative_config.get("effective") or "Off"),
@@ -4215,6 +4291,7 @@ class LocalGGUFLLM:
             str((speculative_config.get("runtime") or {}).get("ngram_implementation") or ""),
             bool((speculative_config.get("runtime") or {}).get("mtp")),
         )
+
         def allocation_file_state(path):
             if not path:
                 return None
@@ -4224,18 +4301,156 @@ class LocalGGUFLLM:
             except Exception:
                 return (os.path.realpath(path), "missing")
 
-        # Include backing-file state in the native allocation key too.  IS_CHANGED
-        # already invalidates ComfyUI's output cache when a GGUF is replaced under
-        # the same filename; this additionally prevents the persistent native cache
-        # from silently continuing to serve the old mmap/model instance.
-        load_key = (
-            tuple(sorted((k, freeze(v)) for k, v in allocation_kwargs.items())),
+        # Placement learning is keyed to the complete allocation shape but excludes
+        # the projector device itself. A GPU-projector capacity failure therefore
+        # becomes a stable CPU-projector choice until model/runtime settings change
+        # (or ComfyUI restarts), avoiding repeated destructive GPU-fit attempts.
+        base_allocation_kwargs = {
+            k: v for k, v in base_load_kwargs.items()
+            if k not in {"verbose", "chat_handler", "chat_handler_kwargs", "chat_template_kwargs"}
+        }
+        vision_placement_signature = _load_signature_id((
+            "vision-placement-auto",
+            tuple(sorted((k, freeze(v)) for k, v in base_allocation_kwargs.items())),
             ("model_file_state", allocation_file_state(model_path)),
             ("vision_file_state", allocation_file_state(mmproj_path)),
             ("custom_chat_format", custom_chat_format if chat_format == "Custom" else ""),
-            vision_behavior_key,
+            ("vision_template", resolved_vision or "", tuple(sorted(template_kwargs.items()))),
             speculative_key,
-        )
+        )) if mmproj_path else None
+
+        def _build_load_variant(vision_use_gpu=True):
+            variant_kwargs = dict(base_load_kwargs)
+            variant_handler = None
+            if mmproj_path:
+                direct_arg = None
+                if "mmproj_path" in llama_init_params or "clip_model_path" in llama_init_params:
+                    direct_arg = "mmproj_path" if "mmproj_path" in llama_init_params else "clip_model_path"
+
+                # Keep the existing direct mmproj path for the preferred GPU
+                # projector. CPU recovery deliberately constructs an explicit
+                # MTMD handler so we can verify that the installed binding really
+                # accepted use_gpu=False instead of trusting an opaque **kwargs path.
+                if direct_arg and vision_use_gpu:
+                    variant_kwargs[direct_arg] = mmproj_path
+                    if "chat_handler_kwargs" in llama_init_params:
+                        variant_kwargs["chat_handler_kwargs"] = {
+                            "extra_template_arguments": template_kwargs,
+                            "verbose": verbose,
+                            "use_gpu": True,
+                        }
+                    elif "chat_template_kwargs" in llama_init_params:
+                        variant_kwargs["chat_template_kwargs"] = template_kwargs
+                else:
+                    variant_handler = _vision_handler(
+                        family, mmproj_path, thinking_mode, preserve_thinking,
+                        reasoning_effort, verbose, use_gpu=bool(vision_use_gpu)
+                    )
+                    variant_kwargs["chat_handler"] = variant_handler
+
+                # Newer MTMD implementations recommend disabling context
+                # checkpoints for single-turn hybrid Qwen vision models.
+                if family in {"qwen3.5", "qwen3.6", "qwen3.8"} and "ctx_checkpoints" in llama_init_params:
+                    variant_kwargs["ctx_checkpoints"] = 0
+
+            variant_kwargs, variant_unsupported = _filter_supported_kwargs(Llama.__init__, variant_kwargs)
+            allocation_kwargs = {
+                k: v for k, v in variant_kwargs.items()
+                if k not in {"verbose", "chat_handler", "chat_handler_kwargs", "chat_template_kwargs"}
+            }
+            vision_behavior_key = (
+                "vision_behavior",
+                resolved_vision or "",
+                tuple(sorted(template_kwargs.items())),
+                "gpu" if bool(vision_use_gpu) else "cpu",
+            ) if mmproj_path else ("text_behavior",)
+            variant_key = (
+                tuple(sorted((k, freeze(v)) for k, v in allocation_kwargs.items())),
+                ("model_file_state", allocation_file_state(model_path)),
+                ("vision_file_state", allocation_file_state(mmproj_path)),
+                ("custom_chat_format", custom_chat_format if chat_format == "Custom" else ""),
+                vision_behavior_key,
+                speculative_key,
+            )
+            variant_components = _estimate_native_vram_components(
+                model_path, mmproj_path, metadata, gpu_layers, context_size,
+                kv_cache_k, kv_cache_v, kv_cache_location,
+                n_batch=effective_prompt_batch_size,
+                n_ubatch=effective_memory_batch_size,
+                flash_attention=flash_attention,
+                speculative_mode=str(speculative_config.get("effective") or "Off"),
+                vision_offload=bool(vision_use_gpu),
+            )
+            return {
+                "load_kwargs": variant_kwargs,
+                "handler": variant_handler,
+                "unsupported": variant_unsupported,
+                "load_key": variant_key,
+                "components": variant_components,
+                "estimated_vram": int(variant_components.get("total_bytes") or 0),
+                "vision_use_gpu": bool(vision_use_gpu),
+            }
+
+        remembered_vision_placement = None
+        if vision_placement_signature:
+            with _NATIVE_COORDINATOR.vision_placement_lock:
+                remembered_vision_placement = _NATIVE_COORDINATOR.vision_placement_by_signature.get(vision_placement_signature)
+        vision_use_gpu = not (mmproj_path and remembered_vision_placement == "cpu")
+        active_variant = _build_load_variant(vision_use_gpu=vision_use_gpu)
+        load_kwargs = active_variant["load_kwargs"]
+        handler = active_variant["handler"]
+        unsupported_load_options = active_variant["unsupported"]
+        load_key = active_variant["load_key"]
+        estimated_vram_components = active_variant["components"]
+        estimated_vram = active_variant["estimated_vram"]
+
+        def _cpu_vision_fallback(mm, target, failed_room):
+            """Retry admission with MTMD projector on CPU after a real GPU-fit failure."""
+            if not mmproj_path or not vision_use_gpu:
+                return None
+            cpu_variant = _build_load_variant(vision_use_gpu=False)
+            cpu_signature = _load_signature_id(cpu_variant["load_key"])
+            prior_observed = _vram_highwater_bytes(cpu_signature, main_gpu_index)
+            cpu_runtime, cpu_source = _reload_vram_target_bytes(cpu_variant["estimated_vram"], prior_observed)
+            cpu_room = _request_comfyui_room(mm, cpu_runtime, target)
+            if not cpu_room.get("satisfied", False):
+                return {
+                    "success": False,
+                    "variant": cpu_variant,
+                    "room": cpu_room,
+                    "runtime_target_bytes": cpu_runtime,
+                    "target_source": cpu_source,
+                }
+
+            if vision_placement_signature:
+                with _NATIVE_COORDINATOR.vision_placement_lock:
+                    _NATIVE_COORDINATOR.vision_placement_by_signature[vision_placement_signature] = "cpu"
+            gpu_runtime = int((failed_room or {}).get("runtime_target_bytes") or estimated_vram)
+            gpu_raw = int((failed_room or {}).get("raw_free_after_bytes") or 0)
+            _LOGGER.warning(
+                "[Local GGUF LLM] Vision projector does not fit safely on GPU with the selected LLM settings "
+                "(GPU vision runtime %.1f MiB, raw free %.1f MiB). Falling back to the native MTMD CPU projector "
+                "backend while keeping the language model GPU-offloaded. Image understanding remains enabled; "
+                "vision encoding may be slower.",
+                gpu_runtime / _MIB,
+                gpu_raw / _MIB,
+            )
+            _perf_log(
+                "vision projector CPU fallback",
+                placement_signature=vision_placement_signature,
+                gpu_runtime_mib=gpu_runtime / _MIB,
+                gpu_raw_after_mib=gpu_raw / _MIB,
+                cpu_runtime_mib=cpu_runtime / _MIB,
+                cpu_room_strategy=cpu_room.get("strategy"),
+                cpu_raw_after_mib=float(cpu_room.get("raw_free_after_bytes") or 0) / _MIB,
+            )
+            return {
+                "success": True,
+                "variant": cpu_variant,
+                "room": cpu_room,
+                "runtime_target_bytes": cpu_runtime,
+                "target_source": cpu_source,
+            }
 
         # Legacy retention labels all map to the persistent native-context mode.
         # This is the KoboldCPP-like behavior: llama.cpp owns its allocations and
@@ -4264,15 +4479,6 @@ class LocalGGUFLLM:
             model_file_size = int(os.path.getsize(model_path))
         except Exception:
             model_file_size = 0
-        estimated_vram_components = _estimate_native_vram_components(
-            model_path, mmproj_path, metadata, gpu_layers, context_size,
-            kv_cache_k, kv_cache_v, kv_cache_location,
-            n_batch=effective_prompt_batch_size,
-            n_ubatch=effective_memory_batch_size,
-            flash_attention=flash_attention,
-            speculative_mode=str(speculative_config.get("effective") or "Off"),
-        )
-        estimated_vram = int(estimated_vram_components.get("total_bytes") or 0)
 
         # A change in allocation settings OR management mode invalidates the old
         # native context and its cached direct-reload signature.
@@ -4307,6 +4513,8 @@ class LocalGGUFLLM:
             kv_mib=int(estimated_vram_components.get("kv_cache_bytes") or 0) / _MIB,
             compute_mib=int(estimated_vram_components.get("compute_batch_bytes") or 0) / _MIB,
             vision_mib=int(estimated_vram_components.get("vision_bytes") or 0) / _MIB,
+            vision_projector=("gpu" if vision_use_gpu else "cpu") if mmproj_path else "none",
+            vision_placement_remembered=remembered_vision_placement,
             speculative_mib=int(estimated_vram_components.get("speculative_bytes") or 0) / _MIB,
             ctx=context_size,
             n_batch=effective_prompt_batch_size,
@@ -4391,7 +4599,60 @@ class LocalGGUFLLM:
                         managed_preload_memory["room_details"] = copy.deepcopy(room)
                         managed_preload_memory["room_satisfied"] = bool(room.get("satisfied"))
                         if not room.get("satisfied", False):
-                            managed_preload_memory["fatal_room_error"] = _vram_room_failure_message(room)
+                            fallback = _cpu_vision_fallback(mm, target, room)
+                            if fallback and fallback.get("success"):
+                                managed_preload_memory["vision_gpu_attempt"] = copy.deepcopy(room)
+                                active_variant = fallback["variant"]
+                                load_kwargs = active_variant["load_kwargs"]
+                                handler = active_variant["handler"]
+                                unsupported_load_options = active_variant["unsupported"]
+                                load_key = active_variant["load_key"]
+                                estimated_vram_components = active_variant["components"]
+                                estimated_vram = active_variant["estimated_vram"]
+                                vision_use_gpu = False
+                                cpu_room = fallback["room"]
+                                managed_preload_memory.update(copy.deepcopy(cpu_room))
+                                managed_preload_memory["room_details"] = copy.deepcopy(cpu_room)
+                                managed_preload_memory["room_satisfied"] = True
+                                managed_preload_memory["vision_projector_placement"] = "cpu-fallback"
+                                managed_preload_memory["target_source"] = fallback["target_source"]
+                                managed_preload_memory["runtime_target_bytes"] = int(fallback["runtime_target_bytes"])
+                                managed_preload_memory["estimated_vram_bytes"] = int(estimated_vram)
+                                managed_preload_memory["estimate_components"] = copy.deepcopy(estimated_vram_components)
+
+                                # The original controller represented the failed GPU-projector
+                                # signature and has no native context. Replace it atomically with
+                                # the successful CPU-projector allocation signature.
+                                with _MODEL_LOCK:
+                                    resident_ctl = _NativeLLMResident(
+                                        llama_cpp=llama_cpp,
+                                        Llama=Llama,
+                                        load_key=load_key,
+                                        load_kwargs=load_kwargs,
+                                        metadata=metadata,
+                                        family=family,
+                                        estimated_vram=estimated_vram,
+                                        model_file_size=model_file_size,
+                                        main_gpu_index=main_gpu_index,
+                                        gpu_layers=gpu_layers,
+                                        speculative_config=speculative_config,
+                                        model_path=model_path,
+                                        verbose=verbose,
+                                    )
+                                    _MODEL_CACHE.update({
+                                        "key": load_key,
+                                        "metadata": metadata,
+                                        "family": family,
+                                        "managed_adapter": resident_ctl,
+                                        "mode": model_retention,
+                                    })
+                            else:
+                                if fallback:
+                                    managed_preload_memory["vision_gpu_attempt"] = copy.deepcopy(room)
+                                    managed_preload_memory["vision_cpu_attempt"] = copy.deepcopy(fallback.get("room") or {})
+                                    managed_preload_memory["fatal_room_error"] = _vram_room_failure_message(fallback.get("room") or room)
+                                else:
+                                    managed_preload_memory["fatal_room_error"] = _vram_room_failure_message(room)
                 except Exception as e:
                     managed_preload_memory["error"] = str(e)
                     managed_preload_memory.setdefault(
@@ -4510,7 +4771,34 @@ class LocalGGUFLLM:
                                 preload_memory["room_details"] = copy.deepcopy(room)
                                 preload_memory["room_satisfied"] = bool(room.get("satisfied"))
                                 if not room.get("satisfied", False):
-                                    preload_memory["fatal_room_error"] = _vram_room_failure_message(room)
+                                    fallback = _cpu_vision_fallback(mm, target, room)
+                                    if fallback and fallback.get("success"):
+                                        preload_memory["vision_gpu_attempt"] = copy.deepcopy(room)
+                                        active_variant = fallback["variant"]
+                                        load_kwargs = active_variant["load_kwargs"]
+                                        handler = active_variant["handler"]
+                                        unsupported_load_options = active_variant["unsupported"]
+                                        load_key = active_variant["load_key"]
+                                        estimated_vram_components = active_variant["components"]
+                                        estimated_vram = active_variant["estimated_vram"]
+                                        vision_use_gpu = False
+                                        signature_id = _load_signature_id(load_key)
+                                        cpu_room = fallback["room"]
+                                        preload_memory.update(copy.deepcopy(cpu_room))
+                                        preload_memory["room_details"] = copy.deepcopy(cpu_room)
+                                        preload_memory["room_satisfied"] = True
+                                        preload_memory["vision_projector_placement"] = "cpu-fallback"
+                                        preload_memory["target_source"] = fallback["target_source"]
+                                        preload_memory["runtime_target_bytes"] = int(fallback["runtime_target_bytes"])
+                                        preload_memory["estimated_vram_bytes"] = int(estimated_vram)
+                                        preload_memory["estimate_components"] = copy.deepcopy(estimated_vram_components)
+                                    else:
+                                        if fallback:
+                                            preload_memory["vision_gpu_attempt"] = copy.deepcopy(room)
+                                            preload_memory["vision_cpu_attempt"] = copy.deepcopy(fallback.get("room") or {})
+                                            preload_memory["fatal_room_error"] = _vram_room_failure_message(fallback.get("room") or room)
+                                        else:
+                                            preload_memory["fatal_room_error"] = _vram_room_failure_message(room)
                     except Exception as e:
                         preload_memory["error"] = str(e)
                         preload_memory.setdefault(
@@ -4546,6 +4834,10 @@ class LocalGGUFLLM:
                 next_lease_preview = _lease_plan_preview(next_target)
                 load_diagnostics["next_reload_lease_free_target_bytes"] = int(next_lease_preview.get("free_target_bytes") or 0)
                 load_diagnostics["next_reload_lease_free_target_mib"] = round(float(next_lease_preview.get("free_target_bytes") or 0) / _MIB, 1)
+                load_diagnostics["next_reload_lease_stability_guard_bytes"] = int(next_lease_preview.get("stability_guard_bytes") or 0)
+                load_diagnostics["next_reload_lease_stability_guard_mib"] = round(float(next_lease_preview.get("stability_guard_bytes") or 0) / _MIB, 1)
+                load_diagnostics["next_reload_lease_admission_target_bytes"] = int(next_lease_preview.get("admission_target_bytes") or next_lease_preview.get("free_target_bytes") or 0)
+                load_diagnostics["next_reload_lease_admission_target_mib"] = round(float(next_lease_preview.get("admission_target_bytes") or next_lease_preview.get("free_target_bytes") or 0) / _MIB, 1)
                 if model_retention in {"Persistent (Driver Managed)", "Unload After Run"}:
                     load_diagnostics["preload_memory"] = preload_memory
                 with _MODEL_LOCK:
@@ -4571,6 +4863,14 @@ class LocalGGUFLLM:
                 load_diagnostics["minor_faults_delta"] = 0
                 load_diagnostics["block_inputs_delta"] = 0
                 load_diagnostics["page_cache_hint"] = "not-loaded"
+
+        load_diagnostics["vision_projector_placement"] = (
+            ("gpu" if vision_use_gpu else "cpu") if mmproj_path else "none"
+        )
+        load_diagnostics["vision_placement_signature"] = vision_placement_signature
+        load_diagnostics["vision_placement_remembered"] = remembered_vision_placement
+        load_diagnostics["vision_estimated_gpu_bytes"] = int(estimated_vram_components.get("vision_bytes") or 0)
+        load_diagnostics["vision_projector_file_bytes"] = int(estimated_vram_components.get("vision_file_bytes") or 0)
 
         with _MODEL_LOCK:
             # MTMD uses its own Jinja environment in some llama-cpp-python builds.
@@ -5107,6 +5407,7 @@ class LocalGGUFLLM:
             "model": model,
             "vision": resolved_vision or "None",
             "vision_active": bool(data_uris or messages_have_images),
+            "vision_projector_placement": ("gpu" if vision_use_gpu else "cpu") if mmproj_path else "none",
             "vision_inputs": {
                 "still_images": len(image_uris),
                 "sampled_video_frames": len(video_uris),

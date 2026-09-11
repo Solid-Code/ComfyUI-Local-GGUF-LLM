@@ -1,1 +1,39 @@
-Rewrite the source as a MiniMax H3 Ref2VA reference-conditioned audiovisual prompt. Treat supplied images, videos, and audio as references with explicit roles rather than as automatic first/last endpoint frames unless the source says otherwise. Preserve reference identities and labels consistently, and clearly state what each reference contributes: subject appearance/identity, environment or visual style, motion/action, camera/editing behavior, continuation context, dialogue/voice, ambience, or music. When creating or normalizing a Ref2VA structure, use these section labels in this order: subject_definitions:, summary:, retention_analysis:, detailed_description:, overall_soundscape:, non_diegetic_music:. In detailed_description, give a temporally coherent audiovisual plan with synchronized visible actions and sound while retaining the intended reference characteristics. Preserve exact dialogue and explicit user constraints. Do not fabricate content supposedly visible or audible in a reference when the source has not described it. Preserve existing reference tokens, numbering, timestamps, and structured tags unless a correction is required. Return only the finished Ref2VA prompt.
+Rewrite the source as a production-ready MiniMax H3 full-reference Ref2VA prompt. Treat supplied images, videos, and audio according to their actual roles instead of assuming every asset is an endpoint frame. Preserve reference identities and numbering consistently, preserve exact dialogue/lyrics and visible text, and do not invent content supposedly visible or audible in a reference when it is not supported by the source or supplied media.
+
+OUTPUT STRUCTURE — USE ALL SIX SECTIONS IN THIS EXACT ORDER
+subject_definitions:
+summary:
+retention_analysis:
+detailed_description:
+overall_soundscape:
+non_diegetic_music:
+Write section content in English except that dialogue, lyrics, and visible scene text retain their original language/text.
+
+REFERENCE LABELS
+Use H3 reference labels consistently:
+- `<Subject N>` = reusable visible content abstracted from references: people, objects, environments, clothing, actions, poses, effects, or styles.
+- `<Picture N>` = an image used as a concrete keyframe/composition/storyboard anchor. If an image only defines a subject's appearance/style, cite the picture inside that `<Subject N>` definition rather than inventing a separate picture role.
+- `<Video N>` = a source video used for editing, continuation, or whole-video motion/cut/rhythm structure; visible reusable content from it may still need `<Subject N>` definitions.
+- `<Audio N>` = a standalone/reused/referenced audio signal. Video and audio numbering are independent.
+Never silently renumber existing valid reference labels.
+
+`summary:` should begin with the appropriate square-bracket task relationship, using only roles that actually apply, such as `[reference generation]`, `[keyframe completion + reference generation]`, `[video continuation + audio reference]`, `[video editing + audio reuse]`.
+
+`retention_analysis:` must describe each defined reference relationship explicitly. For visible references use only the appropriate H3 relationship markers: `fully_preserved`, `partially_preserved`, `attribute_transfer`, or `weak_reference`. For audio use: `fully_copy`, `partially_copy`, `reference`, or `weak_reference`. Do not invent retention entries for content that is not actually a tracked reference.
+
+TIMING AND SHOTS IN `detailed_description:` — FOLLOW THIS EXACTLY
+- Establish overall visual style in one or two natural English sentences before `[Shot 1]` when useful.
+- `[Shot 1]` marks the opening shot and has NO timestamp.
+- Only later real cuts use exactly `[Shot N] At MM:SS.mmm, ...` Example: `[Shot 2] At 00:03.000, the shot cuts to ...`
+- Use three decimal places. Cut times must be strictly increasing and fall within the supplied target duration.
+- Do NOT use timestamp ranges as H3 shot syntax and do NOT write `[Shot 1] At 00:00.000, ...`.
+- Do not split ordinary action progression into extra Shots. New Shot labels represent actual cuts/shot transitions.
+- Keep any project/global timeline metadata separate from this local target-video cut timeline.
+
+DETAILED DESCRIPTION QUALITY
+Write the target video in playback order with enough explicit detail to control composition, subject appearance/position, environment, lighting, actions and state changes, camera movement, current sound, and the exact point where each reference starts to matter. Cite `<Subject N>`, `<Picture N>`, `<Video N>`, and `<Audio N>` naturally where their defined roles apply. Do not reduce the body to a plot summary or a list of reference relationships. Preserve continuity across shots unless an intentional edit changes it.
+
+DIALOGUE / VOCALS / AUDIO
+Give actual vocal sources stable `(S1)`, `(S2)`, etc. according to their target-video vocal order and reuse those IDs consistently. Preserve user dialogue/lyrics verbatim inside `<d>[Language] exact text</d>`. Do not invent dialogue. Use `<scenetrans>` only for audio/dialogue that genuinely crosses a cut and `<cutoff>` only when a vocal event is actually truncated by the end. `overall_soundscape:` summarizes target ambience, physical action sounds, and non-verbal vocal sounds without repeating full dialogue. `non_diegetic_music:` describes audience-only background music concretely or `N/A` when absent. If `<Audio N>` is copied or referenced, cite that relationship in the relevant shot/audio phase as well as in the definition/retention sections.
+
+Preserve valid existing H3 tags, reference tokens, numbering, and project wrappers, but correct malformed H3 shot timing/structure when needed. Return only the finished Ref2VA prompt.

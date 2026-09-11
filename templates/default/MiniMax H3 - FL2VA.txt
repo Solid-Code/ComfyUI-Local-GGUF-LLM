@@ -1,1 +1,31 @@
-Rewrite the source as a MiniMax H3 FL2VA prompt where the supplied first frame is the exact starting visual state and the supplied last frame is the exact ending visual state. Describe a continuous, plausible audiovisual path from the first frame to the last without contradicting either endpoint. Begin the internal H3 timeline at local 0.00 seconds and, when a duration is supplied, make the final described state converge naturally to the last frame at the end of that duration. Preserve identity, clothing, objects, environment, lighting, framing, camera axis, and other endpoint constraints unless the source explicitly requests a transformation. Avoid repeatedly redescribing the endpoint images; focus on the observable changes, motion, camera continuity, synchronized sound, and transitions connecting them. Use integrated_multimodal_description:, overall_soundscape:, non_diegetic_music: for the H3 base format. Preserve existing frame/reference tags and exact dialogue. Do not invent a duration, frame label, or endpoint fact that the source does not provide. Return only the finished H3 prompt.
+Rewrite the source as a production-ready MiniMax H3 FL2VA prompt where Picture 1 is the exact FIRST FRAME and Picture 2 is the exact LAST FRAME. Build a continuous, physically plausible audiovisual path from the first image to the last without contradicting either endpoint. Preserve the user's concept, identities, clothing, objects, environment, lighting, camera axis, exact dialogue/lyrics, visible text, explicit constraints, and relevant project/reference wrappers.
+
+KEYFRAME ALIGNMENT — USE MINIMAX'S CANONICAL FORM
+When the effective duration is supplied, the first line must use this pattern, with the real final shot index and duration substituted:
+How the reference pictures align with the target video — Picture 1 (from Shot 1) aligns with the 0.00-second mark of the target video; Picture 2 (from Shot N) aligns with the S.SS-second mark of the target video.
+- `N` is the actual shot containing the final frame.
+- `S.SS` is the effective duration formatted to exactly two decimal places, e.g. `8.00-second`.
+- Insert one blank line after the alignment instruction.
+- Never invent a duration. If the source lacks one, preserve any valid existing endpoint alignment rather than fabricating a time value.
+
+OUTPUT STRUCTURE
+Then use exactly these fields in order:
+integrated_multimodal_description:
+overall_soundscape:
+non_diegetic_music:
+
+TIMING AND SHOTS — FOLLOW THIS EXACTLY
+- The internal H3 shot timeline is local to this generation.
+- `[Shot 1]` has NO timestamp.
+- Only later actual cuts use `[Shot N] At MM:SS.mmm, ...`, with strictly increasing three-decimal cut times inside the duration.
+- Do NOT use timestamp ranges as H3 shot syntax and do NOT write `[Shot 1] At 00:00.000, ...`.
+- FL2VA normally works best as one continuous shot because the model must interpolate between two endpoint frames. Do not introduce extra cuts unless the source explicitly requires them or a genuine shot transition is essential.
+- If multiple shots are explicitly required, Picture 2 must belong to the actual final `[Shot N]`, and the endpoint alignment line must name that shot.
+
+ENDPOINT PATH
+Do not spend the prompt merely describing two static images. Describe the visible path between them: initial motion from Picture 1, intermediate pose/object/composition changes, camera motion, environmental response, and gradual convergence so the final frame lands naturally on Picture 2. Preserve endpoint identity, object states, geometry, lighting, and framing unless a requested transformation specifically changes them. Avoid last-moment impossible jumps; narrow differences progressively as the endpoint approaches.
+
+DIALOGUE / AUDIO
+Preserve exact user dialogue/lyrics and use stable `(S1)`, `(S2)` speaker IDs with `<d>[Language] exact text</d>`. Do not invent dialogue. Synchronize diegetic sound with physical actions. `overall_soundscape:` summarizes ambience/action/non-verbal sounds in 1-4 sentences. `non_diegetic_music:` describes audience-only score concretely or `N/A` when absent. Preserve visible text exactly.
+
+Preserve external/global timing metadata when present, but never substitute global sequence timestamps for the local H3 cut timeline. Correct malformed H3 timing while keeping valid project wrappers/tags. Return only the finished H3 prompt.
