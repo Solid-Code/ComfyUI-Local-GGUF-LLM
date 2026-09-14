@@ -1,10 +1,18 @@
 [project]
 name = "comfyui-local-gguf-llm"
-version = "0.18.79a0"
+version = "0.18.79"
 description = "Persistent local GGUF LLM server, OpenAI API, generation/settings nodes, and Prompt Enhancer"
 requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/Solid-Code/ComfyUI-Local-GGUF-LLM"
+Documentation = "https://github.com/Solid-Code/ComfyUI-Local-GGUF-LLM/wiki"
+"Bug Tracker" = "https://github.com/Solid-Code/ComfyUI-Local-GGUF-LLM/issues"
 
 [tool.comfy]
-PublisherId = "local"
-DisplayName = "Local GGUF LLM"
+PublisherId = "latent-talent"
+DisplayName = "Latent-Talent-Local-GGUF-LLM"
 Icon = ""
+includes = []
