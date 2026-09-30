@@ -3097,13 +3097,30 @@ def _ensure_mtmd_chat_template_compat(handler):
 def _vision_modules():
     """Return multimodal modules exposed by current and older llama-cpp-python builds."""
     modules = []
-    for modname in ("llama_cpp.llama_multimodal", "llama_cpp.llama_chat_format", "llama_cpp"):
-        try:
-            mod = __import__(modname, fromlist=["*"])
-            if mod not in modules:
-                modules.append(mod)
-        except Exception:
-            pass
+
+    try:
+        import llama_cpp.llama_multimodal as llama_multimodal
+
+        modules.append(llama_multimodal)
+    except Exception:
+        pass
+
+    try:
+        import llama_cpp.llama_chat_format as llama_chat_format
+
+        if llama_chat_format not in modules:
+            modules.append(llama_chat_format)
+    except Exception:
+        pass
+
+    try:
+        import llama_cpp
+
+        if llama_cpp not in modules:
+            modules.append(llama_cpp)
+    except Exception:
+        pass
+
     return modules
 
 

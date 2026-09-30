@@ -2453,7 +2453,8 @@ class LocalLLMServiceManager:
             "cycle_wall_seconds":"cycle_wall_seconds_median", "score_seconds":"score_median_seconds",
         }
         for dst,src in mapping.items():
-            if src in summary: merged[dst]=summary[src]
+            if src in summary:
+                merged[dst] = summary[src]
         merged.update(summary)
         return merged
 
@@ -2523,63 +2524,89 @@ class LocalLLMServiceManager:
             warm_info = {}
         warm_unload = self._tuner_unload_current("tuner-warmup-yield")
 
-        prompt_rates=[]; decode_rates=[]; prompt_seconds=[]; decode_seconds=[]
-        load_seconds=[]; native_load_seconds=[]; unload_seconds=[]; unload_sync_seconds=[]
-        completion_tokens=[]; inference_seconds=[]; cycle_wall_seconds=[]; acceptance_rates=[]
-        trial_records=[]
-        measured_vram=0
-        last_info={}
+        prompt_rates = []
+        decode_rates = []
+        prompt_seconds = []
+        decode_seconds = []
+        load_seconds = []
+        native_load_seconds = []
+        unload_seconds = []
+        unload_sync_seconds = []
+        completion_tokens = []
+        inference_seconds = []
+        cycle_wall_seconds = []
+        acceptance_rates = []
+        trial_records = []
+        measured_vram = 0
+        last_info = {}
 
         for trial in range(max(1, int(trials))):
             if self._tuner_cancel.is_set():
                 raise InterruptedError("Performance tuner cancelled")
-            cycle_started=time.perf_counter()
-            info={}; tokens=0; generate_wall=0.0
-            p_rate=d_rate=p_sec=d_sec=load_sec=native_sec=0.0
-            p_tok=c_tok=0
-            gpu={}
-            unload={}
+            cycle_started = time.perf_counter()
+            info = {}
+            tokens = 0
+            generate_wall = 0.0
+            p_rate = d_rate = p_sec = d_sec = load_sec = native_sec = 0.0
+            p_tok = c_tok = 0
+            gpu = {}
+            unload = {}
             try:
-                started=time.perf_counter()
+                started = time.perf_counter()
                 _response, _thinking, info_json, tokens, api = LocalGGUFLLM().generate(**args)
-                generate_wall=time.perf_counter()-started
-                self._api=api
-                try: info=json.loads(info_json)
-                except Exception: info={}
-                last_info=info
+                generate_wall = time.perf_counter() - started
+                self._api = api
+                try:
+                    info = json.loads(info_json)
+                except Exception:
+                    info = {}
+                last_info = info
 
-                p_rate=float(info.get("prompt_tokens_per_second") or 0.0)
-                d_rate=float(info.get("tokens_per_second") or 0.0)
-                p_sec=float(info.get("prompt_eval_seconds") or 0.0)
-                d_sec=float(info.get("generation_seconds") or 0.0)
-                p_tok=int(info.get("prompt_eval_tokens", info.get("prompt_tokens")) or 0)
-                c_tok=int(info.get("completion_tokens") or tokens or 0)
-                if p_sec<=0 and p_rate>0 and p_tok>0: p_sec=p_tok/p_rate
-                if d_sec<=0 and d_rate>0 and c_tok>0: d_sec=c_tok/d_rate
+                p_rate = float(info.get("prompt_tokens_per_second") or 0.0)
+                d_rate = float(info.get("tokens_per_second") or 0.0)
+                p_sec = float(info.get("prompt_eval_seconds") or 0.0)
+                d_sec = float(info.get("generation_seconds") or 0.0)
+                p_tok = int(info.get("prompt_eval_tokens", info.get("prompt_tokens")) or 0)
+                c_tok = int(info.get("completion_tokens") or tokens or 0)
+                if p_sec <= 0 and p_rate > 0 and p_tok > 0:
+                    p_sec = p_tok / p_rate
+                if d_sec <= 0 and d_rate > 0 and c_tok > 0:
+                    d_sec = c_tok / d_rate
 
-                load_sec=float(info.get("load_seconds") or 0.0)
-                gpu=info.get("gpu_backend") or {}
-                native_sec=float(gpu.get("native_load_seconds") or 0.0)
-                if load_sec<=0:
-                    load_sec=max(0.0, generate_wall-max(0.0,p_sec)-max(0.0,d_sec))
+                load_sec = float(info.get("load_seconds") or 0.0)
+                gpu = info.get("gpu_backend") or {}
+                native_sec = float(gpu.get("native_load_seconds") or 0.0)
+                if load_sec <= 0:
+                    load_sec = max(0.0, generate_wall - max(0.0, p_sec) - max(0.0, d_sec))
 
-                if p_rate>0: prompt_rates.append(p_rate)
-                if d_rate>0: decode_rates.append(d_rate)
-                if p_sec>=0: prompt_seconds.append(p_sec)
-                if d_sec>=0: decode_seconds.append(d_sec)
-                load_seconds.append(load_sec); native_load_seconds.append(native_sec)
+                if p_rate > 0:
+                    prompt_rates.append(p_rate)
+                if d_rate > 0:
+                    decode_rates.append(d_rate)
+                if p_sec >= 0:
+                    prompt_seconds.append(p_sec)
+                if d_sec >= 0:
+                    decode_seconds.append(d_sec)
+                load_seconds.append(load_sec)
+                native_load_seconds.append(native_sec)
                 completion_tokens.append(c_tok)
-                inference_seconds.append((p_sec+d_sec) if (p_sec>0 or d_sec>0) else max(0.0,generate_wall-load_sec))
-                spec_stats=((info.get("speculative") or {}).get("stats") or {})
-                rate=spec_stats.get("acceptance_rate")
-                if isinstance(rate,(int,float)): acceptance_rates.append(float(rate))
-                measured_vram=max(measured_vram,int(gpu.get("observed_vram_bytes") or 0))
+                inference_seconds.append(
+                    (p_sec + d_sec)
+                    if (p_sec > 0 or d_sec > 0)
+                    else max(0.0, generate_wall - load_sec)
+                )
+                spec_stats = ((info.get("speculative") or {}).get("stats") or {})
+                rate = spec_stats.get("acceptance_rate")
+                if isinstance(rate, (int, float)):
+                    acceptance_rates.append(float(rate))
+                measured_vram = max(measured_vram, int(gpu.get("observed_vram_bytes") or 0))
             finally:
-                unload=self._tuner_unload_current(f"tuner-trial-{trial + 1}-yield")
-                u=float(unload.get("total_seconds") or 0.0)
-                us=float(unload.get("sync_seconds") or 0.0)
-                unload_seconds.append(u); unload_sync_seconds.append(us)
-                cycle_wall=time.perf_counter()-cycle_started
+                unload = self._tuner_unload_current(f"tuner-trial-{trial + 1}-yield")
+                u = float(unload.get("total_seconds") or 0.0)
+                us = float(unload.get("sync_seconds") or 0.0)
+                unload_seconds.append(u)
+                unload_sync_seconds.append(us)
+                cycle_wall = time.perf_counter() - cycle_started
                 cycle_wall_seconds.append(cycle_wall)
 
             fixed=p_sec
@@ -2622,7 +2649,8 @@ class LocalLLMServiceManager:
         cycle_fixed_seconds=float(summary.get("cycle_fixed_seconds_median") or (load_sec+fixed_work_seconds+unload_sec))
         score_seconds=float(summary.get("score_median_seconds") or (fixed_work_seconds if mode=="Inference Only" else cycle_fixed_seconds))
 
-        tradeoffs=[]; quality_tradeoff=False
+        tradeoffs = []
+        quality_tradeoff = False
         if candidate_cfg.get("kv_cache_k") != base_cfg.get("kv_cache_k") or candidate_cfg.get("kv_cache_v") != base_cfg.get("kv_cache_v"):
             quality_tradeoff=True
             tradeoffs.append("KV precision changed; lower-bit KV formats can slightly affect output quality.")
