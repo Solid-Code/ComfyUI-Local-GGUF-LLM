@@ -7,16 +7,16 @@ from .version import PACKAGE_VERSION, BRIDGE_API_VERSION, VRAM_POLICY_VERSION, V
 # every JS module found under WEB_DIRECTORY.
 _js_dir = Path(__file__).resolve().parent / "web" / "js"
 _FRONTENDS = {
-    "local_llm_server": "local_llm_server_v101.js",
-    "prompt_enhancer": "prompt_enhancer_dom_v0633.js",
+    "local_llm_server": "local_llm_server_v102.js",
+    "prompt_enhancer": "prompt_enhancer_dom_v0651.js",
 }
 if _js_dir.is_dir():
     for _candidate in _js_dir.glob("*.js"):
         name = _candidate.name
         keep = True
-        if name.startswith("local_llm_server"):
+        if name.startswith("local_llm_server_v") and name.endswith(".js"):
             keep = name == _FRONTENDS["local_llm_server"]
-        elif name.startswith("prompt_enhancer"):
+        elif name.startswith("prompt_enhancer_dom_v") and name.endswith(".js"):
             keep = name == _FRONTENDS["prompt_enhancer"]
         elif name.startswith("h3_shot_generator"):
             # Migration from v0.18.40-and-earlier combined builds: H3 now lives

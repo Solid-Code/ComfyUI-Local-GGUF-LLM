@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-local-gguf-llm"
-version = "0.18.100a0"
+version = "0.18.80"
 description = "Persistent local GGUF LLM server, OpenAI API, generation/settings nodes, and Prompt Enhancer"
 requires-python = ">=3.10"
 
@@ -8,4 +8,3 @@ requires-python = ">=3.10"
 PublisherId = "local"
 DisplayName = "Local GGUF LLM"
 Icon = ""
-

@@ -310,6 +310,10 @@ MEMORY_COMMON = {
     "memory_batch_size": 512,
     "use_mmap": True,
     "use_mlock": False,
+    "threads": 0,
+    "threads_batch": 0,
+    "compute_mode": "Auto",
+    "numa_mode": "Auto",
 }
 
 MEMORY_PRESETS = {
@@ -319,6 +323,22 @@ MEMORY_PRESETS = {
     "Low KV Memory": {**MEMORY_COMMON, "kv_cache_k": "q8_0", "kv_cache_v": "q4_0"},
     "Minimum KV Memory": {**MEMORY_COMMON, "kv_cache_k": "q4_0", "kv_cache_v": "q4_0"},
     "CPU KV Cache": {**MEMORY_COMMON, "kv_cache_k": "q8_0", "kv_cache_v": "q8_0", "kv_cache_location": "CPU"},
+    "CPU Only (Auto / High Core)": {
+        **MEMORY_COMMON,
+        "context_size": 32768,
+        "kv_cache_k": "q8_0",
+        "kv_cache_v": "q8_0",
+        "kv_cache_location": "CPU",
+        "gpu_layers": 0,
+        "flash_attention": False,
+        "prompt_batch_size": 2048,
+        "memory_batch_size": 512,
+        "threads": 0,
+        "threads_batch": 0,
+        "compute_mode": "CPU Only",
+        "numa_mode": "Auto",
+        "op_offload": "Disabled",
+    },
     "CPU / Low VRAM": {
         **MEMORY_COMMON,
         "context_size": 16384,
@@ -329,6 +349,11 @@ MEMORY_PRESETS = {
         "flash_attention": False,
         "prompt_batch_size": 512,
         "memory_batch_size": 256,
+        "threads": 0,
+        "threads_batch": 0,
+        "compute_mode": "CPU Only",
+        "numa_mode": "Auto",
+        "op_offload": "Disabled",
     },
 }
 

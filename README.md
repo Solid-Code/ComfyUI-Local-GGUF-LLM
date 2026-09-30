@@ -1,240 +1,408 @@
 # ComfyUI Local GGUF LLM
 
-A single ComfyUI custom-node package for running a persistent local GGUF LLM and using it directly from workflows.
+> **0.18.100 CPU-first runtime:** CPU-only inference is now a first-class mode. `CPU Only` hard-disables model-layer, KV-cache, operator, and vision-projector GPU offload; Auto CPU threading is topology/affinity aware; NUMA Auto is available for multi-node CPU systems.
 
-This package includes:
+**Version 0.18.100-alpha**  
+Persistent local GGUF inference for ComfyUI, with workflow nodes, multimodal prompt support, VRAM-aware model residency, a performance tuner, Prompt Enhancer, and an optional OpenAI-compatible API.
 
-- **Local LLM Generate** — send prompts, images, and sampled video frames to the persistent local LLM.
-- **Local LLM Settings** — reusable model/generation settings with loadable Complete Settings Presets. Memory/performance tuning remains in the Local LLM service panel rather than crowding the workflow node.
-- **Local LLM Prompt Enhancer** — bundled **v0.6.32-alpha** prompt-enhancement node with prompt history, Prompt Sets, enhancement templates, IMAGE/VIDEO references, and workflow-driven enhancement.
-- **Local LLM Server panel** — model loading, presets, memory/VRAM controls, status, performance information, and the optional OpenAI-compatible API.
+## What is in this package
 
+This package currently registers exactly three ComfyUI nodes:
+
+| Node | Purpose |
+| --- | --- |
+| **Local LLM Generate** | Send a system prompt, prompt, optional images/video frames, and a request-local seed to the persistent Local LLM service. |
+| **Local LLM Settings** | Carry reusable model/sampling/vision/runtime settings into Generate or Prompt Enhancer. It can follow the current server configuration or load a saved Complete Settings Preset. |
+| **Local LLM Prompt Enhancer** | Generate and manage enhanced prompts with optional image/video reference input, prompt history, Prompt Sets, templates, batching, and workflow-time cycling. |
+
+The package also installs the **Local LLM Server** UI inside ComfyUI. The server owns the active llama.cpp model/context and is shared by all three nodes and by the OpenAI-compatible API.
+
+> **Package scope:** the old H3 Shot Generator is no longer part of this package. It lives in the separate `ComfyUI-H3-Shot-Generator` package. MiniMax H3 enhancement templates remain here because Prompt Enhancer can still write H3 prompts.
+
+## Architecture
+
+```text
+                         ┌──────────────────────┐
+                         │  Local LLM Server    │
+                         │  one shared llama.cpp│
+                         │  model/context       │
+                         └──────────┬───────────┘
+                                    │
+              ┌─────────────────────┼─────────────────────┐
+              │                     │                     │
+      Local LLM Generate    Local LLM Prompt      OpenAI-compatible API
+              │                 Enhancer          /v1/chat/completions
+              │                     │              /v1/completions
+              └──────────┬──────────┘
+                         │
+                Local LLM Settings
+                 (optional snapshot)
+```
+
+The workflow nodes do **not** independently load duplicate GGUF models. They submit work to the same process-global service.
 
 ## Requirements
 
 - ComfyUI
 - Python 3.10 or newer
-- `llama-cpp-python` installed in the same Python environment used by ComfyUI
-- A CUDA-enabled `llama-cpp-python` build when GPU inference is desired
+- `llama-cpp-python` installed in the **same Python environment as ComfyUI**
+- A CPU-capable `llama-cpp-python` build for CPU-only inference
+- A GPU-enabled `llama-cpp-python` build only when GPU or mixed CPU/GPU inference is desired
 
-This package intentionally does not install or replace `llama-cpp-python`, because installing the wrong wheel can replace a working CUDA build with a CPU-only build.
+`requirements.txt` intentionally installs nothing. This package does not automatically install or replace `llama-cpp-python`, because doing so can replace a working CUDA build with an incompatible or CPU-only wheel.
 
-Verify the copy visible to ComfyUI with:
+Verify the binding visible to ComfyUI with the Python executable used by ComfyUI:
 
 ```bash
 python -c "import llama_cpp; print(llama_cpp.__version__)"
 ```
 
+Feature availability such as particular multimodal chat handlers, quantized KV formats, Flash Attention, N-gram speculative decoding, or native MTP depends on the installed `llama-cpp-python` / llama.cpp build.
+
 ## Installation
 
-Extract the package so the folder is:
+Extract or clone the package to:
 
 ```text
 ComfyUI/custom_nodes/ComfyUI-Local-GGUF-LLM/
 ```
 
-Restart ComfyUI, then hard-refresh the browser if an older frontend is still cached.
+Then restart ComfyUI. After updating from an older build, hard-refresh the browser (`Ctrl+F5`) if the previous JavaScript UI is still cached.
 
-Do not install the standalone `ComfyUI-Local-LLM-Prompt-Enhancer` beside this package. Prompt Enhancer v0.6.35-alpha is already bundled here.
+Do not install a second standalone copy of the Local LLM Prompt Enhancer beside this package; Prompt Enhancer is bundled here.
 
-## GGUF model folders
+## Model layout
 
-Place model GGUF files anywhere below:
+GGUF model files are discovered recursively through the shared ComfyUI `LLM` model folder, whose canonical path is:
 
 ```text
-ComfyUI/models/llm/
+ComfyUI/models/LLM/
 ```
 
-Subfolders are supported, for example:
+Example:
 
 ```text
-ComfyUI/models/llm/
+ComfyUI/models/LLM/
 ├── Qwen/
-│   ├── Qwen3-30B-Q4_K_M.gguf
-│   └── mmproj-Qwen3-VL-F16.gguf
+│   ├── Qwen3.8-27B-Q4_K_M.gguf
+│   └── mmproj-Qwen3.8-27B-F16.gguf
 ├── Gemma/
 │   ├── gemma-3-12b-it-Q4_K_M.gguf
 │   └── mmproj-gemma-3-12b-f16.gguf
 └── Mistral/
-    └── mistral-24b-Q4_K_M.gguf
+    └── mistral-small-24b.gguf
 ```
 
-The Local LLM model selectors search this folder recursively.
+Files whose names look like `mmproj`, `vision-proj`, or `projector` are presented as vision projectors rather than text-model choices.
 
-## First-time server setup
+Package presets live under the same canonical `LLM` root:
 
-Open **LLM** in the ComfyUI side menu to open the Local LLM Server panel.
+```text
+ComfyUI/models/LLM/local_LLM_presets/
+```
 
-For a normal first setup:
+Using one `models/LLM` root avoids parallel `llm`/`LLM` directories on case-sensitive Linux/WSL filesystems and interoperates with other ComfyUI LLM nodes that register the `LLM` model category.
 
-1. Select the GGUF under **Model**.
-2. Select the matching **Vision / mmproj** only when the model supports vision. Otherwise use `None` or `Auto`.
-3. Select a model preset or use **Auto (Detected)**.
-4. Adjust memory/VRAM settings directly, or load a **Complete Settings Preset** from the **Presets** tab.
-5. For a machine that also runs diffusion/video models, **Auto Yield to ComfyUI** is the recommended VRAM policy.
-6. Save the server settings.
-7. Start the model, or use **On Demand** so it loads on the first request.
+If upgrading from a release that stored GGUF files in lowercase `ComfyUI/models/llm/`, move those model files into `ComfyUI/models/LLM/` once. Presets already used the uppercase root in recent releases.
 
-The server is global and persistent. Workflow nodes send requests to that service instead of creating a new llama.cpp model for every node execution.
+## Quick start
+
+1. Open the **Local LLM Server** from its ComfyUI sidebar launcher or floating status control.
+2. In **Model**, choose a GGUF model.
+3. For a multimodal model, choose the matching **Vision / mmproj** projector or use `Auto` when a safe match is available.
+4. Leave **Model Preset** on `Auto (Detected)` unless you want to set sampling behavior manually.
+5. In **Memory**, choose a context size and VRAM policy. For a ComfyUI machine that also runs diffusion/video models, start with **Auto Yield to ComfyUI**.
+6. Use **On Demand** startup unless you specifically want the LLM loaded at ComfyUI startup.
+7. Add **Local LLM Generate** to a workflow and enter a prompt.
+
+The service automatically loads on the first request when startup mode is **On Demand**.
+
+# Local LLM Server
+
+The server UI is the authoritative place for the global model/runtime configuration. It contains seven tabs.
+
+## Server
+
+Shows live state and request activity:
+
+- loaded model and service state
+- decode speed in tokens/second
+- generated token count
+- queued requests and total request count
+- current client
+- **Start**, **Suspend**, and **Stop / Unload** controls
+- startup mode: `Off`, `On Demand`, or `Auto Start`
+- optional draggable floating status indicator
+
+**Suspend** releases the native model/context while retaining the configuration so the next request can reload it. **Stop / Unload** also acts as the package-wide Local LLM interrupt. It cancels the current request generation epoch and unloads safely when the active native llama.cpp call reaches a safe return boundary; it does not trigger ComfyUI's global workflow interrupt.
+
+## Presets
+
+The Presets tab manages **Complete Settings Presets**. A complete preset stores the LLM runtime configuration, including:
+
+- model and vision projector
+- model preset / reasoning behavior
+- sampler values
+- vision limits
+- context / KV-cache configuration
+- GPU offload and split settings
+- prompt-prefix cache mode
+- speculative decoding settings
+- VRAM policy
+
+Server administration is deliberately excluded: API keys, startup mode, content logging, and interface preferences are not part of Complete Settings Presets.
+
+Preset creation and deletion are centralized in this tab. **Local LLM Settings** can load these presets but does not delete them.
+
+## Model
+
+The Model tab controls the current model and normal generation behavior:
+
+- GGUF model
+- Vision / mmproj projector
+- detected model family and capabilities
+- still-image, video-frame, and image-edge limits
+- model preset
+- thinking mode and reasoning effort where supported
+- preserve-thinking-history behavior where supported
+- temperature, top-p, top-k, min-p
+- repeat, presence, and frequency penalties
+- default max tokens
+
+`Auto (Detected)` uses GGUF metadata plus the filename to select the closest known model family/preset. Unknown/community models fall back to generic behavior rather than being rejected.
+
+Current tuned/detected families include presets for Qwen 3.8, Qwen 3.5, Qwen 3, GPT-OSS 20B, Mistral Small 3.2, Ministral 3, Gemma 3, Llama 3.1/3.2 Instruct, DeepSeek R1 Distill, Phi-4 Reasoning, and Nemotron 3 Nano.
+
+Vision capability metadata also recognizes a broader set of supported llama.cpp multimodal families/handlers, including Qwen VL variants, Gemma 3/4, GLM vision models, LFM vision models, MiniCPM, LLaVA, Llama 3 Vision, Moondream, OCR-oriented models, and others. Actual support still depends on the handlers present in the installed binding and on a compatible projector.
+
+## Memory
+
+The Memory tab contains the model-residency and performance controls.
+
+### Live VRAM estimate
+
+The UI estimates and displays:
+
+- model-weight VRAM
+- KV-cache VRAM
+- compute / batch working memory
+- speculative-decoding memory
+- vision/mmproj memory when applicable
+- measured native residency for a previously verified matching configuration
+- current GPU free memory
+- projected headroom and Auto-Yield reload target
+
+The estimate is intentionally conservative until the exact configuration has completed a verified load.
+
+### VRAM policy
+
+**Auto Yield to ComfyUI** is designed for shared diffusion/video + LLM systems. The LLM stays resident while there is room, but its native context can be fully closed when ComfyUI needs GPU memory and recreated on the next LLM request.
+
+**Keep Resident** avoids voluntary LLM eviction and is appropriate when enough VRAM exists for the other models in the workflow.
+
+The package uses a GPU-memory lease/coordination layer rather than blindly loading llama.cpp into whatever memory happens to be free.
+
+### Context and KV cache
+
+The panel exposes:
+
+- context size, constrained to normal steps and the GGUF's advertised native context when known
+- independent K and V KV-cache formats
+- GPU or CPU KV-cache location
+- GPU layers (`-1` = full supported offload)
+- Flash Attention
+- prompt batch (`n_batch`) and micro-batch (`n_ubatch`)
+- mmap / mlock
+- main GPU
+- multi-GPU split mode and tensor split
+
+Lower-bit KV formats can save significant memory but may change quality/performance slightly. CPU KV saves VRAM but is usually slower.
+
+### CPU-only and high-core-count CPUs
+
+**Compute Mode** controls the hardware boundary:
+
+- `Auto` — use GPU/mixed mode only when ComfyUI can see a CUDA/ROCm accelerator and the installed llama.cpp binding supports GPU offload; otherwise use CPU-only mode.
+- `GPU / Mixed` — allow llama.cpp GPU offload according to GPU Layers, KV placement, operator offload, and vision settings.
+- `CPU Only` — hard-disable all native GPU allocations owned by this package: model layers use `n_gpu_layers=0`, KV stays on CPU, operator/KQV offload is disabled, and an mmproj/vision projector stays on CPU.
+
+CPU thread fields accept `0` for **Auto**. Auto uses the physical-core count for token-generation/decode threads and the logical CPU count for prompt/batch threads, while respecting the CPU affinity visible to the ComfyUI process. On a fully exposed Threadripper 3990X (64 cores / 128 threads), this resolves to **64 generation threads and 128 prompt/batch threads**.
+
+**NUMA = Auto** stays disabled on a single exposed NUMA node. In CPU-only mode, if the OS exposes more than one NUMA node to the process, Auto selects llama.cpp's `Distribute` strategy. Explicit `Disabled`, `Distribute`, `Isolate`, and `Numactl` choices remain available for manual tuning.
+
+For CPU-only use, keep **mmap enabled** unless there is a specific reason not to. Leave **mlock disabled** by default; enable it only when the system has sufficient RAM and you intentionally want to pin model pages. The Memory tab's **Use CPU-only Auto** button applies a high-core-count baseline in one step: the CPU hard boundary, Auto threading/NUMA, CPU KV, mmap on, mlock off, and 2048/512 prompt/micro batches. The built-in **CPU Only (Auto / High Core)** memory preset applies the same baseline for legacy/internal memory-preset consumers.
+
+CPU-only loads skip CUDA synchronization and VRAM-verification snapshots, so a machine without a working CUDA runtime does not need GPU diagnostics merely to load a GGUF.
+
+### Prompt Prefix Cache
+
+`Auto` can reuse an **exact token prefix already present in the current resident llama.cpp KV context**. It is not a second RAM cache.
+
+The reusable prefix is cleared or bypassed by operations that invalidate the resident context, including Suspend, Stop / Unload, model reload, and vision requests.
+
+### Speculative decoding
+
+Modes:
+
+- `Off`
+- `Auto`
+- `N-gram`
+- `MTP`
+
+Speculative decoding is target-verified: draft tokens are accepted only when the target model verifies them.
+
+`Auto` prefers native embedded MTP when the GGUF and installed binding genuinely support it; otherwise it can fall back to N-gram. The current native MTP path requires full GPU offload (`GPU layers = -1`). Unsupported providers are disabled rather than silently emulated.
+
+## Tuner
+
+The built-in Performance Tuner benchmarks the actual saved server configuration and can test combinations of:
+
+- prompt/micro batch sizes
+- Flash Attention
+- speculative decoding
+- mmap / mlock
+- GPU/CPU KV placement
+- useful GPU-layer offload points
+- optional KV precision variants
+
+Profiles:
+
+- **Quick** — shorter screening followed by sustained validation of the strongest candidates
+- **Standard** — wider screening and longer validation
+
+Scoring modes:
+
+- **ComfyUI Cycle** — includes warm reload, fixed prompt/generation work, and Suspend-style unload; useful when the LLM frequently yields to ComfyUI
+- **Inference Only** — focuses on prompt processing + generation without load/unload time
+
+The tuner never silently reduces the configured context size. A recommendation can be applied directly or saved as a Complete Settings Preset.
+
+## API
+
+The API tab controls the optional OpenAI-compatible server:
+
+- enable/disable external API access
+- allow/disallow streaming requests
+- display/copy the API base URL
+- configure, reveal, or regenerate the API key
+
+The API is disabled by default.
+
+## Logs and privacy
+
+The service keeps a bounded runtime log for status/diagnostics. Prompt and response **content are not logged by default**. Content logging must be explicitly enabled in the Logs tab.
+
+# Workflow nodes
 
 ## Local LLM Generate
 
-Add **Local LLM Generate** from the Local LLM node category.
+**Category:** `LLM/Local Service`
 
-The node provides:
+Inputs:
 
-- System Prompt preset and editable System Prompt
-- Prompt preset and editable Prompt
+- System Prompt Preset
+- editable System Prompt
+- Prompt Preset
+- editable Prompt
+- request-local Seed + standard ComfyUI Control After Generate
 - optional `LOCAL_LLM_SETTINGS`
-- optional `IMAGE`
-- optional video frames as an `IMAGE` batch
+- optional `IMAGE` / image batch
+- optional `video_frames` as an ordered IMAGE batch
 
 Outputs:
 
-- `response`
-- `thinking`
-- `info`
+```text
+response : STRING
+thinking : STRING
+info     : STRING (formatted JSON diagnostics)
+```
 
-Local LLM Generate no longer duplicates model, sampler, or vision-limit controls. Connect **Local LLM Settings** when the workflow should own those values. **Seed + Control After Generate remain on Generate** as per-request controls. Local LLM Settings no longer contains or overrides seed. If `settings` is left disconnected, Generate uses the current Local LLM server/modal configuration. Prompt text, media, and seed remain owned by Local LLM Generate.
+When `settings` is disconnected, Generate uses the **current server configuration**. When connected, the Settings object supplies its runtime/sampler/vision snapshot. The Generate node's seed always remains request-local and is never replaced by Local LLM Settings.
 
-### Number controls
+Prompt and System Prompt presets are stored as editable text files and can be saved/deleted from the Generate node UI.
 
-The custom DOM numeric controls mirror Nodes 2.0 behavior:
+### Image and video-frame input
 
-- large touch/clickable `−` and `+` controls
-- drag or touch-scrub left/right to change the value
-- min/max range fill when a real range exists
-- exact step snapping
-- direct click-to-edit
-- keyboard stepping
+`image` accepts one still or an IMAGE batch. `video_frames` accepts ordered frames as an IMAGE batch and samples them evenly using the active Vision Max Frames limit. Inputs are downscaled to the active Vision Max Edge before being encoded for the multimodal handler.
 
-The underlying native ComfyUI widgets remain authoritative for serialization and execution.
+A compatible multimodal GGUF + projector/handler is required. Connecting media does not make a text-only model multimodal.
 
-## Complete Settings Presets and Local LLM Settings
+## Local LLM Settings
 
-The server panel has a dedicated **Presets** tab for Complete Settings Presets. A complete preset stores the LLM runtime configuration: model and vision projector, model behavior/sampling, and memory/KV/offload/speculative settings. API keys, startup mode, logging, and interface preferences are intentionally excluded. The Presets tab is the only place that creates or deletes Complete Settings Presets and shows a readable summary of the selected preset.
+**Category:** `LLM/Local Service`
 
-Use **Local LLM Settings** when a workflow should own a reusable LLM configuration. The node can **load** Complete Settings Presets from the same preset library, but it does not save or delete them. Model, vision-projector, and model-preset selection come from the Complete Settings Preset rather than separate selectors on the workflow node. Thinking/reasoning and sampler controls remain directly adjustable; editing any visible preset-owned field changes the node to **Custom**. Detailed memory/performance tuning is managed in the Local LLM service panel and carried into the node when a Complete Settings Preset is loaded.
-
-It outputs:
+Output:
 
 ```text
 LOCAL_LLM_SETTINGS
 ```
 
+The Settings node is deliberately a **request configuration carrier**, not another model server.
 
+Its preset selector supports:
 
+- **Current Server** — resolves against the live global server configuration
+- **Custom** — use the serialized values in this Settings node
+- any saved Complete Settings Preset
 
-The node is a planning/orchestration layer. Enter the complete video idea in plain English and click **Generate Shots**. The Local LLM returns a validated, versioned plan and the node renders the result as horizontally scrollable shot cards.
+The compact node UI directly exposes thinking/reasoning, sampler values, and vision limits. Model selection, projector selection, and detailed memory/offload values are carried by the current server or Complete Settings Preset instead of being duplicated as a large second server panel inside the workflow.
 
-### Sequence settings
-
-- **Max Shot** — hard maximum for one H3 generation segment, up to 15 seconds.
-- **Target Length** — `0` means Auto. Set a value when the complete sequence needs a requested total duration.
-- **Width / Height** — explicit output geometry.
-- **Start Frame Ratio / MP** — preserves the designated starting-image aspect ratio (or the first connected image as a fallback) and derives width/height from the target megapixel count.
-- **Seed** — request-local seed used only when planning/regenerating shots.
-
-### Dynamic H3 references
-
-The frontend starts with one socket each for IMAGE, VIDEO, and AUDIO. As the final slot of a media type is connected or configured, the next slot appears automatically, up to the supported H3 planner limits:
-
-- 9 images
-- 3 videos
-- 3 audio clips
-
-Every visible reference gets a small **Role** selector and **Label** field. Labels tell the Local LLM what a connected asset represents; roles provide stronger routing hints such as first frame, last frame, subject identity, motion/camera reference, voice, music, paired video soundtrack, or source timeline audio.
-
-`first_frame`, `last_frame`, and `source_timeline` are sequence-global roles and may each be assigned to only one connected asset. **Source audio timeline** is carried in the sequence separately so a downstream continuation chain can receive it once and preserve/slice it across shots; it is not automatically treated as a per-shot `<Audio N>` reference.
-
-Audio references can also be marked as the soundtrack paired to Video 1/2/3 so Node Expansion can route them to H3's paired video-audio input rather than treating them as standalone audio.
-
-The planner uses stable workflow asset IDs such as `image_1` and creates **shot-local** H3 bindings such as `<Picture 1>`, `<Video 1>`, and `<Audio 1>`. This matters because each shot may use a different subset of connected assets while still keeping valid contiguous H3 reference numbers.
-
-### Shot cards
-
-Each generated card supports:
-
-- drag to reorder
-- direct script editing
-- direct duration editing
-- per-shot guidance text
-- **per-shot reference editing**: swap a bound asset in place, or add/remove Ref2VA bindings without an LLM call
-- **reference pins**: pin any connected asset so the Local LLM must keep it bound when that shot is regenerated or when the full plan is regenerated; endpoint-conditioned modes can accept a new reference as a regen pin without corrupting their fixed input shape
-- **shot lock**: locked shots are immutable anchors during Generate Shots replanning and their card controls/regeneration remain disabled until unlocked
-- **STALE indicator**: a generated card is marked stale when the master description, sequence settings, connected-reference topology, or asset label/role changes after that shot was generated
-- ↻ regenerate only that shot while sending the original request and complete current sequence as continuity context
-- duplicate
-- delete
-
-Regeneration preserves the card's stable workflow ID. Pinned assets are enforced again by backend validation, and locked shots are restored verbatim even if the Local LLM attempts to rewrite them. The Local LLM returns a tolerant tagged transport format rather than embedding long H3 scripts inside JSON strings. The backend parses `<shot>`, `<seconds>`, `<model_mode>`, `<binding>`, and `<h3_script>` blocks into the same normalized internal plan, then validates durations, media bindings, model mode, reference limits, label numbering, and local timing. `plan_json` and `H3_SEQUENCE` remain structured JSON/Python workflow state; only the LLM response boundary uses tags. A compact tag-format repair request is attempted if wrapper structure is malformed.
-
-### Output contract
-
-The node outputs:
-
-```text
-H3_SEQUENCE  (displayed as "H3 Sequence")
-```
-
-`H3_SEQUENCE` is deliberately a **planned sequence**, not the live continuation `H3_CHAIN`. It contains the original request, validated shot plan, geometry, connected media objects plus metadata, reference limits, and optional source-audio asset ID. A downstream H3 Node Expansion/generation node should consume this sequence, build the first H3 conditioning/generation, and then create/advance the runtime `H3_CHAIN` as actual latent/audio history exists.
-
-Each shot also stores the requested `seconds`, canonical H3 `frame_count`, and resulting `actual_seconds`. H3 uses 24 fps and the `17n+5` temporal frame grid; Node Expansion should use `frame_count` as authoritative.
-
-This keeps planning state separate from generated AV state and avoids pretending a pre-generation object already contains continuation history.
-
-### Local LLM media visibility
-
-Still images and sampled video frames are sent to a compatible multimodal Local LLM. If a connected **Local LLM Settings** node sets vision limits below the number of connected references, the Shot Generator errors rather than silently hiding references from the planner.
-
-Audio objects are preserved in `H3_SEQUENCE`, but the current GGUF vision path does not audition the waveform. The planner receives the audio's label, role, and duration metadata and is explicitly told not to invent unheard content.
+Editing a preset-owned visible field changes the node to `Custom`. Seed is intentionally absent from Local LLM Settings; each consuming request node owns its own seed.
 
 ## Local LLM Prompt Enhancer
 
-The bundled **Local LLM Prompt Enhancer v0.6.15-alpha** uses the same persistent Local GGUF service. No second LLM server or second model load is required.
+**Prompt Enhancer version: 0.6.51-alpha**  
+**Category:** `prompt/Local LLM`
 
-### Main workflow
+Prompt Enhancer uses the same persistent Local LLM service as Generate.
 
-1. Add **Local LLM Prompt Enhancer**.
-2. Enter the original text in **Prompt**.
-3. Choose an **Enhancement Preset** or edit **Enhancement Instructions**.
-4. Set the number beside **Enhance Prompt** to `1` for a single result or higher for a batch, then click **Enhance Prompt**. Batch counts above `1` automatically switch **Overwrite Enhanced** to **Add New** and lock that choice until the count returns to `1`.
-5. Edit the resulting **Enhanced Prompt** if needed.
-6. Connect `enhanced_prompt` downstream to the node that should receive the enhanced text.
+Inputs include:
 
-The original `prompt` output is also available unchanged.
+- original Prompt
+- editable Enhanced Prompt
+- Prompt Set
+- Prompt Cycle
+- Add New / Overwrite behavior
+- Enhancement Preset and editable Enhancement Instructions
+- request-local enhancement seed
+- Enhance with Workflow
+- shared Prompt Preset
+- optional `image(s)` IMAGE input
+- optional native ComfyUI `VIDEO` input
+- optional `LOCAL_LLM_SETTINGS`
 
-### Optional media
-
-Prompt Enhancer accepts:
-
-- `image(s)` — still image or IMAGE batch
-- `video` — native ComfyUI VIDEO input
-- `settings` — Local LLM Settings
-
-Manual Enhance can partially execute the dependencies needed to make connected media available to the LLM. The selected local model must support the media type and have the appropriate vision/mmproj configuration.
-
-### Enhanced Prompt history
-
-Generated enhanced prompts are stored as an editable array.
-
-The history control uses:
+Outputs:
 
 ```text
-− | X / Y | + | × | Undo | Redo | Clear All
+enhanced_prompt : STRING
+prompt          : STRING  # unchanged original prompt
 ```
 
-- `X` is the editable/scrubbable active prompt index.
-- `Y` is the read-only number of stored prompts.
-- `×` deletes the active entry.
-- Undo/Redo keep up to 20 array states in each direction.
-- **Clear All** empties the array.
+### Manual Enhance
+
+The node's **Enhance Prompt** action can generate 1–64 enhancements in one batch. A batch greater than 1 appends results rather than repeatedly overwriting the same entry.
+
+A manual batch pins the server/runtime configuration that existed when the batch started, so changing the server modal halfway through a batch does not make later items use a different model configuration.
+
+When image/video inputs are connected, manual Enhance uses ComfyUI partial execution to obtain only the dependencies required for this node. Media tensors are not kept in a long-lived global cache.
+
+### Enhanced-prompt history
+
+Enhancements are stored as an editable prompt array. The UI supports:
+
+- previous / next prompt
+- direct active-index editing
+- delete active entry
+- clear all
+- Undo / Redo, up to 20 array states in each direction
+
+The active prompt is the one returned by `enhanced_prompt` when workflow-time enhancement is disabled.
 
 ### Prompt Sets
 
 Prompt Sets save and restore the complete enhanced-prompt array and active index.
 
-They are stored under:
+Stored at:
 
 ```text
 ComfyUI/models/LLM/local_LLM_presets/prompt_enhancer/prompt_sets/
@@ -242,87 +410,84 @@ ComfyUI/models/LLM/local_LLM_presets/prompt_enhancer/prompt_sets/
 
 ### Enhancement templates
 
-Built-in templates are included for:
+Bundled protected templates currently include:
 
-- Krea 2 Image
-- MiniMax H3 T2VA
-- MiniMax H3 I2VA
-- MiniMax H3 FL2VA
-- MiniMax H3 L2VA
-- MiniMax H3 Ref2VA
+- Krea 2 - Image
+- MiniMax H3 - T2VA
+- MiniMax H3 - I2VA
+- MiniMax H3 - FL2VA
+- MiniMax H3 - L2VA
+- MiniMax H3 - Ref2VA
 
-User enhancement templates are stored under:
+User templates are stored as text files in:
 
 ```text
 ComfyUI/models/LLM/local_LLM_presets/prompt_enhancer/
 ```
 
-Built-in templates are protected from deletion through the node UI.
+The MiniMax templates are prompt-writing templates only; the H3 shot-planning/generation node pack is separate.
 
 ### Prompt Cycle
 
-When **Enhance with Workflow** is disabled, Prompt Cycle controls how the stored enhanced-prompt array advances after normal workflow execution:
+When **Enhance with Workflow** is off, Prompt Cycle chooses how the stored enhanced-prompt array advances during normal workflow execution:
 
-- `fixed`
-- `increment`
-- `decrement`
-- `shuffle`
-- `random`
+- `fixed` — stay on the selected entry
+- `increment` — advance and wrap
+- `decrement` — move backward and wrap
+- `shuffle` — true no-repeat deck behavior until the deck is exhausted
+- `random` — choose freely
 
-Shuffle and Random use fresh internal randomness and do not use the LLM generation seed.
+Fixed mode is cacheable. Active cycle modes deliberately re-execute because each queued item can select a different stored prompt. During normal ComfyUI queueing, the frontend freezes the exact X/Y index into `prompt_history_index` while **each Run x N API prompt is serialized**. The backend uses that serialized index directly; it does not advance a shared cycle cursor at execution time. This makes the chosen prompt independent of queue execution timing and backend cursor state.
 
-Prompt Cycle execution state is mirrored from ComfyUI's global `executed` event, so cycling does not depend on the Prompt Enhancer node being selected or mounted by the renderer.
+The queue snapshot also marks the request so backend history reconciliation cannot overwrite the selected array entry with the stale visible Enhanced Prompt text from a different X/Y position. Shuffle/Random planning is performed per queued item and is independent of the LLM generation seed. Headless/legacy submissions without queue metadata use the serialized X/Y as the active item and calculate only a one-step next-index value for UI feedback.
 
 ### Enhance with Workflow
 
-Enable **Enhance with Workflow** when every normal workflow execution should generate a fresh enhancement before sending text downstream.
+When enabled, every normal workflow execution calls the LLM and creates a fresh enhancement before returning downstream text.
 
-When disabled, normal workflow execution uses the currently selected stored Enhanced Prompt instead of calling the LLM again.
+When disabled, workflow execution does not call the LLM for enhancement; it returns the selected stored Enhanced Prompt and applies Prompt Cycle if enabled.
 
-## Preset folders
+# Preset storage
 
-Local LLM presets are stored below:
+Current package-owned preset layout:
 
 ```text
 ComfyUI/models/LLM/local_LLM_presets/
 ├── settings/          # Complete Settings Presets
-├── prompts/
-├── system_prompts/
-├── sampler/           # legacy/user sampler files remain readable
+├── prompts/           # shared user prompts
+├── system_prompts/    # shared system prompts
+├── sampler/           # legacy/user sampler presets remain readable
 └── prompt_enhancer/
-    └── prompt_sets/
+    ├── *.txt           # user enhancement templates
+    └── prompt_sets/    # saved enhanced-prompt arrays
 ```
 
-**Local LLM Settings** loads Complete Settings Presets from `settings/`. Complete preset creation and deletion is intentionally centralized in the server panel's **Presets** tab.
+Small preset/config writes use same-directory temporary files followed by atomic replacement to avoid partial files and fixed-temp-name collisions.
 
-## Vision input
+The global server configuration itself is stored in the ComfyUI user directory as:
 
-For **Local LLM Generate**:
+```text
+local_llm_server.json
+```
 
-- `image` accepts a still IMAGE or IMAGE batch.
-- `video_frames` accepts ordered frames as an IMAGE batch and samples them according to the configured frame limit.
+# Thinking and reasoning
 
-For **Local LLM Prompt Enhancer**:
+Where the model/template exposes reasoning, ComfyUI requests return reasoning separately from final visible text:
 
-- `image(s)` accepts still IMAGE references.
-- `video` accepts native ComfyUI VIDEO.
+- `thinking` output on Local LLM Generate
+- `reasoning_content` on OpenAI-compatible chat responses/stream chunks
 
+The runtime also handles common reasoning-tag/channel forms and the prefilled-thinking behavior used by supported Qwen templates. The final `response` output is kept separate from extracted reasoning.
 
-- dynamic `image_N` sockets provide still H3 references.
-- dynamic `video_N` sockets provide native VIDEO references sampled for Local LLM planning.
-- dynamic `audio_N` sockets are preserved for downstream H3 use; only label/role/duration metadata is available to the current Local LLM planner.
+# OpenAI-compatible API
 
-Vision input requires a compatible multimodal model and mmproj/projector configuration. A text-only GGUF cannot use image/video input simply because the node socket is connected.
+Enable the API from **Local LLM Server → API**.
 
-## Thinking / reasoning
+Base URL shown by the UI:
 
-The service exposes the final response and reasoning separately to ComfyUI nodes when the model/template provides reasoning.
-
-The OpenAI-compatible chat endpoint also supports structured `reasoning_content`. For models such as Qwen where the chat template prefills the opening `<think>` and generation begins with reasoning text followed by `</think>`, the server recognizes the prefilled-thinking form and separates reasoning from final content instead of leaking the closing tag into the response.
-
-## OpenAI-compatible API
-
-The optional external API is configured from the Local LLM Server panel.
+```text
+http://<comfy-host>:<port>/local-llm/v1
+```
 
 Endpoints:
 
@@ -332,23 +497,260 @@ POST /local-llm/v1/chat/completions
 POST /local-llm/v1/completions
 ```
 
-`/local-llm/v1/chat/completions` supports streaming responses. Configure the API key and external-access options in the LLM panel before using an external client such as SillyTavern.
+This is a focused local compatibility layer, not a complete implementation of every OpenAI API feature.
 
-`GET /local-llm/v1/models` also advertises the **configured usable context window** through `context_length`, `max_context_length`, and `n_ctx`. When the GGUF exposes its native/training context metadata, `n_ctx_train` is included separately. These are compatibility extensions: strict OpenAI clients can ignore them, while local clients that understand them can auto-size their context window.
+## Single active model
 
-External GPU requests coordinate with ComfyUI GPU execution so the persistent LLM does not intentionally race a diffusion/video workload during VRAM handoff.
+The service has one configured active GGUF model. `/v1/models` advertises that model and its configured usable context window.
 
-## Model residency and ComfyUI VRAM
+The `model` string supplied by a client is accepted for OpenAI-client compatibility and response labeling; it does **not** route to or hot-swap an arbitrary GGUF. Select the real model in the Local LLM Server configuration.
 
-The service is designed to coexist with normal ComfyUI model workloads.
+`/v1/models` additionally exposes local-client context metadata:
 
-- **Auto Yield to ComfyUI** allows the LLM to release its native context when ComfyUI needs the GPU, then reconstruct it on the next LLM request.
-- **Keep Resident** prioritizes avoiding LLM reloads and is appropriate when enough VRAM remains for the rest of the workflow.
-- **On Demand** loads the model on first use.
-- **Auto Start** loads shortly after ComfyUI starts.
+- `context_length`
+- `max_context_length`
+- `n_ctx`
+- `n_ctx_train` when native GGUF metadata is available
 
-Changing model-allocation settings requires a native model reload. Request-local prompts and sampler values do not.
+## Request control precedence
 
-### Stop / Unload
+Generation-control precedence is:
 
-**Stop / Unload** is a global Local LLM interrupt and remains available while the service is loading, waiting for ComfyUI, evaluating a prompt, generating, running an Enhance batch, or running the performance tuner. A Stop request immediately cancels the active/queued Local LLM request generation epoch; native llama.cpp teardown is deferred until the active native call reaches a safe return boundary. This avoids destroying a live CUDA context from another thread. On GPU, a large native model load or prompt-prefill cannot be forcibly torn down mid-kernel, so Stop becomes effective at the next safe llama.cpp/Python boundary and then unloads the model. It does not invoke ComfyUI's global workflow interrupt.
+```text
+server/current values
+        ↓
+model preset / Auto-detected preset
+        ↓
+explicit request-local API fields
+```
+
+Only fields explicitly sent by the API client override the server/preset. Missing or `null` generation controls fall back to the server/preset value.
+
+Supported request controls include the normal/local fields used by common OpenAI-compatible clients:
+
+- `temperature`
+- `top_p`
+- `max_tokens`
+- `presence_penalty`
+- `frequency_penalty`
+- `stop`
+- `seed`
+- `stream`
+
+Common local-LLM extensions are also accepted:
+
+- `top_k`
+- `min_p`
+- `typical_p`
+- `repeat_penalty`
+- `reasoning_effort`
+- `thinking_mode`
+- `preserve_thinking`
+- `tfs_z`
+- `mirostat_mode`
+- `mirostat_tau`
+- `mirostat_eta`
+
+Fields not implemented by this service are not silently turned into unrelated behavior. For example, the current API is not an `n`-completion fan-out service and does not implement OpenAI logprobs/logit-bias semantics.
+
+## Seed behavior
+
+The API treats seeds as follows:
+
+```text
+seed omitted  -> fresh random request seed
+seed: null    -> fresh random request seed
+seed: -1      -> fresh random request seed
+seed >= 0     -> explicit deterministic request seed
+```
+
+ComfyUI exposes a 64-bit seed, while llama.cpp sampling ultimately uses a deterministic 32-bit seed. The package maps the full 64-bit value into that native seed space and reserves llama.cpp's default/random sentinel.
+
+Automatically randomized API requests keep a bounded recent history of native sampler seeds so a newly generated random request is redrawn if it would immediately recycle a recently used effective seed. Explicit client seeds remain reproducible and are never rewritten for uniqueness.
+
+API responses include diagnostic headers:
+
+```text
+X-Local-LLM-Request-Id
+X-Local-LLM-Seed
+X-Local-LLM-Sampler-Seed
+X-Local-LLM-Seed-Mode
+```
+
+Seed modes are `explicit`, `random-omitted`, `random-null`, or `random-sentinel`.
+
+The server log also records the requested runtime seed, the seed read back from the live Llama object after `set_seed()`, sampler provenance, and hashes for repeated-output diagnosis. Different valid seeds can still legitimately converge to identical text when the token distribution is strongly peaked; identical text alone is not evidence of a reused seed.
+
+## Streaming
+
+Both chat completions and text completions support SSE streaming when streaming is enabled in the API tab.
+
+Chat streaming forwards visible text through `delta.content` and reasoning through `delta.reasoning_content`. A final usage object is included when the request asks for `stream_options.include_usage`.
+
+## Example request
+
+```bash
+curl http://127.0.0.1:8188/local-llm/v1/chat/completions \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "local-llm",
+    "messages": [{"role": "user", "content": "Explain KV cache quantization briefly."}],
+    "temperature": 0.8,
+    "top_p": 0.95,
+    "seed": -1,
+    "stream": false
+  }'
+```
+
+If the API key is blank, the server permits requests once the external API itself is enabled. Use an API key whenever the ComfyUI server is reachable by anything beyond a trusted local environment.
+
+# In-process bridge for sibling custom nodes
+
+On package import, a stable process-local module is registered as:
+
+```python
+import comfyui_local_gguf_llm_bridge as local_llm
+```
+
+It exposes:
+
+- `SERVICE`
+- `SAMPLER_PRESET_FIELDS`
+- `API_VERSION` (currently 2)
+- `PACKAGE_VERSION`
+- `VRAM_POLICY_VERSION`
+- `VRAM_COORDINATION_MODE`
+
+`SERVICE.api` provides a small integration surface for sibling custom-node packages, including status/settings access, text/message generation, and an explicit GPU handoff. This avoids depending on this package's hyphenated filesystem folder name or importing private implementation helpers.
+
+# Tests
+
+The package includes a dependency-light regression suite covering Prompt Cycle behavior, workflow isolation, input-slot stability, OpenAI request precedence and seed plumbing, repeated-output diagnostics, and source contracts.
+
+Run it from the custom-node directory:
+
+```bash
+python tests/run_all.py
+```
+
+When Node.js is available, the runner also executes the frontend tests and JavaScript syntax checks.
+
+The v0.18.99 package currently runs:
+
+- **77 Python tests**
+- **26 JavaScript tests**
+- Python compilation checks
+- JavaScript syntax checks for all shipped frontend modules
+
+Live CUDA/model performance still depends on the user's ComfyUI, driver, GPU, GGUF, and `llama-cpp-python` build and therefore cannot be fully represented by the dependency-free unit suite.
+
+# Troubleshooting
+
+## No models appear
+
+Confirm the GGUF is below:
+
+```text
+ComfyUI/models/LLM/
+```
+
+Then restart ComfyUI. The model list is recursive.
+
+## Vision input is rejected or ignored
+
+Check all three conditions:
+
+1. the GGUF family is actually multimodal,
+2. a compatible mmproj/projector is selected,
+3. the installed `llama-cpp-python` build contains a compatible chat handler / MTMD path.
+
+## ComfyUI needs VRAM occupied by the LLM
+
+Use **Auto Yield to ComfyUI**. The service can close the native context when ComfyUI needs the memory and warm-reload it on the next LLM request. **Suspend** can also yield manually.
+
+## Context shown by an external client does not match the server
+
+The actual llama.cpp context is the **Context Size configured in Local LLM Server / Local LLM Settings**, not whatever an external UI assumes. Query `/local-llm/v1/models` or inspect the server panel to see the configured value.
+
+## An API reroll produces the same response
+
+Check the `OpenAI API request` and `OpenAI sampling resolved` log lines. Compare:
+
+- request ID
+- seed mode
+- request seed
+- sampler seed
+- applied sampler seed
+- temperature / top-p / top-k and their `[api]` vs `[server/preset]` provenance
+- response and reasoning hashes
+
+A temperature of 0 or top-k of 1 makes the output effectively seed-independent. Distinct seeds can also produce the same output when the model distribution strongly favors the same tokens.
+
+## Prompt Enhancer runs again when nothing changed
+
+With **Enhance with Workflow** disabled, the Prompt Enhancer seed is excluded from normal workflow variability and its Control After Generate state does not advance. Fixed mode is cacheable. Increment/Decrement/Shuffle/Random deliberately re-execute the Prompt Enhancer because each queued API prompt can carry a different serialized X/Y selection. Downstream nodes may still reuse cached work when a cycled prompt eventually returns to identical output and all of their effective inputs are unchanged.
+
+# Updating
+
+For manual updates:
+
+1. Stop ComfyUI.
+2. **Delete the existing `ComfyUI-Local-GGUF-LLM` directory completely.** Do not merge/extract a new release over an older folder; obsolete frontend or helper files can otherwise survive and make debugging unreliable.
+3. Extract/copy the new complete `ComfyUI-Local-GGUF-LLM` directory into `custom_nodes`.
+4. Start ComfyUI.
+5. Hard-refresh the browser (`Ctrl+F5`) if the old frontend remains cached.
+
+The package removes obsolete versioned frontend files from older releases at import time. It also removes the legacy bundled H3 Shot Generator backend/frontend left by old combined builds.
+
+# v0.18.100-alpha release notes
+
+CPU-only inference is now a first-class runtime mode. **Compute Mode = CPU Only** is a hard boundary: model layers are forced to `n_gpu_layers=0`, KV/KQV offload stays on CPU, operator offload is disabled, and multimodal projector execution is kept on CPU. CPU-only model loads also skip CUDA synchronization and VRAM verification snapshots. `Auto` selects CPU-only behavior when ComfyUI has no visible CUDA/ROCm accelerator or the installed llama.cpp binding explicitly reports that GPU offload is unavailable.
+
+CPU Auto tuning is topology and affinity aware. `CPU Threads = 0` resolves to the physical-core count for token generation, while `CPU Batch Threads = 0` resolves to the logical CPUs available to the ComfyUI process. A fully exposed 64-core/128-thread Threadripper 3990X therefore resolves to 64 generation threads and 128 prompt-processing threads. Explicit thread values are preserved.
+
+NUMA is now passed directly to supported llama.cpp bindings. **NUMA = Auto** enables `Distribute` only for CPU-only inference when more than one NUMA node is exposed; otherwise it remains disabled. Explicit `Disabled`, `Distribute`, `Isolate`, and `Numactl` modes are available. The server UI exposes Compute Mode, CPU generation/batch threads, NUMA mode, and operator offload, reports the resolved CPU profile, and provides a **Use CPU-only Auto** button for a one-step high-core-count baseline. The new **CPU Only (Auto / High Core)** memory preset provides the same baseline to legacy/internal memory-preset consumers.
+
+The service-side estimator and speculative-decoding resolver now treat `Auto` as CPU-only on no-CUDA hosts before model load. Native MTP therefore does not advertise itself as active when its full-GPU requirement cannot be met. The Local LLM Server frontend moved to `local_llm_server_v102.js` to force a cache-distinct update.
+
+# v0.18.99-alpha release notes
+
+Prompt Cycle now uses ComfyUI's actual per-item queue lifecycle instead of custom `serializeValue()` overrides or an execution-time backend cursor. The existing Seed **Control After Generate** widget is the lifecycle carrier because ComfyUI creates it as a real node widget and calls widget `beforeQueued` before `graphToPrompt()` and `afterQueued` after each queued item is submitted.
+
+For every non-Fixed Run × N item, `beforeQueued` plans exactly one cycle entry and writes the selected `prompt_history_index`, matching `enhanced_prompt`, and a unique `prompt_cycle_queue_seq` into ordinary schema widgets **before** ComfyUI builds that API prompt. `afterQueued` commits exactly one next-entry advance. JavaScript does not use completion events to advance queue-prepared cycle items, so a fast Prompt Enhancer execution cannot move X/Y while later batch items are still being serialized.
+
+Workflow serialization is also read-only with respect to the stored prompt array while a cycle item is being prepared. This closes the remaining path where `graph.serialize()`/`onSerialize` could reconcile the visible editor while a Run × N item was being frozen. The backend simply consumes the X/Y already present in that queued graph; it does not reinterpret the item through shared cursor state.
+
+`prompt_cycle_queue_seq` is a monotonic cache discriminator only; it never selects the prompt. Positive queue values produce distinct `IS_CHANGED` signatures, while legacy/headless clients retain the non-cacheable fallback. The frontend moved to `prompt_enhancer_dom_v0651.js`, and the node version is `0.6.51-alpha`.
+
+# v0.18.97-alpha release notes
+
+Prompt Cycle was rebuilt around one authority: the Python backend state machine. `Increment`, `Decrement`, `Shuffle`, and `Random` no longer depend on ComfyUI widget `beforeQueued` / `afterQueued` callbacks, no longer carry a frontend cycle cursor, and no longer use a queue-prepared snapshot path. Every non-fixed execution is intentionally non-cacheable and consumes exactly one backend cycle entry.
+
+The legacy `prompt_cycle_queue_seq` input remains only for workflow/schema compatibility and is forced to `0` by the v0.6.48 frontend. Positive values from older cached frontends are ignored by the backend. Runtime scope, state id, cycle revision, and shuffle state remain API-only values so each workflow/tab has an isolated cursor without persisting runtime ownership into workflow/image metadata.
+
+The visible X/Y selector is updated from the backend execution result. A single queued run should therefore visibly move after that Prompt Enhancer execution completes; Run × N advances once per executed item and the UI follows those execution results.
+
+The Prompt Enhancer frontend moved to `prompt_enhancer_dom_v0649.js` to force a cache-distinct load.
+
+# v0.18.95-alpha release notes
+
+Prompt Cycle queueing was rebuilt rather than patched on top of the 0.18.90-0.18.93 implementations. For normal browser queueing, there is now one owner of cycle progression: the hidden `prompt_cycle_queue_seq` widget. Its `beforeQueued` callback freezes the current X/Y selection into that queue item and serializes a unique monotonic nonce. Its `afterQueued` callback is the only place that advances the live selector to the entry for the next item.
+
+The old frontend private cursor and frontend-to-backend cycle synchronization path were removed from normal queue operation. The backend `PromptCycleStore` remains only as a compatibility fallback for legacy/headless submissions that arrive without the queue nonce. Queue-prepared submissions always trust the X/Y index serialized into that specific item, so backend state cannot advance them a second time.
+
+Each queue-prepared non-Fixed item now has a distinct `IS_CHANGED` signature using its queue nonce. That prevents several Run x N items from collapsing into one cached Prompt Enhancer execution merely because the surrounding workflow snapshot is otherwise identical. A failed queue submission does not consume a cycle entry because advancement happens only after acceptance.
+
+Shuffle was also rebuilt as a deck. The selected entry is consumed once, every other entry is emitted once before a new deck begins, and a deck-boundary repeat is avoided. The runtime journal now remembers whether Shuffle has started even when the remaining deck is momentarily empty, so workflow-tab remounts do not accidentally restart the first deck.
+
+The Prompt Enhancer frontend was moved to `prompt_enhancer_dom_v0647.js` to force a cache-distinct load. The queue lifecycle carrier is now the required `Prompt Cycle` widget rather than the hidden queue nonce widget. The dependency-free suite is run as part of release validation.
+
+# v0.18.93-alpha release notes
+
+This release corrects the Prompt Cycle regressions in 0.18.90-0.18.92. Current ComfyUI queues each batch item with one `beforeQueued -> graphToPrompt -> afterQueued` lifecycle. Prompt Cycle now prepares exactly one immutable cycle selection in `beforeQueued`, serializes that selection into the queued API prompt, and commits the next private cursor only in `afterQueued` after the item is accepted. Cycling no longer advances from `serializeValue()`, so extra prompt serialization cannot consume a second cycle step.
+
+The lifecycle hook is attached to the **current** `prompt_cycle` widget rather than being marked only on the node. If Nodes 2.0 replaces that widget object after extension initialization, the `promptQueueing` event repairs the hook before ComfyUI starts the per-item queue loop.
+
+The workflow-enhancement toggle now uses explicit boolean normalization throughout the queue path. Values such as the string `"false"` are treated as false instead of JavaScript truthy strings; this was the reason the callback-based 0.18.90/0.18.91 design could bypass cycling completely on affected frontends.
+
+When **Enhance with Workflow** is disabled, the Prompt Enhancer LLM seed still serializes as a stable zero and runtime-only cycle bookkeeping is omitted from the API prompt where possible, preserving ComfyUI cache reuse when the effective enhanced prompt and all downstream inputs are unchanged.

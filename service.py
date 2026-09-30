@@ -14,6 +14,7 @@ import logging
 import os
 import secrets
 import statistics
+import tempfile
 import threading
 import time
 import uuid
@@ -23,6 +24,8 @@ from pathlib import Path
 from typing import Any
 
 import folder_paths
+
+from .paths import PRESET_ROOT_DIR
 
 from .nodes import (
     LocalGGUFLLM,
@@ -51,7 +54,18 @@ from .nodes import (
 )
 from .gguf_meta import detect_family, recommended_model_preset, available_model_presets
 from .presets import MEMORY_PRESETS, MODEL_PRESETS, capabilities_for_family, public_presets
-from .version import PACKAGE_VERSION, BRIDGE_API_VERSION, VRAM_POLICY_VERSION, VRAM_COORDINATION_MODE
+from .version import PACKAGE_VERSION, BRIDGE_API_VERSION, VRAM_POLICY_VERSION
+from .seed_utils import RecentSamplerSeedAllocator, parse_openai_seed
+from .generation_controls import REQUEST_GENERATION_OVERRIDE_FIELDS
+from .openai_controls import (
+    OpenAIRequestSequence,
+    effective_openai_sampling,
+    extract_openai_generation_overrides,
+    format_openai_sampling,
+    openai_control_sources,
+)
+from .api_diagnostics import OpenAIRepeatTracker, openai_request_signature, stable_text_hash
+from .cpu_tuning import cpu_runtime_profile
 from .vram_coordination import GPUMemoryLeaseManager, NATIVE_LOAD_STABILITY_GUARD_BYTES
 
 log = logging.getLogger(__name__)
@@ -74,7 +88,7 @@ LOAD_FIELDS = {
     "ngram_pred_tokens", "ngram_size", "ngram_mode", "ngram_min_hits",
     "ngram_max_entries_per_key", "ngram_sync_check_tokens", "mtp_draft_tokens", "mtp_p_min",
     "split_mode", "main_gpu", "tensor_split",
-    "threads", "threads_batch", "op_offload", "swa_full", "rope_freq_base", "rope_freq_scale",
+    "threads", "threads_batch", "compute_mode", "numa_mode", "op_offload", "swa_full", "rope_freq_base", "rope_freq_scale",
     "yarn_ext_factor", "yarn_attn_factor", "yarn_beta_fast", "yarn_beta_slow", "yarn_orig_ctx",
     "verbose", "vram_policy",
 }
@@ -83,6 +97,14 @@ SERVER_ONLY_FIELDS = {
     "startup_mode", "external_api_enabled", "api_key", "allow_buffered_streaming",
     "log_prompt_content", "log_response_content", "show_status_indicator",
 }
+
+# Automatically-random OpenAI requests are de-duplicated by the actual 32-bit
+# llama.cpp sampler seed, not just by their 64-bit request seed. This bounded
+# process-local history eliminates practical random-seed collisions on long-lived
+# servers while explicit client seeds remain untouched/reproducible.
+_OPENAI_RANDOM_SEEDS = RecentSamplerSeedAllocator(recent_limit=65536)
+_OPENAI_REQUEST_SEQUENCE = OpenAIRequestSequence()
+_OPENAI_REPEAT_TRACKER = OpenAIRepeatTracker(limit=256)
 
 
 # Common context sizes exposed by the global server UI.  The list is filtered
@@ -102,7 +124,7 @@ CONTEXT_SIZE_STEPS = (
 # and user prompts can be mixed independently.  The files live beside the GGUF
 # models rather than inside workflows:
 #
-#   models/llm/local_LLM_presets/
+#   models/LLM/local_LLM_presets/
 #       sampler/         -> JSON generation settings
 #       system_prompts/  -> plain UTF-8 text
 #       prompts/         -> plain UTF-8 text
@@ -114,7 +136,6 @@ SAMPLER_PRESET_FIELDS = (
 )
 SAMPLER_PRESET_SCHEMA = "local_llm_sampler_preset"
 SAMPLER_PRESET_VERSION = 1
-PRESET_ROOT_DIR = Path(folder_paths.models_dir) / "LLM" / "local_LLM_presets"
 SAMPLER_PRESET_DIR = PRESET_ROOT_DIR / "sampler"
 SYSTEM_PROMPT_PRESET_DIR = PRESET_ROOT_DIR / "system_prompts"
 PROMPT_PRESET_DIR = PRESET_ROOT_DIR / "prompts"
@@ -127,6 +148,7 @@ MEMORY_PRESET_FIELDS = (
     "main_gpu", "split_mode", "tensor_split", "speculative_mode",
     "ngram_pred_tokens", "ngram_size", "ngram_mode", "ngram_min_hits",
     "ngram_max_entries_per_key", "ngram_sync_check_tokens", "mtp_draft_tokens", "mtp_p_min",
+    "threads", "threads_batch", "compute_mode", "numa_mode", "op_offload",
 )
 MEMORY_PRESET_SCHEMA = "local_llm_memory_preset"
 MEMORY_PRESET_VERSION = 1
@@ -143,6 +165,7 @@ COMPLETE_SETTINGS_PRESET_FIELDS = (
     "vision_max_images", "vision_max_frames", "vision_max_edge",
     "context_size", "kv_cache_k", "kv_cache_v", "kv_cache_location", "gpu_layers",
     "flash_attention", "prompt_batch_size", "memory_batch_size", "use_mmap", "use_mlock",
+    "threads", "threads_batch", "compute_mode", "numa_mode", "op_offload",
     "prompt_cache_mode", "speculative_mode", "ngram_pred_tokens", "ngram_size",
     "ngram_mode", "ngram_min_hits", "ngram_max_entries_per_key",
     "ngram_sync_check_tokens", "mtp_draft_tokens", "mtp_p_min",
@@ -157,10 +180,27 @@ _BUILTIN_MEMORY_PRESET_NAMES = frozenset(str(name).lower() for name in MEMORY_PR
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """Atomically replace a small UTF-8 settings/preset file."""
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(text, encoding="utf-8")
-    temporary.replace(path)
+    """Atomically replace a small UTF-8 settings/preset file without temp-name collisions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            handle.write(text)
+            temporary = Path(handle.name)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -348,7 +388,7 @@ def _validate_memory_preset_settings(settings: dict[str, Any]) -> dict[str, Any]
         if key not in settings:
             continue
         value = settings[key]
-        if key in {"context_size", "gpu_layers", "prompt_batch_size", "memory_batch_size",
+        if key in {"context_size", "gpu_layers", "prompt_batch_size", "memory_batch_size", "threads", "threads_batch",
                    "ngram_pred_tokens", "ngram_size", "ngram_min_hits",
                    "ngram_max_entries_per_key", "ngram_sync_check_tokens", "mtp_draft_tokens"}:
             value = int(value)
@@ -403,7 +443,7 @@ def _validate_complete_settings(settings: dict[str, Any]) -> dict[str, Any]:
         raise TypeError("complete settings preset must be an object")
     int_fields = {
         "top_k", "max_tokens", "vision_max_images", "vision_max_frames", "vision_max_edge",
-        "context_size", "gpu_layers", "prompt_batch_size", "memory_batch_size",
+        "context_size", "gpu_layers", "prompt_batch_size", "memory_batch_size", "threads", "threads_batch",
         "ngram_pred_tokens", "ngram_size", "ngram_min_hits",
         "ngram_max_entries_per_key", "ngram_sync_check_tokens", "mtp_draft_tokens",
     }
@@ -595,6 +635,24 @@ def _model_capabilities_with_runtime(metadata, family):
     return caps, runtime
 
 
+def _service_cpu_only(cfg):
+    """Best-effort service-side view of whether the current config is CPU-only.
+
+    Runtime loading does the authoritative llama.cpp capability check in nodes.py.
+    The service uses this lighter helper for pre-load UI/status/estimator behavior.
+    """
+    mode = str((cfg or {}).get("compute_mode") or "Auto")
+    if mode == "CPU Only":
+        return True
+    if mode == "GPU / Mixed":
+        return False
+    try:
+        import torch
+        return not bool(torch.cuda.is_available())
+    except Exception:
+        return True
+
+
 def _resolve_service_speculative(cfg, metadata, runtime=None):
     """Resolve UI/estimator speculative mode with current native-MTP constraints."""
     support = runtime or _speculative_runtime_support()
@@ -604,6 +662,8 @@ def _resolve_service_speculative(cfg, metadata, runtime=None):
         gpu_layers = int(cfg.get("gpu_layers", -1))
     except Exception:
         gpu_layers = -1
+    if _service_cpu_only(cfg):
+        gpu_layers = 0
     if spec.get("effective") == "MTP" and gpu_layers >= 0:
         if requested == "Auto" and support.get("ngram"):
             spec["effective"] = "N-gram"
@@ -1172,7 +1232,7 @@ class LocalLLMServiceManager:
         args = self._call_args()
         model = args.get("model")
         if not model or model == "No GGUF models found":
-            raise FileNotFoundError("No GGUF model is configured. Put a GGUF in ComfyUI/models/llm and select it in Local LLM Server.")
+            raise FileNotFoundError("No GGUF model is configured. Put a GGUF in ComfyUI/models/LLM and select it in Local LLM Server.")
         # One-token warmup deliberately exercises the exact chat handler/template
         # path that real callers will use. This guarantees Start means actually
         # loaded/ready rather than only configured.
@@ -1575,6 +1635,15 @@ class LocalLLMServiceManager:
                 args = self._call_args(cfg)
                 args["messages_override"] = messages
                 args.update(overrides)
+                # Explicit request-local generation controls must survive the
+                # model-preset resolution inside LocalGGUFLLM._generate_impl().
+                # Without this marker, Auto/model presets could silently replace
+                # an OpenAI client's temperature/top-p/etc. after args.update().
+                args["request_generation_overrides"] = {
+                    key: copy.deepcopy(value)
+                    for key, value in overrides.items()
+                    if key in REQUEST_GENERATION_OVERRIDE_FIELDS
+                }
                 cfg_model = str(cfg.get("model") or "")
                 cfg_model_md = _metadata_for(cfg_model) if cfg_model and cfg_model != "No GGUF models found" else {}
                 family = detect_family(cfg_model_md or {}, cfg_model) if cfg_model else "unknown"
@@ -1932,6 +2001,12 @@ class LocalLLMServiceManager:
             gpu_layers = int(cfg.get("gpu_layers", -1))
         except Exception:
             gpu_layers = -1
+        compute_mode = str(cfg.get("compute_mode") or "Auto")
+        estimator_cpu_only = _service_cpu_only(cfg)
+        kv_location_for_estimate = str(cfg.get("kv_cache_location") or "GPU")
+        if estimator_cpu_only:
+            gpu_layers = 0
+            kv_location_for_estimate = "CPU"
         try:
             main_gpu_index = _gpu_index(cfg.get("main_gpu", 0))
         except Exception:
@@ -1947,18 +2022,19 @@ class LocalLLMServiceManager:
             n_ctx=int(cfg.get("context_size") or 0),
             kv_k=str(cfg.get("kv_cache_k") or "f16"),
             kv_v=str(cfg.get("kv_cache_v") or "f16"),
-            kv_location=str(cfg.get("kv_cache_location") or "GPU"),
+            kv_location=kv_location_for_estimate,
             n_batch=int(cfg.get("prompt_batch_size") or 2048),
             n_ubatch=int(cfg.get("memory_batch_size") or 512),
             flash_attention=bool(cfg.get("flash_attention")),
             speculative_mode=str(speculative.get("effective") or "Off"),
+            vision_offload=not estimator_cpu_only,
         )
 
         raw_free = None
         total_vram = None
         torch_allocated = None
         torch_reserved = None
-        if gpu_layers != 0:
+        if gpu_layers != 0 and not estimator_cpu_only:
             try:
                 import torch
                 if torch.cuda.is_available() and main_gpu_index < int(torch.cuda.device_count()):
@@ -3214,6 +3290,9 @@ class LocalLLMServiceManager:
             "prompt_cache_mode": cfg.get("prompt_cache_mode", "Auto"),
             "model_preset": cfg.get("model_preset"),
             "memory_preset": cfg.get("memory_preset"),
+            "compute_mode": cfg.get("compute_mode", "Auto"),
+            "numa_mode": cfg.get("numa_mode", "Auto"),
+            "cpu_runtime": copy.deepcopy(info.get("cpu_runtime") or cpu_runtime_profile(cfg.get("threads", 0), cfg.get("threads_batch", 0), cfg.get("numa_mode", "Auto"), cpu_only=_service_cpu_only(cfg))),
             "vram_policy": cfg.get("vram_policy", "Auto Yield to ComfyUI"),
             "context_size": cfg.get("context_size"),
             "kv_cache_k": cfg.get("kv_cache_k"),
@@ -3277,6 +3356,7 @@ def catalog():
         "models": models,
         "vision": vision,
         "gpus": _gpu_choices(),
+        "cpu_profile": cpu_runtime_profile(0, 0, "Auto", cpu_only=True),
         "model_presets": ["Auto (Detected)", "Custom"] + list(MODEL_PRESETS.keys()),
         "memory_presets": ["Custom"] + list(MEMORY_PRESETS.keys()) + sorted(user_memory, key=str.lower),
         "memory_preset_files": {name: item.get("path") for name, item in user_memory.items()},
@@ -3359,6 +3439,7 @@ class LocalLLMSettings:
         "vision_max_images", "vision_max_frames", "vision_max_edge",
         "context_size", "kv_cache_k", "kv_cache_v", "kv_cache_location", "gpu_layers",
         "flash_attention", "prompt_batch_size", "memory_batch_size", "use_mmap", "use_mlock",
+        "threads", "threads_batch", "compute_mode", "numa_mode", "op_offload",
         "prompt_cache_mode", "speculative_mode", "ngram_pred_tokens", "ngram_size",
         "ngram_mode", "ngram_min_hits", "ngram_max_entries_per_key",
         "ngram_sync_check_tokens", "mtp_draft_tokens", "mtp_p_min",
@@ -3563,8 +3644,148 @@ try:
         "X-Accel-Buffering": "no",
     }
 
-    def _sse_response():
-        return web.StreamResponse(status=200, headers=dict(_SSE_HEADERS))
+    def _sse_response(extra_headers=None):
+        headers = dict(_SSE_HEADERS)
+        if isinstance(extra_headers, dict):
+            headers.update({str(k): str(v) for k, v in extra_headers.items()})
+        return web.StreamResponse(status=200, headers=headers)
+
+    def _openai_seed_mode(body, randomized):
+        if not randomized:
+            return "explicit"
+        if "seed" not in body:
+            return "random-omitted"
+        if body.get("seed") is None:
+            return "random-null"
+        return "random-sentinel"
+
+    def _openai_seed_headers(request_seed, sampler_seed, mode, request_id=None):
+        headers = {
+            "X-Local-LLM-Seed": str(int(request_seed)),
+            "X-Local-LLM-Sampler-Seed": str(int(sampler_seed)),
+            "X-Local-LLM-Seed-Mode": str(mode),
+        }
+        if request_id is not None:
+            headers["X-Local-LLM-Request-Id"] = str(int(request_id))
+        return headers
+
+    def _log_openai_sampling_result(
+        result, request_seed, expected_sampler_seed, mode, *, request_id=None,
+        control_sources=None, request_signature=None
+    ):
+        """Log sampler provenance plus repeated-output evidence.
+
+        ``expected_sampler_seed`` is the uint32 value allocated at the HTTP
+        boundary. ``llama_seed_applied`` is read back from the live Llama object
+        after ``set_seed`` and is therefore a stronger signal than merely
+        recomputing the mapping from the 64-bit request seed.
+        """
+        info = (result or {}).get("info") or {}
+        controls = info.get("independent_output_controls") or {}
+        snapshot = effective_openai_sampling(info, control_sources)
+        requested_runtime_seed = controls.get("llama_seed_requested", controls.get("llama_seed"))
+        applied_sampler_seed = controls.get("llama_seed_applied")
+        seed_setter_succeeded = controls.get("seed_setter_succeeded")
+        seed_kwarg_forwarded = controls.get("seed_kwarg_forwarded")
+        chat_handler_type = controls.get("chat_handler_type")
+        llama_cpp_version = info.get("llama_cpp_version")
+        prefix = f"request=#{int(request_id)}" if request_id is not None else "request=#?"
+        fields = [
+            prefix,
+            f"seed={int(request_seed)}",
+            f"seed_mode={mode}",
+            f"sampler_seed={int(expected_sampler_seed)}",
+        ]
+        if requested_runtime_seed is not None:
+            fields.append(f"runtime_requested_seed={requested_runtime_seed}")
+        if applied_sampler_seed is not None:
+            try:
+                applied_sampler_seed = int(applied_sampler_seed) & 0xFFFFFFFF
+                fields.append(f"applied_sampler_seed={applied_sampler_seed}")
+                if applied_sampler_seed != int(expected_sampler_seed):
+                    SERVICE._log(
+                        "OpenAI sampler-seed mismatch: HTTP allocator selected "
+                        f"{int(expected_sampler_seed)} but the live Llama object held {applied_sampler_seed} before sampling.",
+                        "warning",
+                    )
+            except (TypeError, ValueError, OverflowError):
+                fields.append(f"applied_sampler_seed={applied_sampler_seed!r}")
+                applied_sampler_seed = None
+        fields.append(f"seed_setter={'ok' if seed_setter_succeeded else 'failed'}")
+        fields.append(f"seed_kwarg={'yes' if seed_kwarg_forwarded else 'no'}")
+        if chat_handler_type:
+            fields.append(f"chat_handler={chat_handler_type}")
+        fields.extend(format_openai_sampling(snapshot))
+        if llama_cpp_version:
+            fields.append(f"llama_cpp_python={llama_cpp_version}")
+
+        response_text = str((result or {}).get("response") or "")
+        thinking_text = str((result or {}).get("thinking") or "")
+        response_hash = stable_text_hash(response_text)
+        thinking_hash = stable_text_hash(thinking_text) if thinking_text else ""
+        fields.append(f"response_hash={response_hash}")
+        fields.append(f"response_chars={len(response_text)}")
+        if thinking_text:
+            fields.append(f"thinking_hash={thinking_hash}")
+            fields.append(f"thinking_chars={len(thinking_text)}")
+
+        def _snapshot_value(name):
+            item = snapshot.get(name) or {}
+            return item.get("value")
+
+        effective_temperature = _snapshot_value("temperature")
+        effective_top_p = _snapshot_value("top_p")
+        effective_top_k = _snapshot_value("top_k")
+        try:
+            if effective_temperature is not None and float(effective_temperature) <= 0.0:
+                SERVICE._log(
+                    "OpenAI request resolved to greedy sampling (effective temperature <= 0); "
+                    "changing the seed cannot change the sampled token path.",
+                    "warning",
+                )
+        except (TypeError, ValueError, OverflowError):
+            pass
+        try:
+            if effective_top_k is not None and int(effective_top_k) == 1:
+                SERVICE._log(
+                    "OpenAI request resolved to top_k=1; only the highest-ranked candidate survives top-k, "
+                    "so changing the seed normally cannot change the sampled token path.",
+                    "warning",
+                )
+        except (TypeError, ValueError, OverflowError):
+            pass
+        try:
+            if effective_top_p is not None and abs(float(effective_top_p) - 1.0) <= 1e-12:
+                SERVICE._log(
+                    "OpenAI request resolved to top_p=1.0, so nucleus cutoff is effectively disabled. "
+                    "If investigating repeated outputs, compare with top_p below 1.0 while checking the logged sampler seeds.",
+                    "info",
+                )
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+        SERVICE._log("OpenAI sampling resolved • " + " • ".join(fields))
+
+        if request_signature and request_id is not None:
+            observed_seed = applied_sampler_seed if applied_sampler_seed is not None else int(expected_sampler_seed)
+            repeat = _OPENAI_REPEAT_TRACKER.observe(
+                request_signature=request_signature,
+                request_id=int(request_id),
+                sampler_seed=observed_seed,
+                response=response_text,
+                thinking=thinking_text,
+            )
+            previous = repeat.get("matched_previous")
+            if previous:
+                reasoning_note = "same" if repeat.get("thinking_same_as_previous") else "different"
+                SERVICE._log(
+                    "OpenAI identical visible response across distinct sampler seeds: "
+                    f"request #{int(request_id)} seed={observed_seed} matched request "
+                    f"#{previous.get('request_id')} seed={previous.get('sampler_seed')} • "
+                    f"response_hash={response_hash} • reasoning={reasoning_note}. "
+                    "This is same-output-under-different-seeds, not a seed collision.",
+                    "warning",
+                )
 
     def _token_queue_callback(loop, token_queue):
         def on_token(event):
@@ -3854,17 +4075,20 @@ try:
             item["n_ctx_train"] = int(native_ctx)
         return web.json_response({"object": "list", "data": [item]})
 
+    def _openai_request_seed(body):
+        """Resolve one request-local OpenAI seed plus its actual llama sampler seed."""
+        raw = body.get("seed") if "seed" in body else None
+        return parse_openai_seed(raw, _OPENAI_RANDOM_SEEDS)
+
     def _request_overrides(body):
-        mapping = {
-            "temperature": "temperature", "top_p": "top_p", "top_k": "top_k", "min_p": "min_p",
-            "repeat_penalty": "repeat_penalty", "presence_penalty": "presence_penalty",
-            "frequency_penalty": "frequency_penalty", "max_tokens": "max_tokens", "seed": "seed",
-            "reasoning_effort": "reasoning_effort",
-        }
-        out = {}
-        for src, dst in mapping.items():
-            if src in body and body[src] is not None:
-                out[dst] = body[src]
+        out = extract_openai_generation_overrides(body)
+        # Seed is deliberately resolved for every API request instead of falling
+        # through to the server's persistent seed=0 default. Omitted/null/-1 are
+        # fresh random requests; an explicit non-negative integer is reproducible.
+        request_seed, sampler_seed, randomized = _openai_request_seed(body)
+        out["seed"] = request_seed
+        out["_openai_sampler_seed"] = sampler_seed
+        out["_openai_seed_random"] = randomized
         stop = body.get("stop")
         if isinstance(stop, str):
             # Preserve an OpenAI stop string as one exact sequence.
@@ -3914,8 +4138,23 @@ try:
             requested_model = str(body.get("model") or SERVICE.get_config().get("model") or "local-llm")
             client = request.headers.get("X-Client-Name") or request.headers.get("User-Agent") or "OpenAI-compatible client"
             overrides = _request_overrides(body)
+            control_sources = openai_control_sources(body)
+            request_id = _OPENAI_REQUEST_SEQUENCE.next()
+            seed_was_random = bool(overrides.pop("_openai_seed_random", False))
+            sampler_seed = int(overrides.pop("_openai_sampler_seed"))
+            request_seed = int(overrides.get("seed"))
+            # Carry the exact uint32 seed chosen/logged at the HTTP boundary all
+            # the way into the native generation call; do not rely on a second
+            # 64->32 mapping later in the stack.
+            overrides["native_sampler_seed_override"] = sampler_seed
+            request_signature = openai_request_signature(body)
+            seed_mode = _openai_seed_mode(body, seed_was_random)
+            seed_headers = _openai_seed_headers(request_seed, sampler_seed, seed_mode, request_id)
+            api_controls = ",".join(sorted(name for name, source in control_sources.items() if source == "api")) or "none"
             SERVICE._log(
-                f"OpenAI API {request.method} {request.path} • stream={bool(body.get('stream'))} • client={client}"
+                f"OpenAI API request #{request_id} • {request.method} {request.path} • "
+                f"stream={bool(body.get('stream'))} • client={client} • seed_mode={seed_mode} • "
+                f"seed={request_seed} • sampler_seed={sampler_seed} • api_controls={api_controls}"
             )
 
             if body.get("stream"):
@@ -3928,7 +4167,7 @@ try:
                 # buffered response after generation completes.
                 rid = "chatcmpl-" + uuid.uuid4().hex
                 created = int(time.time())
-                stream = _sse_response()
+                stream = _sse_response(seed_headers)
                 await stream.prepare(request)
 
                 async def write_chunk(delta, finish_reason=None, usage=None):
@@ -4009,6 +4248,10 @@ try:
                         await _finish_sse(stream)
                     SERVICE._log(f"OpenAI SSE interrupted by Stop for {client}")
                     return stream
+                _log_openai_sampling_result(
+                    result, request_seed, sampler_seed, seed_mode,
+                    request_id=request_id, control_sources=control_sources, request_signature=request_signature,
+                )
                 payload = _openai_response(result, requested_model)
                 final_content = str(payload["choices"][0]["message"].get("content") or "")
                 final_reasoning = str(payload["choices"][0]["message"].get("reasoning_content") or "")
@@ -4050,7 +4293,11 @@ try:
                 client=client,
                 overrides=overrides,
             )
-            return web.json_response(_openai_response(result, requested_model))
+            _log_openai_sampling_result(
+                result, request_seed, sampler_seed, seed_mode,
+                request_id=request_id, control_sources=control_sources, request_signature=request_signature,
+            )
+            return web.json_response(_openai_response(result, requested_model), headers=seed_headers)
         except LocalLLMInterrupted as e:
             return _json_error(e, 409)
         except Exception as e:
@@ -4069,8 +4316,23 @@ try:
             requested_model = str(body.get("model") or SERVICE.get_config().get("model") or "local-llm")
             client = request.headers.get("X-Client-Name") or request.headers.get("User-Agent") or "completion client"
             overrides = _request_overrides(body)
+            control_sources = openai_control_sources(body)
+            request_id = _OPENAI_REQUEST_SEQUENCE.next()
+            seed_was_random = bool(overrides.pop("_openai_seed_random", False))
+            sampler_seed = int(overrides.pop("_openai_sampler_seed"))
+            request_seed = int(overrides.get("seed"))
+            # Carry the exact uint32 seed chosen/logged at the HTTP boundary all
+            # the way into the native generation call; do not rely on a second
+            # 64->32 mapping later in the stack.
+            overrides["native_sampler_seed_override"] = sampler_seed
+            request_signature = openai_request_signature(body)
+            seed_mode = _openai_seed_mode(body, seed_was_random)
+            seed_headers = _openai_seed_headers(request_seed, sampler_seed, seed_mode, request_id)
+            api_controls = ",".join(sorted(name for name, source in control_sources.items() if source == "api")) or "none"
             SERVICE._log(
-                f"OpenAI API {request.method} {request.path} • stream={bool(body.get('stream'))} • client={client}"
+                f"OpenAI API request #{request_id} • {request.method} {request.path} • "
+                f"stream={bool(body.get('stream'))} • client={client} • seed_mode={seed_mode} • "
+                f"seed={request_seed} • sampler_seed={sampler_seed} • api_controls={api_controls}"
             )
 
             if body.get("stream"):
@@ -4079,7 +4341,7 @@ try:
 
                 rid = "cmpl-" + uuid.uuid4().hex
                 created = int(time.time())
-                stream = _sse_response()
+                stream = _sse_response(seed_headers)
                 await stream.prepare(request)
 
                 async def write_text_chunk(text="", finish_reason=None, usage=None):
@@ -4142,6 +4404,10 @@ try:
                         await _finish_sse(stream)
                     SERVICE._log(f"OpenAI text SSE interrupted by Stop for {client}")
                     return stream
+                _log_openai_sampling_result(
+                    result, request_seed, sampler_seed, seed_mode,
+                    request_id=request_id, control_sources=control_sources, request_signature=request_signature,
+                )
                 final_content = str(result.get("response") or "")
                 info = result.get("info") or {}
                 usage = {
@@ -4171,6 +4437,10 @@ try:
                 client=client,
                 overrides=overrides,
             )
+            _log_openai_sampling_result(
+                result, request_seed, sampler_seed, seed_mode,
+                request_id=request_id, control_sources=control_sources, request_signature=request_signature,
+            )
             info = result.get("info") or {}
             response_text = str(result.get("response") or "")
             SERVICE._log(f"OpenAI text response returned {len(response_text)} visible chars to {client}")
@@ -4185,7 +4455,7 @@ try:
                     "completion_tokens": int(info.get("completion_tokens") or 0),
                     "total_tokens": int(result.get("tokens") or info.get("total_tokens") or 0),
                 },
-            })
+            }, headers=seed_headers)
         except LocalLLMInterrupted as e:
             return _json_error(e, 409)
         except Exception as e:

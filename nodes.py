@@ -10,7 +10,6 @@ import gc
 import hashlib
 import inspect
 import io
-import importlib
 import json
 import logging
 import os
@@ -27,6 +26,10 @@ import folder_paths
 from .gguf_meta import read_gguf_metadata, detect_family, recommended_model_preset, available_model_presets
 from .presets import MODEL_PRESETS, MEMORY_PRESETS, capabilities_for_family, public_presets
 from .version import VRAM_POLICY_VERSION, VRAM_COORDINATION_MODE
+from .seed_utils import llama_seed_from_u64
+from .generation_controls import resolve_generation_controls, REQUEST_GENERATION_OVERRIDE_FIELDS
+from .cpu_tuning import cpu_runtime_profile
+from .paths import LLM_FOLDER_KEY, LLM_MODEL_DIR, register_llm_model_folder
 from .vram_coordination import (
     GPUMemoryLeaseManager,
     NATIVE_LOAD_STABILITY_GUARD_BYTES,
@@ -34,13 +37,7 @@ from .vram_coordination import (
     lease_failure_message,
 )
 
-LLM_DIR = os.path.join(folder_paths.models_dir, "llm")
-os.makedirs(LLM_DIR, exist_ok=True)
-folder_paths.add_model_folder_path("llm", LLM_DIR, is_default=True)
-try:
-    folder_paths.folder_names_and_paths["llm"][1].add(".gguf")
-except Exception:
-    pass
+register_llm_model_folder()
 
 _NONE = "None"
 _AUTO_VISION = "Auto (matching mmproj)"
@@ -911,7 +908,7 @@ def _resident_prompt_cache_metrics(llm, prepared, prompt_tokens, native_prompt_t
 
 def _scan_gguf():
     try:
-        names = folder_paths.get_filename_list("llm")
+        names = folder_paths.get_filename_list(LLM_FOLDER_KEY)
     except Exception:
         names = []
     return sorted([n for n in names if n.lower().endswith(".gguf")], key=str.lower)
@@ -952,7 +949,7 @@ def _gpu_choices():
     except Exception:
         pass
 
-    return devices or ["0 — Default GPU (backend device 0)"]
+    return devices or ["0 — No GPU detected (CPU-only available)"]
 
 
 def _gpu_index(value):
@@ -970,7 +967,7 @@ def _gpu_index(value):
 
 
 def _full_path(name):
-    p = folder_paths.get_full_path("llm", name)
+    p = folder_paths.get_full_path(LLM_FOLDER_KEY, name)
     if p is None:
         p = os.path.join(LLM_DIR, name)
     return p
@@ -1138,7 +1135,10 @@ def _resolve_kv_type(llama_cpp, name):
     low_level = getattr(llama_cpp, "llama_cpp", None)
     if low_level is None:
         try:
-            low_level = importlib.import_module("llama_cpp.llama_cpp")
+            # Keep llama-cpp-python optional and lazily loaded, but use a normal
+            # import rather than dynamic module loading.  Some binding versions
+            # expose GGML enums only from this low-level module.
+            from llama_cpp import llama_cpp as low_level
         except Exception:
             low_level = None
     value = getattr(low_level, attr, None) if low_level is not None else None
@@ -1479,6 +1479,65 @@ def _llama_gpu_offload_hint(llama_cpp):
     return None
 
 
+def _torch_cuda_available():
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def _resolve_compute_mode(requested, llama_cpp):
+    """Resolve Auto/GPU/CPU without requiring a GPU-capable binding.
+
+    This package's GPU memory coordination is CUDA/ROCm-through-torch based. In
+    Auto mode, a machine with no ComfyUI-visible accelerator or a binding that
+    explicitly reports no GPU offload support becomes a hard CPU-only load.
+    """
+    mode = str(requested or "Auto").strip()
+    if mode not in {"Auto", "GPU / Mixed", "CPU Only"}:
+        mode = "Auto"
+    support_hint = _llama_gpu_offload_hint(llama_cpp)
+    accelerator = _torch_cuda_available()
+    if mode == "CPU Only":
+        effective, reason = "CPU Only", "explicit CPU-only mode"
+    elif mode == "GPU / Mixed":
+        effective, reason = "GPU / Mixed", "explicit GPU/mixed mode"
+    elif support_hint is False:
+        effective, reason = "CPU Only", "llama.cpp binding reports no GPU offload support"
+    elif not accelerator:
+        effective, reason = "CPU Only", "no ComfyUI-visible CUDA/ROCm accelerator detected"
+    else:
+        effective, reason = "GPU / Mixed", "accelerator and GPU-capable llama.cpp path detected"
+    return {
+        "requested": mode,
+        "effective": effective,
+        "cpu_only": effective == "CPU Only",
+        "reason": reason,
+        "gpu_offload_hint": support_hint,
+        "torch_accelerator_available": accelerator,
+    }
+
+
+def _llama_numa_strategy(llama_cpp, mode):
+    """Map the UI NUMA strategy to JamePeng/llama.cpp constants."""
+    names = {
+        "Disabled": ("GGML_NUMA_STRATEGY_DISABLED", 0),
+        "Distribute": ("GGML_NUMA_STRATEGY_DISTRIBUTE", 1),
+        "Isolate": ("GGML_NUMA_STRATEGY_ISOLATE", 2),
+        "Numactl": ("GGML_NUMA_STRATEGY_NUMACTL", 3),
+    }
+    key = str(mode or "Disabled")
+    attr, fallback = names.get(key, names["Disabled"])
+    for owner in (llama_cpp, getattr(llama_cpp, "llama_cpp", None)):
+        if owner is not None and hasattr(owner, attr):
+            try:
+                return int(getattr(owner, attr))
+            except Exception:
+                pass
+    return int(fallback)
+
+
 def _model_file_size(load_kwargs):
     """Return the configured GGUF size for diagnostics without raising."""
     path = load_kwargs.get("model_path")
@@ -1508,10 +1567,16 @@ def _llama_backend_libraries(llama_cpp):
 
 
 def _load_llama_verified(llama_cpp, Llama, load_kwargs, gpu_layers):
-    """Load a model and verify requested GPU offload by measuring device-wide VRAM."""
+    """Load a model and verify requested GPU offload by measuring device-wide VRAM.
+
+    CPU-only loads skip CUDA synchronization/snapshots entirely. This is both
+    faster on CPU hosts and guarantees that CPU mode does not require a working
+    CUDA runtime merely for diagnostics.
+    """
     total_started = time.perf_counter()
+    requested_gpu = _native_cuda_expected(0, load_kwargs) or int(gpu_layers) != 0
     before_started = time.perf_counter()
-    before = _torch_cuda_snapshot()
+    before = _torch_cuda_snapshot() if requested_gpu else {}
     snapshot_before_seconds = time.perf_counter() - before_started
     load_mode = _load_mode_name(load_kwargs)
     host_before = _host_load_snapshot()
@@ -1524,12 +1589,11 @@ def _load_llama_verified(llama_cpp, Llama, load_kwargs, gpu_layers):
     host_after = _host_load_snapshot()
     host_delta = _host_load_delta(host_before, host_after, load_mode)
     after_started = time.perf_counter()
-    after = _torch_cuda_snapshot()
+    after = _torch_cuda_snapshot() if requested_gpu else {}
     snapshot_after_seconds = time.perf_counter() - after_started
     deltas = _snapshot_deltas(before, after)
 
     diag_started = time.perf_counter()
-    requested_gpu = _native_cuda_expected(0, load_kwargs) or int(gpu_layers) != 0
     total_delta = sum(deltas.values())
     support_hint = _llama_gpu_offload_hint(llama_cpp)
     system_info = _llama_system_info(llama_cpp)
@@ -1610,13 +1674,15 @@ def _load_llama_fast(Llama, load_kwargs, prior_diagnostics=None, reload_count=0)
     """Reload a previously verified model without heavyweight GPU diagnostics."""
     device = None
     free_before = None
-    try:
-        import torch
-        if torch.cuda.is_available():
-            device = torch.device("cuda", int(load_kwargs.get("main_gpu", 0) or 0))
-            free_before = _raw_cuda_free_bytes(device)
-    except Exception:
-        pass
+    gpu_expected = _native_cuda_expected(0, load_kwargs) or int(load_kwargs.get("n_gpu_layers", 0) or 0) != 0
+    if gpu_expected:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device = torch.device("cuda", int(load_kwargs.get("main_gpu", 0) or 0))
+                free_before = _raw_cuda_free_bytes(device)
+        except Exception:
+            pass
 
     load_mode = _load_mode_name(load_kwargs)
     host_before = _host_load_snapshot()
@@ -2209,17 +2275,6 @@ def _estimate_native_vram_components(model_path, mmproj_path, metadata, gpu_laye
     }
 
 
-def _estimate_native_vram(model_path, mmproj_path, metadata, gpu_layers, n_ctx, kv_k, kv_v,
-                          kv_location, n_batch=2048, n_ubatch=512, flash_attention=True,
-                          speculative_mode="Off", vision_offload=True):
-
-    """Conservative first-load estimate for ComfyUI pressure planning."""
-    return int(_estimate_native_vram_components(
-        model_path, mmproj_path, metadata, gpu_layers, n_ctx, kv_k, kv_v, kv_location,
-        n_batch=n_batch, n_ubatch=n_ubatch, flash_attention=flash_attention,
-        speculative_mode=speculative_mode, vision_offload=vision_offload,
-    )["total_bytes"])
-
 
 class _NativeLLMResident:
     """All-or-nothing native llama.cpp residency controller.
@@ -2653,7 +2708,10 @@ def _is_fatal_decode_error(exc):
     fallback, so retrying against the same native context cannot recover.
     """
     message = str(exc or "").lower()
-    if "llama.eval(decode)" not in message:
+    # Match the meaning of the native failure rather than a Python-looking
+    # method-call fragment.  This also tolerates small wording changes between
+    # llama-cpp-python releases while retaining the same narrow failure class.
+    if "llama" not in message or "decode" not in message:
         return False
     return (
         "failed completely" in message
@@ -3666,23 +3724,10 @@ def _extract_response(result):
 
 
 def _llama_seed_from_comfy(seed):
-    """Map ComfyUI's standard unsigned 64-bit seed to llama.cpp's uint32 seed.
+    """Backward-compatible wrapper around the shared 64->32-bit seed mapping."""
+    return llama_seed_from_u64(seed)
 
-    ComfyUI exposes 0..2^64-1 seeds, while llama.cpp's sampler seed is uint32_t
-    and reserves 0xFFFFFFFF as LLAMA_DEFAULT_SEED (random). SplitMix64 gives a
-    stable, well-distributed 32-bit value from the full Comfy seed. Avoiding the
-    reserved all-ones value guarantees that every explicit Comfy seed remains
-    deterministic, including 0xFFFFFFFF and larger 64-bit values.
-    """
-    x = int(seed) & 0xFFFFFFFFFFFFFFFF
-    z = (x + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
-    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
-    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
-    z ^= z >> 31
-    out = int(z & 0xFFFFFFFF)
-    if out == 0xFFFFFFFF:
-        out = 0xFFFFFFFE
-    return out
+
 
 
 class LocalGGUFLLMAPI:
@@ -3958,6 +4003,8 @@ class LocalGGUFLLM:
                 "vision_max_frames": ("INT", {"default": 24, "min": 1, "max": 1024, "tooltip": "Evenly sample at most this many frames from the optional Video Frames IMAGE batch."}),
                 "vision_max_edge": ("INT", {"default": 1536, "min": 256, "max": 4096, "step": 64, "tooltip": "Downscale vision inputs so their longest edge does not exceed this value."}),
                 "verbose": ("BOOLEAN", {"default": False}),
+                "compute_mode": (["Auto", "GPU / Mixed", "CPU Only"], {"default": "Auto", "tooltip": "Auto uses GPU/mixed mode only when ComfyUI sees a CUDA/ROCm accelerator and llama.cpp supports offload. CPU Only hard-disables model, KV, operator, and vision-projector GPU offload."}),
+                "numa_mode": (["Auto", "Disabled", "Distribute", "Isolate", "Numactl"], {"default": "Auto", "tooltip": "CPU NUMA policy. Auto uses Distribute only when CPU-only mode is active and the OS exposes more than one NUMA node."}),
             },
             "optional": {
                 "image": ("IMAGE", {"tooltip": "One image or an IMAGE batch. Multiple images are preserved in batch order."}),
@@ -3969,7 +4016,7 @@ class LocalGGUFLLM:
     RETURN_NAMES = ("response", "thinking", "info", "tokens", "api")
     FUNCTION = "generate"
     CATEGORY = "LLM/Local GGUF"
-    DESCRIPTION = "Run local GGUF LLMs from models/llm and expose a live API facade for linked custom nodes."
+    DESCRIPTION = "Run local GGUF LLMs from models/LLM and expose a live API facade for linked custom nodes."
 
     @classmethod
     def IS_CHANGED(cls, **kwargs):
@@ -4033,7 +4080,7 @@ class LocalGGUFLLM:
                  tfs_z, mirostat_mode, mirostat_tau, mirostat_eta, penalize_newline,
                  op_offload, swa_full, rope_freq_base, rope_freq_scale, yarn_ext_factor,
                  yarn_attn_factor, yarn_beta_fast, yarn_beta_slow, yarn_orig_ctx,
-                 stop_sequences, vision_max_images, vision_max_frames, vision_max_edge, verbose, image=None, video_frames=None, messages_override=None, progress_callback=None, token_callback=None, cancel_event=None):
+                 stop_sequences, vision_max_images, vision_max_frames, vision_max_edge, verbose, compute_mode="Auto", numa_mode="Auto", image=None, video_frames=None, messages_override=None, progress_callback=None, token_callback=None, cancel_event=None, request_generation_overrides=None, native_sampler_seed_override=None):
         # Defense in depth: this implementation owns/uses the raw llama.cpp
         # context and must never be invoked by future code that bypasses
         # ``generate()``, which is the process-global native ownership boundary.
@@ -4058,27 +4105,51 @@ class LocalGGUFLLM:
         else:
             model_preset_resolved = model_preset
 
-        # Presets are authoritative at execution time too. The frontend mirrors these
-        # values for editability; if a user changes one in the UI it flips to Custom.
-        # Enforcing here also keeps API/headless execution deterministic.
-        if model_preset_resolved in MODEL_PRESETS and model_preset != "Custom":
-            mp = MODEL_PRESETS[model_preset_resolved]
-            thinking_mode = mp.get("thinking_mode", thinking_mode)
-            reasoning_effort = mp.get("reasoning_effort", reasoning_effort)
-            preserve_thinking = mp.get("preserve_thinking", preserve_thinking)
-            chat_format = mp.get("chat_format", chat_format)
-            temperature = mp.get("temperature", temperature)
-            top_p = mp.get("top_p", top_p)
-            top_k = mp.get("top_k", top_k)
-            min_p = mp.get("min_p", min_p)
-            typical_p = mp.get("typical_p", typical_p)
-            repeat_penalty = mp.get("repeat_penalty", repeat_penalty)
-            presence_penalty = mp.get("presence_penalty", presence_penalty)
-            frequency_penalty = mp.get("frequency_penalty", frequency_penalty)
-            tfs_z = mp.get("tfs_z", tfs_z)
-            mirostat_mode = mp.get("mirostat_mode", mirostat_mode)
-            mirostat_tau = mp.get("mirostat_tau", mirostat_tau)
-            mirostat_eta = mp.get("mirostat_eta", mirostat_eta)
+        # Resolve model-preset defaults first, then re-apply explicit request-local
+        # controls. Previously the preset block ran after SERVICE args.update(), so
+        # OpenAI/Settings overrides such as temperature/top_p were silently lost.
+        # A low-temperature preset could therefore make different random seeds
+        # appear ineffective even though the seed itself had changed.
+        _generation_controls = resolve_generation_controls(
+            model_preset=model_preset,
+            model_preset_resolved=model_preset_resolved,
+            current={
+                "thinking_mode": thinking_mode,
+                "reasoning_effort": reasoning_effort,
+                "preserve_thinking": preserve_thinking,
+                "chat_format": chat_format,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "min_p": min_p,
+                "typical_p": typical_p,
+                "repeat_penalty": repeat_penalty,
+                "presence_penalty": presence_penalty,
+                "frequency_penalty": frequency_penalty,
+                "tfs_z": tfs_z,
+                "mirostat_mode": mirostat_mode,
+                "mirostat_tau": mirostat_tau,
+                "mirostat_eta": mirostat_eta,
+            },
+            model_presets=MODEL_PRESETS,
+            request_overrides=request_generation_overrides,
+        )
+        thinking_mode = _generation_controls["thinking_mode"]
+        reasoning_effort = _generation_controls["reasoning_effort"]
+        preserve_thinking = _generation_controls["preserve_thinking"]
+        chat_format = _generation_controls["chat_format"]
+        temperature = _generation_controls["temperature"]
+        top_p = _generation_controls["top_p"]
+        top_k = _generation_controls["top_k"]
+        min_p = _generation_controls["min_p"]
+        typical_p = _generation_controls["typical_p"]
+        repeat_penalty = _generation_controls["repeat_penalty"]
+        presence_penalty = _generation_controls["presence_penalty"]
+        frequency_penalty = _generation_controls["frequency_penalty"]
+        tfs_z = _generation_controls["tfs_z"]
+        mirostat_mode = _generation_controls["mirostat_mode"]
+        mirostat_tau = _generation_controls["mirostat_tau"]
+        mirostat_eta = _generation_controls["mirostat_eta"]
 
         if memory_preset in MEMORY_PRESETS and memory_preset != "Custom":
             mem = MEMORY_PRESETS[memory_preset]
@@ -4092,6 +4163,32 @@ class LocalGGUFLLM:
             memory_batch_size = mem.get("memory_batch_size", memory_batch_size)
             use_mmap = mem.get("use_mmap", use_mmap)
             use_mlock = mem.get("use_mlock", use_mlock)
+            threads = mem.get("threads", threads)
+            threads_batch = mem.get("threads_batch", threads_batch)
+            compute_mode = mem.get("compute_mode", compute_mode)
+            numa_mode = mem.get("numa_mode", numa_mode)
+            op_offload = mem.get("op_offload", op_offload)
+
+        compute_runtime = _resolve_compute_mode(compute_mode, llama_cpp)
+        cpu_only = bool(compute_runtime.get("cpu_only"))
+        if cpu_only:
+            # Hard CPU boundary: no model/KV/operator/projector GPU allocation.
+            gpu_layers = 0
+            kv_cache_location = "CPU"
+            split_mode = "None (single GPU)"
+            tensor_split = ""
+            op_offload = "Disabled"
+
+        cpu_profile = cpu_runtime_profile(threads, threads_batch, numa_mode, cpu_only=cpu_only)
+        effective_threads = int(cpu_profile["threads"])
+        effective_threads_batch = int(cpu_profile["threads_batch"])
+        effective_numa_mode = str(cpu_profile["numa_effective"])
+        _LOGGER.info(
+            "[Local GGUF LLM] Compute mode: requested=%s effective=%s (%s) • CPU threads=%d/%d • NUMA=%s (%d node%s)",
+            compute_runtime.get("requested"), compute_runtime.get("effective"), compute_runtime.get("reason"),
+            effective_threads, effective_threads_batch, effective_numa_mode,
+            int(cpu_profile.get("numa_nodes") or 1), "s" if int(cpu_profile.get("numa_nodes") or 1) != 1 else "",
+        )
 
         resolved_vision = None
         if vision_model == _AUTO_VISION:
@@ -4227,6 +4324,8 @@ class LocalGGUFLLM:
             _require_init_option(llama_init_params, llama_init_var_kw, "type_v", f"KV cache V type {kv_cache_v}")
         if kv_cache_location == "CPU":
             _require_init_option(llama_init_params, llama_init_var_kw, "offload_kqv", "CPU KV cache placement")
+        if effective_numa_mode != "Disabled":
+            _require_init_option(llama_init_params, llama_init_var_kw, "numa", f"NUMA mode {effective_numa_mode}")
 
         load_kwargs = dict(
             model_path=model_path,
@@ -4239,8 +4338,9 @@ class LocalGGUFLLM:
             n_ctx=context_size,
             n_batch=effective_prompt_batch_size,
             n_ubatch=effective_memory_batch_size,
-            n_threads=(None if threads == 0 else threads),
-            n_threads_batch=(None if threads_batch == 0 else threads_batch),
+            n_threads=effective_threads,
+            n_threads_batch=effective_threads_batch,
+            numa=_llama_numa_strategy(llama_cpp, effective_numa_mode),
             offload_kqv=(kv_cache_location == "GPU"),
             flash_attn=flash_attention,
             last_n_tokens_size=last_n_tokens,
@@ -4395,7 +4495,7 @@ class LocalGGUFLLM:
         if vision_placement_signature:
             with _NATIVE_COORDINATOR.vision_placement_lock:
                 remembered_vision_placement = _NATIVE_COORDINATOR.vision_placement_by_signature.get(vision_placement_signature)
-        vision_use_gpu = not (mmproj_path and remembered_vision_placement == "cpu")
+        vision_use_gpu = False if cpu_only else not (mmproj_path and remembered_vision_placement == "cpu")
         active_variant = _build_load_variant(vision_use_gpu=vision_use_gpu)
         load_kwargs = active_variant["load_kwargs"]
         handler = active_variant["handler"]
@@ -4521,6 +4621,10 @@ class LocalGGUFLLM:
             n_ubatch=effective_memory_batch_size,
             gpu_layers=gpu_layers,
             main_gpu=main_gpu_index,
+            compute_mode=compute_runtime.get("effective"),
+            cpu_threads=effective_threads,
+            cpu_threads_batch=effective_threads_batch,
+            numa=effective_numa_mode,
         )
         if model_retention == "ComfyUI Managed":
             try:
@@ -4917,7 +5021,7 @@ class LocalGGUFLLM:
         if (data_uris or messages_have_images) and not mmproj_path:
             raise RuntimeError(
                 "A vision request was received, but no usable vision projector is selected. "
-                "Choose a matching mmproj GGUF in Vision, or use Auto when a matching projector is present in models/llm."
+                "Choose a matching mmproj GGUF in Vision, or use Auto when a matching projector is present in models/LLM."
             )
 
         if messages_override is not None:
@@ -4952,7 +5056,16 @@ class LocalGGUFLLM:
             else:
                 messages.append({"role": "user", "content": prompt})
 
-        llama_seed = _llama_seed_from_comfy(seed)
+        # OpenAI requests allocate/log the native uint32 sampler seed before the
+        # generation call. Accept that internal value directly so the seed named
+        # in the API log is exactly the one handed to llama-cpp-python; normal
+        # ComfyUI calls continue to derive it from their 64-bit request seed.
+        if native_sampler_seed_override is None:
+            llama_seed = _llama_seed_from_comfy(seed)
+        else:
+            llama_seed = int(native_sampler_seed_override) & 0xFFFFFFFF
+            if llama_seed == 0xFFFFFFFF:
+                llama_seed = 0xFFFFFFFE
 
         completion_kwargs = dict(
             messages=messages,
@@ -4991,6 +5104,12 @@ class LocalGGUFLLM:
         except Exception:
             pass
 
+        seed_kwarg_forwarded = "seed" in completion_kwargs
+        chat_handler_obj = getattr(llm, "chat_handler", None)
+        chat_handler_type = type(chat_handler_obj).__name__ if chat_handler_obj is not None else "None"
+        seed_setter_succeeded = False
+        seed_object_after_set = None
+
         _check_cancel(cancel_event)
         if progress_callback is not None:
             try:
@@ -5021,8 +5140,14 @@ class LocalGGUFLLM:
             # passing it in completion_kwargs when supported.
             try:
                 llm.set_seed(llama_seed)
+                seed_setter_succeeded = True
             except Exception:
-                pass
+                seed_setter_succeeded = False
+            try:
+                raw_seed = getattr(llm, "_seed", None)
+                seed_object_after_set = None if raw_seed is None else int(raw_seed) & 0xFFFFFFFF
+            except Exception:
+                seed_object_after_set = None
 
             if progress_callback is None:
                 try:
@@ -5303,6 +5428,10 @@ class LocalGGUFLLM:
         # Effective configuration snapshot backing the live API facade.  It is
         # no longer emitted as a separate ComfyUI output; linked nodes query it
         # through api.get_settings()/get_*_settings().
+        try:
+            seed_affects_sampling = float(temperature) > 0.0
+        except (TypeError, ValueError, OverflowError):
+            seed_affects_sampling = None
         settings = {
             "schema": "local_gguf_llm_settings",
             "schema_version": 3,
@@ -5338,6 +5467,15 @@ class LocalGGUFLLM:
                 "max_tokens": max_tokens,
                 "seed": seed,
                 "llama_seed": llama_seed,
+                "llama_seed_applied": seed_object_after_set,
+                "seed_setter_succeeded": seed_setter_succeeded,
+                "seed_kwarg_forwarded": seed_kwarg_forwarded,
+                "chat_handler_type": chat_handler_type,
+                "seed_affects_sampling": seed_affects_sampling,
+                "request_override_fields": sorted(
+                    key for key in (request_generation_overrides or {})
+                    if key in REQUEST_GENERATION_OVERRIDE_FIELDS
+                ),
             },
             "memory": {
                 "memory_preset": memory_preset,
@@ -5445,12 +5583,24 @@ class LocalGGUFLLM:
                 "repeat_penalty": repeat_penalty,
                 "presence_penalty": presence_penalty,
                 "frequency_penalty": frequency_penalty,
+                "tfs_z": tfs_z,
+                "mirostat_mode": mirostat_mode,
+                "mirostat_tau": mirostat_tau,
+                "mirostat_eta": mirostat_eta,
             },
             "independent_output_controls": {
                 "thinking_output": thinking_output,
                 "max_tokens": max_tokens,
                 "seed": seed,
+                # ``llama_seed`` is retained for compatibility. The additional
+                # fields distinguish our requested native seed from what was
+                # actually stored on the live Llama object before sampling.
                 "llama_seed": llama_seed,
+                "llama_seed_requested": llama_seed,
+                "llama_seed_applied": seed_object_after_set,
+                "seed_setter_succeeded": seed_setter_succeeded,
+                "seed_kwarg_forwarded": seed_kwarg_forwarded,
+                "chat_handler_type": chat_handler_type,
             },
             "thinking_extraction": thinking_extraction,
             "memory_preset": memory_preset,
@@ -5490,6 +5640,10 @@ class LocalGGUFLLM:
             "tokens_per_second": round(tok_s, 2),
             "performance_source": perf_source,
             "llama_cpp_version": getattr(llama_cpp, "__version__", "unknown"),
+            "compute_mode_requested": compute_runtime.get("requested"),
+            "compute_mode_effective": compute_runtime.get("effective"),
+            "compute_mode_reason": compute_runtime.get("reason"),
+            "cpu_runtime": copy.deepcopy(cpu_profile),
             "ignored_unsupported_load_options": unsupported_load_options,
         }
 
@@ -5528,6 +5682,8 @@ class LocalGGUFLLM:
             "memory_batch_size": memory_batch_size,
             "use_mmap": use_mmap,
             "use_mlock": use_mlock,
+            "compute_mode": compute_runtime.get("requested", compute_mode),
+            "numa_mode": numa_mode,
             "prompt_cache_mode": prompt_cache_mode,
             "speculative_mode": speculative_mode,
             "ngram_pred_tokens": ngram_pred_tokens,
