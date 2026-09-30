@@ -1,8 +1,8 @@
 # ComfyUI Local GGUF LLM
 
-> **0.18.100 CPU-first runtime:** CPU-only inference is now a first-class mode. `CPU Only` hard-disables model-layer, KV-cache, operator, and vision-projector GPU offload; Auto CPU threading is topology/affinity aware; NUMA Auto is available for multi-node CPU systems.
+> **0.18.103 Prompt Cycle native-control rebuild:** Prompt Cycle now uses ComfyUI's own `control_after_generate` queue lifecycle, the same mechanism used by KSampler Seed. A hidden signed cycle counter is serialized into each queue item and mapped to the prompt array by modulo, removing the server admission cursor/epoch from normal cycling.
 
-**Version 0.18.100-alpha**  
+**Version 0.18.103-alpha**  
 Persistent local GGUF inference for ComfyUI, with workflow nodes, multimodal prompt support, VRAM-aware model residency, a performance tuner, Prompt Enhancer, and an optional OpenAI-compatible API.
 
 ## What is in this package
@@ -351,7 +351,7 @@ Editing a preset-owned visible field changes the node to `Custom`. Seed is inten
 
 ## Local LLM Prompt Enhancer
 
-**Prompt Enhancer version: 0.6.51-alpha**  
+**Prompt Enhancer version: 0.6.54-alpha**  
 **Category:** `prompt/Local LLM`
 
 Prompt Enhancer uses the same persistent Local LLM service as Generate.
@@ -437,7 +437,7 @@ When **Enhance with Workflow** is off, Prompt Cycle chooses how the stored enhan
 - `shuffle` — true no-repeat deck behavior until the deck is exhausted
 - `random` — choose freely
 
-Fixed mode is cacheable. Active cycle modes deliberately re-execute because each queued item can select a different stored prompt. During normal ComfyUI queueing, the frontend freezes the exact X/Y index into `prompt_history_index` while **each Run x N API prompt is serialized**. The backend uses that serialized index directly; it does not advance a shared cycle cursor at execution time. This makes the chosen prompt independent of queue execution timing and backend cursor state.
+Fixed mode is cacheable. Active cycle modes deliberately re-execute because each queued item can select a different stored prompt. During normal ComfyUI queueing, the Python server freezes the exact X/Y index into `prompt_history_index` in its `/prompt` admission hook **before each Run × N item is validated or inserted into the queue**. It also freezes the matching prompt text and a unique queue sequence. Execution uses those submitted values directly and does not advance the shared submission cursor a second time. This makes the chosen prompt independent of browser widget lifecycle, Vue/LiteGraph rendering, queue execution timing, and completion-event timing.
 
 The queue snapshot also marks the request so backend history reconciliation cannot overwrite the selected array entry with the stale visible Enhanced Prompt text from a different X/Y position. Shuffle/Random planning is performed per queued item and is independent of the LLM generation seed. Headless/legacy submissions without queue metadata use the serialized X/Y as the active item and calculate only a one-step next-index value for UI feedback.
 
@@ -703,54 +703,10 @@ For manual updates:
 
 The package removes obsolete versioned frontend files from older releases at import time. It also removes the legacy bundled H3 Shot Generator backend/frontend left by old combined builds.
 
-# v0.18.100-alpha release notes
+# v0.18.103-alpha release notes
 
-CPU-only inference is now a first-class runtime mode. **Compute Mode = CPU Only** is a hard boundary: model layers are forced to `n_gpu_layers=0`, KV/KQV offload stays on CPU, operator offload is disabled, and multimodal projector execution is kept on CPU. CPU-only model loads also skip CUDA synchronization and VRAM verification snapshots. `Auto` selects CPU-only behavior when ComfyUI has no visible CUDA/ROCm accelerator or the installed llama.cpp binding explicitly reports that GPU offload is unavailable.
+Prompt Cycle was rebuilt around ComfyUI's native `control_after_generate` mechanism—the same lifecycle used by KSampler Seed. A new hidden `prompt_cycle_counter` INT is the queue-controlled target. For Increment/Decrement/Random/Fixed, ComfyUI itself advances or randomizes that counter between Run × N items. Python does not own or advance a shared cursor; it only maps the counter carried by the individual queued job to `counter % history_length`.
 
-CPU Auto tuning is topology and affinity aware. `CPU Threads = 0` resolves to the physical-core count for token generation, while `CPU Batch Threads = 0` resolves to the logical CPUs available to the ComfyUI process. A fully exposed 64-core/128-thread Threadripper 3990X therefore resolves to 64 generation threads and 128 prompt-processing threads. Explicit thread values are preserved.
+The visible Prompt Cycle selector maps `fixed`, `increment`, `decrement`, and `random` onto ComfyUI's native control values. Shuffle uses the same native Randomize lifecycle as its trigger, with a thin no-repeat bag override in the counter callback. X/Y and Enhanced Prompt mirror the counter for display only and execution completion never advances cycle state.
 
-NUMA is now passed directly to supported llama.cpp bindings. **NUMA = Auto** enables `Distribute` only for CPU-only inference when more than one NUMA node is exposed; otherwise it remains disabled. Explicit `Disabled`, `Distribute`, `Isolate`, and `Numactl` modes are available. The server UI exposes Compute Mode, CPU generation/batch threads, NUMA mode, and operator offload, reports the resolved CPU profile, and provides a **Use CPU-only Auto** button for a one-step high-core-count baseline. The new **CPU Only (Auto / High Core)** memory preset provides the same baseline to legacy/internal memory-preset consumers.
-
-The service-side estimator and speculative-decoding resolver now treat `Auto` as CPU-only on no-CUDA hosts before model load. Native MTP therefore does not advertise itself as active when its full-GPU requirement cannot be met. The Local LLM Server frontend moved to `local_llm_server_v102.js` to force a cache-distinct update.
-
-# v0.18.99-alpha release notes
-
-Prompt Cycle now uses ComfyUI's actual per-item queue lifecycle instead of custom `serializeValue()` overrides or an execution-time backend cursor. The existing Seed **Control After Generate** widget is the lifecycle carrier because ComfyUI creates it as a real node widget and calls widget `beforeQueued` before `graphToPrompt()` and `afterQueued` after each queued item is submitted.
-
-For every non-Fixed Run × N item, `beforeQueued` plans exactly one cycle entry and writes the selected `prompt_history_index`, matching `enhanced_prompt`, and a unique `prompt_cycle_queue_seq` into ordinary schema widgets **before** ComfyUI builds that API prompt. `afterQueued` commits exactly one next-entry advance. JavaScript does not use completion events to advance queue-prepared cycle items, so a fast Prompt Enhancer execution cannot move X/Y while later batch items are still being serialized.
-
-Workflow serialization is also read-only with respect to the stored prompt array while a cycle item is being prepared. This closes the remaining path where `graph.serialize()`/`onSerialize` could reconcile the visible editor while a Run × N item was being frozen. The backend simply consumes the X/Y already present in that queued graph; it does not reinterpret the item through shared cursor state.
-
-`prompt_cycle_queue_seq` is a monotonic cache discriminator only; it never selects the prompt. Positive queue values produce distinct `IS_CHANGED` signatures, while legacy/headless clients retain the non-cacheable fallback. The frontend moved to `prompt_enhancer_dom_v0651.js`, and the node version is `0.6.51-alpha`.
-
-# v0.18.97-alpha release notes
-
-Prompt Cycle was rebuilt around one authority: the Python backend state machine. `Increment`, `Decrement`, `Shuffle`, and `Random` no longer depend on ComfyUI widget `beforeQueued` / `afterQueued` callbacks, no longer carry a frontend cycle cursor, and no longer use a queue-prepared snapshot path. Every non-fixed execution is intentionally non-cacheable and consumes exactly one backend cycle entry.
-
-The legacy `prompt_cycle_queue_seq` input remains only for workflow/schema compatibility and is forced to `0` by the v0.6.48 frontend. Positive values from older cached frontends are ignored by the backend. Runtime scope, state id, cycle revision, and shuffle state remain API-only values so each workflow/tab has an isolated cursor without persisting runtime ownership into workflow/image metadata.
-
-The visible X/Y selector is updated from the backend execution result. A single queued run should therefore visibly move after that Prompt Enhancer execution completes; Run × N advances once per executed item and the UI follows those execution results.
-
-The Prompt Enhancer frontend moved to `prompt_enhancer_dom_v0649.js` to force a cache-distinct load.
-
-# v0.18.95-alpha release notes
-
-Prompt Cycle queueing was rebuilt rather than patched on top of the 0.18.90-0.18.93 implementations. For normal browser queueing, there is now one owner of cycle progression: the hidden `prompt_cycle_queue_seq` widget. Its `beforeQueued` callback freezes the current X/Y selection into that queue item and serializes a unique monotonic nonce. Its `afterQueued` callback is the only place that advances the live selector to the entry for the next item.
-
-The old frontend private cursor and frontend-to-backend cycle synchronization path were removed from normal queue operation. The backend `PromptCycleStore` remains only as a compatibility fallback for legacy/headless submissions that arrive without the queue nonce. Queue-prepared submissions always trust the X/Y index serialized into that specific item, so backend state cannot advance them a second time.
-
-Each queue-prepared non-Fixed item now has a distinct `IS_CHANGED` signature using its queue nonce. That prevents several Run x N items from collapsing into one cached Prompt Enhancer execution merely because the surrounding workflow snapshot is otherwise identical. A failed queue submission does not consume a cycle entry because advancement happens only after acceptance.
-
-Shuffle was also rebuilt as a deck. The selected entry is consumed once, every other entry is emitted once before a new deck begins, and a deck-boundary repeat is avoided. The runtime journal now remembers whether Shuffle has started even when the remaining deck is momentarily empty, so workflow-tab remounts do not accidentally restart the first deck.
-
-The Prompt Enhancer frontend was moved to `prompt_enhancer_dom_v0647.js` to force a cache-distinct load. The queue lifecycle carrier is now the required `Prompt Cycle` widget rather than the hidden queue nonce widget. The dependency-free suite is run as part of release validation.
-
-# v0.18.93-alpha release notes
-
-This release corrects the Prompt Cycle regressions in 0.18.90-0.18.92. Current ComfyUI queues each batch item with one `beforeQueued -> graphToPrompt -> afterQueued` lifecycle. Prompt Cycle now prepares exactly one immutable cycle selection in `beforeQueued`, serializes that selection into the queued API prompt, and commits the next private cursor only in `afterQueued` after the item is accepted. Cycling no longer advances from `serializeValue()`, so extra prompt serialization cannot consume a second cycle step.
-
-The lifecycle hook is attached to the **current** `prompt_cycle` widget rather than being marked only on the node. If Nodes 2.0 replaces that widget object after extension initialization, the `promptQueueing` event repairs the hook before ComfyUI starts the per-item queue loop.
-
-The workflow-enhancement toggle now uses explicit boolean normalization throughout the queue path. Values such as the string `"false"` are treated as false instead of JavaScript truthy strings; this was the reason the callback-based 0.18.90/0.18.91 design could bypass cycling completely on affected frontends.
-
-When **Enhance with Workflow** is disabled, the Prompt Enhancer LLM seed still serializes as a stable zero and runtime-only cycle bookkeeping is omitted from the API prompt where possible, preserving ComfyUI cache reuse when the effective enhanced prompt and all downstream inputs are unchanged.
+The old `/prompt` admission-cycle handler is no longer registered for normal Prompt Cycle. Legacy revision/epoch/queue fields remain in the schema for workflow compatibility but are not cycle authorities. The Prompt Enhancer frontend is `prompt_enhancer_dom_v0654.js`, and the node version is `0.6.54-alpha`.

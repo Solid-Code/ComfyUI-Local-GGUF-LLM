@@ -27,7 +27,7 @@ from .prompt_cycle import (
 
 log = logging.getLogger(__name__)
 
-NODE_VERSION = "0.6.51-alpha"
+NODE_VERSION = "0.6.54-alpha"
 PACKAGE_DIR = Path(__file__).resolve().parent
 DEFAULT_TEMPLATE_DIR = PACKAGE_DIR / "templates" / "default"
 USER_TEMPLATE_DIR = PRESET_ROOT_DIR / "prompt_enhancer"
@@ -75,6 +75,10 @@ _BATCH_TTL_SECONDS = 2 * 60 * 60.0
 _MANUAL_HISTORY_LOCK = threading.Lock()
 _MANUAL_HISTORY_STATES: dict[str, dict[str, Any]] = {}
 _MANUAL_HISTORY_TTL_SECONDS = 30 * 60.0
+
+# Prompt Cycle uses ComfyUI's native control_after_generate lifecycle.
+# There is intentionally no server-side admission cursor or /prompt mutation.
+
 
 def _display_name_from_path(path: Path) -> str:
     return path.stem.strip()
@@ -935,7 +939,7 @@ def _advance_prompt_cycle_backend(
 
 
 def _queue_cycle_transport(value: Any, count: int, active_index: int) -> tuple[int, list[int]] | None:
-    """Parse queue-time next-cursor metadata from the frontend.
+    """Parse queue-time next-cursor metadata from a frozen submission.
 
     Selection correctness never depends on this metadata: the selected entry is
     already frozen into ``prompt_history_index``. This transport only tells the
@@ -952,6 +956,16 @@ def _queue_cycle_transport(value: Any, count: int, active_index: int) -> tuple[i
     next_index = _normalize_history_index(raw.get("next_index", active_index), count)
     shuffle = _parse_shuffle_state(raw.get("shuffle", []), count, next_index)
     return next_index, shuffle
+
+
+def _is_server_cycle_transport(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        raw = json.loads(value or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return bool(isinstance(raw, dict) and raw.get("__queue_cycle_v1") and raw.get("__server_cycle_v2"))
 
 
 def _effective_prompt_text(prompt_preset: Any, prompt: Any) -> str:
@@ -1167,17 +1181,45 @@ class LocalLLMPromptEnhancer:
                         "dynamicPrompts": False,
                     },
                 ),
-                # Queue-time diagnostic/cache discriminator. The frontend writes
-                # a fresh positive value during ComfyUI's per-item beforeQueued
-                # lifecycle, before graphToPrompt() serializes ordinary schema
-                # widgets. The selected X/Y is written to prompt_history_index in
-                # the same step. Zero is the safe legacy/headless fallback.
+                # Legacy queue diagnostic retained for workflow compatibility.
+                # Native Prompt Cycle no longer uses this value; queue ownership
+                # is carried by prompt_cycle_counter via control_after_generate.
                 "prompt_cycle_queue_seq": (
                     "INT",
                     {
                         "default": 0,
                         "min": 0,
                         "max": 0x7FFFFFFF,
+                    },
+                ),
+                # Explicit user-edit generation for Prompt Cycle admission.
+                # Unlike prompt_cycle_revision, this value is not touched by
+                # execution mirroring or serialization. It changes only when the
+                # user deliberately edits X/Y/history/mode and therefore is the
+                # only metadata allowed to re-anchor the server cursor.
+                "prompt_cycle_epoch": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 0x7FFFFFFF,
+                    },
+                ),
+                # Native ComfyUI queue-control target for Prompt Cycle. This is
+                # intentionally a counter rather than a literal array index:
+                # active_index = counter % history_length. ComfyUI advances this
+                # value with the exact same control_after_generate machinery used
+                # by KSampler seeds, which makes every Run x N item carry its own
+                # already-selected cycle state. Signed range allows decrement to
+                # wrap naturally through modulo without any server-side cursor.
+                "prompt_cycle_counter": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": -0x7FFFFFFF,
+                        "max": 0x7FFFFFFF,
+                        "control_after_generate": True,
+                        "tooltip": "Internal Prompt Cycle counter. Uses ComfyUI's native control-after-generate lifecycle, like Seed.",
                     },
                 ),
                 "images": (
@@ -1237,31 +1279,23 @@ class LocalLLMPromptEnhancer:
         A manual Enhance request is out-of-band, so its armed request token is
         used as a one-shot cache signature. Workflow enhancement remains
         intentionally non-cacheable. Non-fixed Prompt Cycle is also intentionally
-        non-cacheable; browser queueing gives every item a distinct queue/cache
-        discriminator and legacy/headless cycling falls back to NaN.
+        non-cacheable; the server admission hook gives every submitted item a
+        distinct queue/cache discriminator and legacy/headless cycling falls back
+        to NaN.
         """
         if _normalize_bool(kwargs.get("enhance_with_workflow", False)):
             return float("nan")
 
         cycle_mode = _normalize_cycle_mode(kwargs.get("prompt_cycle"))
         if cycle_mode != "fixed":
-            # Browser queueing stamps a monotonically increasing queue sequence
-            # into a normal schema input during beforeQueued. Use that exact value
-            # in the cache signature so every accepted queue item is distinct.
-            # Headless/legacy clients without the queue lifecycle still fall back
-            # to NaN so non-fixed cycling cannot be cached accidentally.
+            # Prompt Cycle now uses ComfyUI's native control_after_generate
+            # lifecycle, exactly like a KSampler seed. The serialized counter is
+            # the queue-item discriminator; no server cursor/epoch is involved.
             try:
-                queue_seq = max(0, int(kwargs.get("prompt_cycle_queue_seq") or 0))
+                cycle_counter = int(kwargs.get("prompt_cycle_counter") or 0)
             except (TypeError, ValueError, OverflowError):
-                queue_seq = 0
-            if queue_seq > 0:
-                revision = _normalize_cycle_revision(kwargs.get("prompt_cycle_revision"))
-                try:
-                    history_index = max(0, int(kwargs.get("prompt_history_index") or 0))
-                except (TypeError, ValueError, OverflowError):
-                    history_index = 0
-                return f"cycle:{cycle_mode}:{revision}:{queue_seq}:{history_index}"
-            return float("nan")
+                cycle_counter = 0
+            return f"cycle:{cycle_mode}:{cycle_counter}"
 
         key = _enhancer_state_key(
             kwargs.get("unique_id"),
@@ -1301,7 +1335,9 @@ class LocalLLMPromptEnhancer:
         prompt_preset: str = "Custom",
         prompt_state_id: str = "",
         prompt_runtime_scope: str = "",
+        prompt_cycle_epoch: Any = 0,
         prompt_cycle_queue_seq: Any = 0,
+        prompt_cycle_counter: Any = 0,
         settings: Any = None,
         images: Any = None,
         video: Any = None,
@@ -1329,7 +1365,6 @@ class LocalLLMPromptEnhancer:
         queue_cycle_snapshot = (
             _normalize_cycle_mode(prompt_cycle) != "fixed"
             and not _normalize_bool(enhance_with_workflow)
-            and (queue_cycle_transport is not None or queued_cycle_seq_hint > 0)
         )
         history, ui_active_index, visible_enhanced, _queued_batch_reconciled = _reconcile_queued_manual_history(
             state_key,
@@ -1475,6 +1510,7 @@ class LocalLLMPromptEnhancer:
                 "active_index": active_index,
                 "cycle_mode": cycle_mode,
                 "cycle_revision": cycle_revision,
+                "cycle_epoch": _normalize_cycle_revision(prompt_cycle_epoch),
                 "used_settings": isinstance(settings, dict),
                 "backend_owned": False,
             }
@@ -1483,57 +1519,40 @@ class LocalLLMPromptEnhancer:
                 "result": (effective, source),
             }
 
-        # Non-fixed Prompt Cycle is queue-owned. The frontend freezes the exact
-        # X/Y index into prompt_history_index while ComfyUI builds EACH API prompt.
-        # Therefore execution timing, cache history, and workflow-runtime identity
-        # cannot cause middle Run x N items to collapse onto another cycle entry.
-        _clear_prompt_cycle_state(state_key)  # discard legacy .96/.97 cursor state
-        active_index = ui_active_index
-        transport = _queue_cycle_transport(prompt_shuffle_json, len(history), active_index)
+        # Non-fixed Prompt Cycle uses the same queue lifecycle as a ComfyUI
+        # seed. The browser serializes prompt_cycle_counter into each individual
+        # queue item, then ComfyUI's native control_after_generate widget advances
+        # that counter for the next item. Python only maps the immutable counter
+        # carried by THIS job onto the stored prompt array. There is no shared
+        # server cursor, no admission epoch, and no completion-time advancement.
+        _clear_prompt_cycle_state(state_key)  # discard legacy server cursor state
         try:
-            cycle_queue_seq = max(0, int(prompt_cycle_queue_seq or 0))
+            cycle_counter = int(prompt_cycle_counter or 0)
         except (TypeError, ValueError, OverflowError):
-            cycle_queue_seq = 0
-        if transport is not None:
-            next_index, next_shuffle = transport
-        else:
-            # The queue lifecycle now writes the active X/Y directly into the
-            # schema before graphToPrompt(). The completion-time next cursor is
-            # informational only for browser-prepared items; the UI already
-            # advanced in afterQueued. Legacy/headless clients still use it.
-            next_index, next_shuffle = _next_prompt_index(
-                cycle_mode,
-                len(history),
-                active_index,
-                prompt_shuffle_json,
-            )
-        queue_prepared = cycle_queue_seq > 0 or transport is not None
+            cycle_counter = 0
+        active_index = (cycle_counter % len(history)) if history else 0
         active_enhanced = history[active_index] if history else visible_enhanced
         effective = active_enhanced if active_enhanced.strip() else source
         if history:
             log.info(
-                "[Local LLM Prompt Enhancer] Prompt Cycle • mode=%s • queue=%d • used X/Y=%d/%d • next=%d/%d • queue_prepared=%s",
+                "[Local LLM Prompt Enhancer] Prompt Cycle execute • mode=%s • counter=%d • used X/Y=%d/%d • native_control=True",
                 cycle_mode,
-                cycle_queue_seq,
+                cycle_counter,
                 active_index + 1,
                 len(history),
-                next_index + 1,
-                len(history),
-                queue_prepared,
             )
         payload = {
             "mode": "cycle",
             "state_id": str(prompt_state_id or ""),
             "runtime_scope": str(prompt_runtime_scope or ""),
             "active_index": active_index,
-            "next_index": next_index,
-            "shuffle": next_shuffle,
+            "cycle_counter": cycle_counter,
             "cycle_mode": cycle_mode,
             "cycle_revision": cycle_revision,
-            "queue_seq": cycle_queue_seq,
+            "cycle_epoch": _normalize_cycle_revision(prompt_cycle_epoch),
             "used_settings": isinstance(settings, dict),
             "backend_owned": False,
-            "queue_prepared": queue_prepared,
+            "native_control": True,
         }
         return {
             "ui": {"prompt_enhancer": [json.dumps(payload, ensure_ascii=False)]},
@@ -1545,6 +1564,8 @@ try:
     from aiohttp import web
     from server import PromptServer
 
+    # Prompt Cycle deliberately does not register an on_prompt admission hook.
+    # Normal queueing is owned by ComfyUI's native control_after_generate lifecycle.
     routes = PromptServer.instance.routes
 
     def _json_error(message: Any, status: int = 400):
@@ -1734,8 +1755,9 @@ try:
     @routes.post("/local_llm_prompt_enhancer/cycle_reset")
     async def local_llm_prompt_enhancer_cycle_reset(_request):
         # Compatibility endpoint for cached older frontends. Current cycle
-        # invalidation is revision-based and therefore requires no backend write.
-        return web.json_response({"ok": True, "revision_owned": True})
+        # invalidation is carried by the schema-backed prompt_cycle_epoch and
+        # therefore requires no asynchronous backend write.
+        return web.json_response({"ok": True, "epoch_owned": True})
 
     @routes.post("/local_llm_prompt_enhancer/cycle_state")
     async def local_llm_prompt_enhancer_cycle_state(request):

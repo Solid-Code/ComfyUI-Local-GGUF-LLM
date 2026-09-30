@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "../..");
-const frontend = fs.readFileSync(path.join(root, "web/js/prompt_enhancer_dom_v0651.js"), "utf8");
+const frontend = fs.readFileSync(path.join(root, "web/js/prompt_enhancer_dom_v0654.js"), "utf8");
 const helper = fs.readFileSync(path.join(root, "web/js/prompt_enhancer_input_slots.js"), "utf8");
 
 test("Prompt Enhancer frontend never mutates input topology", () => {
@@ -33,41 +33,24 @@ test("normal frontend queueing has no backend cycle sync authority", () => {
   assert.equal(frontend.includes("__promptEnhancerCycleSyncAt"), false);
 });
 
-test("cycle completion is guarded by current mode and revision", () => {
-  const start = frontend.indexOf("function cycleExecutionMatchesNode");
+test("Prompt Cycle uses native control-after-generate callbacks", () => {
+  assert.match(frontend, /function installNativePromptCycleControl/);
+  assert.match(frontend, /promptCycleControlWidget/);
+  assert.match(frontend, /originalBefore/);
+  assert.match(frontend, /originalAfter/);
+  assert.match(frontend, /promptCycleIndexFromCounter/);
+  assert.match(frontend, /nativeControlModeForPromptCycle/);
+  assert.doesNotMatch(frontend, /installQueueOwnedPromptCycle/);
+});
+
+test("cycle completion never advances native queue state", () => {
+  const marker = 'if (mode === "cycle") {';
+  const start = frontend.indexOf(marker);
   assert.notEqual(start, -1);
-  const end = frontend.indexOf("\n}\n", start) + 3;
+  const end = frontend.indexOf("\n  }", start) + 4;
   const body = frontend.slice(start, end);
-  assert.match(body, /currentMode\s*!==\s*"fixed"/);
-  assert.match(body, /currentMode\s*===\s*resultMode/);
-  assert.match(body, /promptCycleRevision\(node\)\s*===\s*resultRevision/);
-});
-
-test("Prompt Cycle uses ComfyUI queue lifecycle and ordinary schema values", () => {
-  assert.match(frontend, /function preparePromptCycleQueueItem/);
-  assert.match(frontend, /function finalizePromptCycleQueueItem/);
-  assert.match(frontend, /planPromptCycleQueueItem/);
-  assert.match(frontend, /setWidgetValue\(widget\(node, "prompt_history_index"\), plan\.selectedIndex, false\)/);
-  assert.match(frontend, /setWidgetValue\(queueWidget, sequence, false\)/);
-  assert.match(frontend, /node\.__promptEnhancerQueueCycleState = prepared\.plan\.state/);
-  assert.match(frontend, /addEventListener\?\.\("promptQueueing"/);
-  assert.match(frontend, /wrapSeedControlPersistence\(node\)/);
-  assert.match(frontend, /preparePromptCycleQueueItem\(node, context\)/);
-  assert.match(frontend, /finalizePromptCycleQueueItem\(node, context\)/);
-  assert.match(frontend, /if \(data\?\.queue_prepared\) return true;/);
-  assert.match(frontend, /const queuePrepared = !!node\?\.__promptEnhancerPreparedCycleItem/);
-  assert.match(frontend, /if \(!queuePrepared\) history\[index\] = enhanced/);
-  assert.doesNotMatch(frontend, /indexWidget\.serializeValue = \(\) => \{/);
-  assert.doesNotMatch(frontend, /queue\.serializeValue = \(\) => \{/);
-});
-
-test("runtime cycle fields stay serializable without schema positional holes", () => {
-  for (const name of ["prompt_cycle_revision", "prompt_shuffle_json", "prompt_state_id", "prompt_runtime_scope"]) {
-    assert.match(frontend, new RegExp(`"${name}"`));
-  }
-  assert.match(frontend, /w\.options\.serialize === false/);
-  assert.match(frontend, /delete w\.options\.serialize/);
-  assert.doesNotMatch(frontend, /w\.serialize = false/);
+  assert.match(body, /native control_after_generate lifecycle already advanced/);
+  assert.doesNotMatch(body, /setPromptHistoryState/);
 });
 
 test("shuffle deck phase survives runtime-state remounts", () => {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import importlib.util
 import json
 import math
@@ -41,8 +42,16 @@ def load_prompt_enhancer_module():
         post = _decorator
         get = _decorator
 
+    class FakePromptServerInstance:
+        def __init__(self):
+            self.routes = FakeRoutes()
+            self.on_prompt_handlers = []
+
+        def add_on_prompt_handler(self, handler):
+            self.on_prompt_handlers.append(handler)
+
     server = types.ModuleType("server")
-    server.PromptServer = types.SimpleNamespace(instance=types.SimpleNamespace(routes=FakeRoutes()))
+    server.PromptServer = types.SimpleNamespace(instance=FakePromptServerInstance())
     sys.modules["server"] = server
 
     name = f"{PACKAGE_NAME}.prompt_enhancer"
@@ -63,18 +72,107 @@ class PromptEnhancerIntegrationTests(unittest.TestCase):
         PE._PENDING_ENHANCEMENTS.clear()
         PE._MANUAL_HISTORY_STATES.clear()
 
+
+    def submission_payload(
+        self,
+        *,
+        workflow_id="workflow-a",
+        mode="increment",
+        index=0,
+        revision=1,
+        epoch=0,
+        runtime_scope=None,
+        state_id="node-4",
+        history=None,
+        enhanced="A",
+        partial=False,
+        enhance_with_workflow=False,
+    ):
+        if history is None:
+            history = ["A", "B", "C"]
+        if runtime_scope is None:
+            runtime_scope = workflow_id
+        payload = {
+            "client_id": "client-a",
+            "workflow_id": workflow_id,
+            "extra_data": {
+                "extra_pnginfo": {
+                    "workflow": {"id": workflow_id},
+                },
+            },
+            "prompt": {
+                "4": {
+                    "class_type": "LocalLLMPromptEnhancer",
+                    "inputs": {
+                        "prompt": "source",
+                        "enhanced_prompt": enhanced,
+                        "prompt_cycle": mode,
+                        "enhance_with_workflow": enhance_with_workflow,
+                        "prompt_history_json": json.dumps(history),
+                        "prompt_history_index": index,
+                        "prompt_cycle_revision": revision,
+                        "prompt_shuffle_json": "[]",
+                        "prompt_state_id": state_id,
+                        "prompt_runtime_scope": runtime_scope,
+                        "prompt_cycle_queue_seq": 0,
+                        "prompt_cycle_epoch": epoch,
+                    },
+                },
+            },
+        }
+        if partial:
+            payload["partial_execution_targets"] = ["4"]
+        return payload
+
+    def execute_prepared_submission(self, submission):
+        inputs = dict(submission["prompt"]["4"]["inputs"] )
+        return PE.LocalLLMPromptEnhancer().output_prompts(
+            unique_id="4",
+            **inputs,
+        )
+
+    def test_prompt_cycle_does_not_register_server_admission_handler(self):
+        from server import PromptServer
+        self.assertEqual(PromptServer.instance.on_prompt_handlers, [])
+
+    def test_native_cycle_counter_maps_run_x_n_to_history_entries(self):
+        counters = list(range(7))
+        outputs = [
+            self.run_node(mode="increment", counter=counter)["result"][0]
+            for counter in counters
+        ]
+        self.assertEqual(outputs, ["A", "B", "C", "A", "B", "C", "A"])
+
+    def test_native_cycle_counter_supports_negative_decrement_wrap(self):
+        counters = [0, -1, -2, -3, -4]
+        outputs = [
+            self.run_node(mode="decrement", counter=counter)["result"][0]
+            for counter in counters
+        ]
+        self.assertEqual(outputs, ["A", "C", "B", "A", "C"])
+
+    def test_ten_prompt_native_counter_cycles_all_items(self):
+        history = [f"P{i}" for i in range(1, 11)]
+        outputs = [
+            self.run_node(mode="increment", history=history, enhanced=history[0], counter=counter)["result"][0]
+            for counter in range(12)
+        ]
+        self.assertEqual(outputs, history + history[:2])
+
     def run_node(
         self,
         *,
         mode="fixed",
         index=0,
         revision=1,
+        epoch=0,
         history=None,
         enhanced="A",
         state_id="node-4",
         scope="wf-a",
         queue_seq=0,
         shuffle_json="[]",
+        counter=0,
     ):
         if history is None:
             history = ["A", "B", "C"]
@@ -86,10 +184,12 @@ class PromptEnhancerIntegrationTests(unittest.TestCase):
             prompt_history_json=json.dumps(history),
             prompt_history_index=index,
             prompt_cycle_revision=revision,
+            prompt_cycle_epoch=epoch,
             prompt_shuffle_json=shuffle_json,
             prompt_state_id=state_id,
             prompt_runtime_scope=scope,
             prompt_cycle_queue_seq=queue_seq,
+            prompt_cycle_counter=counter,
             unique_id="4",
         )
 
@@ -101,69 +201,22 @@ class PromptEnhancerIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["active_index"], 2)
         self.assertFalse(payload["backend_owned"])
 
-    def test_queue_serialized_xy_is_the_cycle_authority(self):
-        indices = [0, 1, 2, 0, 1, 2, 0]
+    def test_prompt_history_index_no_longer_drives_nonfixed_cycle(self):
+        # Browser-visible X/Y may be stale; the native counter serialized into
+        # each queue item is the sole non-fixed selection authority.
         outputs = [
-            self.run_node(mode="increment", index=index, queue_seq=sequence)["result"][0]
-            for sequence, index in enumerate(indices, 1)
+            self.run_node(mode="increment", index=0, counter=counter)["result"][0]
+            for counter in range(4)
         ]
-        self.assertEqual(outputs, ["A", "B", "C", "A", "B", "C", "A"])
+        self.assertEqual(outputs, ["A", "B", "C", "A"])
 
-    def test_backend_does_not_secretly_advance_repeated_serialized_xy(self):
-        outputs = [
-            self.run_node(mode="increment", index=0, queue_seq=sequence)["result"][0]
-            for sequence in range(1, 5)
-        ]
-        self.assertEqual(outputs, ["A", "A", "A", "A"])
-
-    def test_queue_transport_reports_next_cursor_without_changing_selected_xy(self):
-        transport = json.dumps({
-            "__queue_cycle_v1": True,
-            "next_index": 2,
-            "shuffle": [],
-        })
-        result = self.run_node(
-            mode="increment",
-            index=1,
-            enhanced="B",
-            queue_seq=7,
-            shuffle_json=transport,
-        )
-        self.assertEqual(result["result"][0], "B")
-        payload = json.loads(result["ui"]["prompt_enhancer"][0])
-        self.assertEqual(payload["active_index"], 1)
-        self.assertEqual(payload["next_index"], 2)
-        self.assertEqual(payload["queue_seq"], 7)
-        self.assertTrue(payload["queue_prepared"])
-        self.assertFalse(payload["backend_owned"])
-
-    def test_queue_sequence_is_diagnostic_only(self):
-        for sequence in (1, 2, 99):
-            with self.subTest(sequence=sequence):
-                result = self.run_node(mode="increment", index=2, enhanced="C", queue_seq=sequence)
-                self.assertEqual(result["result"][0], "C")
-
-    def test_positive_queue_sequence_marks_browser_prepared_without_transport_object(self):
-        result = self.run_node(mode="increment", index=1, enhanced="B", queue_seq=3, shuffle_json="[]")
-        payload = json.loads(result["ui"]["prompt_enhancer"][0])
-        self.assertEqual(result["result"][0], "B")
-        self.assertTrue(payload["queue_prepared"])
-        self.assertEqual(payload["queue_seq"], 3)
-
-    def test_legacy_headless_cycle_gets_one_step_next_cursor(self):
-        result = self.run_node(mode="increment", index=1, enhanced="B", shuffle_json="[]")
-        payload = json.loads(result["ui"]["prompt_enhancer"][0])
-        self.assertEqual(result["result"][0], "B")
-        self.assertEqual(payload["next_index"], 2)
-        self.assertFalse(payload["queue_prepared"])
-
-    def test_runtime_scope_no_longer_controls_normal_cycle_selection(self):
-        a = self.run_node(mode="increment", index=0, scope="wf-a", queue_seq=1)
-        b = self.run_node(mode="increment", index=2, enhanced="C", scope="wf-b", queue_seq=2)
-        c = self.run_node(mode="increment", index=1, enhanced="B", state_id="", scope="", queue_seq=3)
+    def test_runtime_scope_does_not_control_native_cycle_selection(self):
+        a = self.run_node(mode="increment", index=0, scope="wf-a", counter=0)
+        b = self.run_node(mode="increment", index=0, scope="wf-b", counter=2)
+        c = self.run_node(mode="increment", index=0, state_id="", scope="", counter=1)
         self.assertEqual([a["result"][0], b["result"][0], c["result"][0]], ["A", "C", "B"])
 
-    def test_fixed_is_cacheable_and_queue_prepared_cycles_have_unique_signatures(self):
+    def test_fixed_is_cacheable_and_native_cycle_counter_is_signature(self):
         fixed = PE.LocalLLMPromptEnhancer.IS_CHANGED(
             prompt_cycle="fixed",
             enhance_with_workflow=False,
@@ -175,29 +228,18 @@ class PromptEnhancerIntegrationTests(unittest.TestCase):
 
         for mode in ("increment", "decrement", "shuffle", "random"):
             with self.subTest(mode=mode):
-                legacy = PE.LocalLLMPromptEnhancer.IS_CHANGED(
-                    prompt_cycle=mode,
-                    enhance_with_workflow=False,
-                    prompt_cycle_revision=7,
-                    prompt_cycle_queue_seq=0,
-                )
-                self.assertTrue(math.isnan(legacy))
                 first = PE.LocalLLMPromptEnhancer.IS_CHANGED(
                     prompt_cycle=mode,
                     enhance_with_workflow=False,
-                    prompt_cycle_revision=7,
-                    prompt_cycle_queue_seq=1,
-                    prompt_history_index=0,
+                    prompt_cycle_counter=10,
                 )
                 second = PE.LocalLLMPromptEnhancer.IS_CHANGED(
                     prompt_cycle=mode,
                     enhance_with_workflow=False,
-                    prompt_cycle_revision=7,
-                    prompt_cycle_queue_seq=2,
-                    prompt_history_index=1,
+                    prompt_cycle_counter=11,
                 )
-                self.assertEqual(first, f"cycle:{mode}:7:1:0")
-                self.assertEqual(second, f"cycle:{mode}:7:2:1")
+                self.assertEqual(first, f"cycle:{mode}:10")
+                self.assertEqual(second, f"cycle:{mode}:11")
                 self.assertNotEqual(first, second)
 
         self.assertTrue(math.isnan(PE.LocalLLMPromptEnhancer.IS_CHANGED(prompt_cycle="fixed", enhance_with_workflow=True)))
@@ -215,11 +257,9 @@ class PromptEnhancerIntegrationTests(unittest.TestCase):
             PE.LocalLLMPromptEnhancer.IS_CHANGED(
                 prompt_cycle="increment",
                 enhance_with_workflow="false",
-                prompt_cycle_queue_seq=1,
-                prompt_cycle_revision=0,
-                prompt_history_index=0,
+                prompt_cycle_counter=3,
             ),
-            "cycle:increment:0:1:0",
+            "cycle:increment:3",
         )
 
     def test_queue_transport_parser_rejects_unmarked_data(self):

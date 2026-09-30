@@ -20,7 +20,7 @@ def main() -> int:
     if node:
         run([node, "--test", "tests/frontend/input_slots.test.mjs", "tests/frontend/prompt_enhancer_queue_state.test.mjs", "tests/frontend/source_contracts.test.mjs"])
         run([node, "--check", "web/js/local_llm_server_v102.js"])
-        run([node, "--check", "web/js/prompt_enhancer_dom_v0651.js"])
+        run([node, "--check", "web/js/prompt_enhancer_dom_v0654.js"])
         run([node, "--check", "web/js/prompt_enhancer_input_slots.js"])
         run([node, "--check", "web/js/prompt_enhancer_queue_state.js"])
     else:

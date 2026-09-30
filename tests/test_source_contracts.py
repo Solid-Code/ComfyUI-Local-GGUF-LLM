@@ -4,7 +4,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 PROMPT_ENHANCER = ROOT / "prompt_enhancer.py"
-FRONTEND = ROOT / "web" / "js" / "prompt_enhancer_dom_v0651.js"
+FRONTEND = ROOT / "web" / "js" / "prompt_enhancer_dom_v0654.js"
 INPUT_HELPERS = ROOT / "web" / "js" / "prompt_enhancer_input_slots.js"
 INIT = ROOT / "__init__.py"
 SERVICE = ROOT / "service.py"
@@ -50,54 +50,37 @@ class SourceContractTests(unittest.TestCase):
             with self.subTest(pattern=pattern):
                 self.assertIsNone(re.search(pattern, source))
 
-    def test_frontend_cycle_result_guard_requires_mode_and_revision_match(self):
-        source = FRONTEND.read_text(encoding="utf-8")
-        start = source.index("function cycleExecutionMatchesNode")
-        end = source.index("\n}\n", start) + 2
-        function_source = source[start:end]
-        self.assertIn('currentMode !== "fixed"', function_source)
-        self.assertIn("currentMode === resultMode", function_source)
-        self.assertIn("promptCycleRevision(node) === resultRevision", function_source)
+    def test_prompt_cycle_uses_native_comfy_control_after_generate(self):
+        backend = PROMPT_ENHANCER.read_text(encoding="utf-8")
+        frontend = FRONTEND.read_text(encoding="utf-8")
+        self.assertIn('"prompt_cycle_counter": (', backend)
+        self.assertIn('"control_after_generate": True', backend)
+        self.assertIn("function installNativePromptCycleControl", frontend)
+        self.assertIn("promptCycleControlWidget", frontend)
+        self.assertIn("originalBefore", frontend)
+        self.assertIn("originalAfter", frontend)
+        self.assertIn("promptCycleIndexFromCounter", frontend)
+        self.assertNotIn("_register_prompt_cycle_submit_handler(PromptServer.instance)", backend)
 
-    def test_prompt_cycle_queue_lifecycle_writes_real_schema_values_per_item(self):
-        source = FRONTEND.read_text(encoding="utf-8")
-        helper = (ROOT / "web" / "js" / "prompt_enhancer_queue_state.js").read_text(encoding="utf-8")
-        self.assertIn("function preparePromptCycleQueueItem", source)
-        self.assertIn("function finalizePromptCycleQueueItem", source)
-        self.assertIn("planPromptCycleQueueItem", source)
-        self.assertIn('setWidgetValue(widget(node, "prompt_history_index"), plan.selectedIndex, false)', source)
-        self.assertIn('setWidgetValue(queueWidget, sequence, false)', source)
-        self.assertIn("node.__promptEnhancerQueueCycleState = prepared.plan.state", source)
-        self.assertIn('api.addEventListener?.("promptQueueing"', source)
-        self.assertIn("wrapSeedControlPersistence(node)", source)
-        self.assertIn("preparePromptCycleQueueItem(node, context)", source)
-        self.assertIn("finalizePromptCycleQueueItem(node, context)", source)
-        self.assertIn("if (data?.queue_prepared) return true;", source)
-        self.assertIn("const queuePrepared = !!node?.__promptEnhancerPreparedCycleItem", source)
-        self.assertIn("if (!queuePrepared) history[index] = enhanced", source)
-        self.assertNotIn("indexWidget.serializeValue = () => {", source)
-        self.assertNotIn("queue.serializeValue = () => {", source)
-        self.assertIn("export function planPromptCycleQueueItem", helper)
-
-    def test_backend_trusts_queue_serialized_xy_and_never_advances_normal_cycle_cursor(self):
+    def test_backend_maps_native_counter_by_modulo_without_shared_cursor(self):
         source = PROMPT_ENHANCER.read_text(encoding="utf-8")
-        cycle_block = source[source.index("# Non-fixed Prompt Cycle is queue-owned.") :]
-        cycle_block = cycle_block[: cycle_block.index("\n\ntry:\n    from aiohttp")]
-        self.assertIn("active_index = ui_active_index", cycle_block)
-        self.assertIn("_queue_cycle_transport(", cycle_block)
-        self.assertIn('"backend_owned": False', cycle_block)
-        self.assertIn('"queue_prepared": queue_prepared', cycle_block)
-        self.assertNotIn("_advance_prompt_cycle_backend(", cycle_block)
-        self.assertIn("merge_visible=not queue_cycle_snapshot", source)
-        self.assertIn("queued_cycle_seq_hint > 0", source)
+        cycle_block = source[source.index("# Non-fixed Prompt Cycle uses the same queue lifecycle as a ComfyUI") :]
+        cycle_block = cycle_block[: cycle_block.index("\n\n\ntry:\n    from aiohttp")]
+        self.assertIn("active_index = (cycle_counter % len(history)) if history else 0", cycle_block)
+        self.assertIn('"native_control": True', cycle_block)
+        self.assertNotIn("PROMPT_CYCLE_STORE.advance(", cycle_block)
 
-    def test_runtime_cycle_widgets_remain_schema_serializable_without_positional_holes(self):
+    def test_runtime_cycle_counter_is_appended_and_hidden(self):
         source = FRONTEND.read_text(encoding="utf-8")
-        self.assertIn("function installQueueOwnedPromptCycle", source)
-        for name in ["prompt_cycle_revision", "prompt_shuffle_json", "prompt_state_id", "prompt_runtime_scope", "prompt_cycle_queue_seq"]:
-            self.assertIn(f'"{name}"', source)
-        self.assertIn("if (w.options.serialize === false) delete w.options.serialize", source)
-        self.assertNotIn("w.serialize = false", source)
+        self.assertIn('"prompt_cycle_counter"', source)
+        self.assertIn("hideNativeWidgetForPanel(promptCycleControlWidget(node))", source)
+        self.assertNotIn("installQueueOwnedPromptCycle", source)
+
+    def test_frontend_helper_contains_no_legacy_cycle_planner(self):
+        helper = (ROOT / "web" / "js" / "prompt_enhancer_queue_state.js").read_text(encoding="utf-8")
+        self.assertNotIn("planPromptCycleQueueItem", helper)
+        self.assertNotIn("nextPromptCycleQueueSequence", helper)
+        self.assertNotIn("normalizeCycleMode", helper)
 
     def test_unused_enhancement_seed_is_neutralized(self):
         source = FRONTEND.read_text(encoding="utf-8")
@@ -246,13 +229,13 @@ class SourceContractTests(unittest.TestCase):
     def test_release_version_advanced_past_01880(self):
         source = VERSION.read_text(encoding="utf-8")
         project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-        self.assertIn('PACKAGE_VERSION = "0.18.100-alpha"', source)
-        self.assertIn('version = "0.18.100a0"', project)
+        self.assertIn('PACKAGE_VERSION = "0.18.103-alpha"', source)
+        self.assertIn('version = "0.18.103a0"', project)
 
     def test_frontend_registry_references_cache_distinct_current_file_and_preserves_helper_module(self):
         source = INIT.read_text(encoding="utf-8")
         self.assertIn('"local_llm_server": "local_llm_server_v102.js"', source)
-        self.assertIn('"prompt_enhancer": "prompt_enhancer_dom_v0651.js"', source)
+        self.assertIn('"prompt_enhancer": "prompt_enhancer_dom_v0654.js"', source)
         self.assertTrue(INPUT_HELPERS.is_file())
         # Cleanup is limited to versioned prompt_enhancer_dom_v*.js files; the
         # unversioned helper therefore survives extract-over-existing upgrades.
@@ -260,12 +243,12 @@ class SourceContractTests(unittest.TestCase):
 
     def test_readme_matches_current_package_scope(self):
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn("**Version 0.18.100-alpha**", readme)
+        self.assertIn("**Version 0.18.103-alpha**", readme)
         self.assertIn("**Local LLM Generate**", readme)
         self.assertIn("**Local LLM Settings**", readme)
         self.assertIn("**Local LLM Prompt Enhancer**", readme)
-        self.assertIn("Prompt Enhancer version: 0.6.51-alpha", readme)
-        self.assertIn('NODE_VERSION = "0.6.51-alpha"', PROMPT_ENHANCER.read_text(encoding="utf-8"))
+        self.assertIn("Prompt Enhancer version: 0.6.54-alpha", readme)
+        self.assertIn('NODE_VERSION = "0.6.54-alpha"', PROMPT_ENHANCER.read_text(encoding="utf-8"))
         self.assertNotIn("H3_SEQUENCE", readme)
         self.assertNotIn("The node is a planning/orchestration layer", readme)
 
